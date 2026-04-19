@@ -5,6 +5,8 @@ fn default_temperature() -> f32 { 0.6 }
 fn default_top_p() -> f32 { 0.95 }
 fn default_top_k() -> i32 { 40 }
 fn default_min_p() -> f32 { 0.0 }
+fn default_presence_penalty() -> f32 { 0.0 }
+fn default_repeat_penalty() -> f32 { 1.0 }
 
 /// Weights file format. Drives the argv style used when spawning the backend.
 ///
@@ -50,6 +52,42 @@ pub enum SplitMode {
     /// in parallel. Generally fastest when supported but bandwidth-sensitive.
     /// In current llama.cpp this is a distinct mode from `row`.
     Tensor,
+}
+
+/// `--reasoning-format` enum exactly matching `common_reasoning_format` in
+/// llama.cpp (`common/common.h`). The comment there says not to extend the
+/// enum "unless you absolutely have to," so we mirror the four values
+/// verbatim. Controls how thought tags are returned in the response
+/// (orthogonal to `--reasoning on|off|auto`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningFormat {
+    None,
+    Auto,
+    Deepseek,
+    DeepseekLegacy,
+}
+
+impl ReasoningFormat {
+    /// The literal string llama-server expects on the command line.
+    pub fn as_arg(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Auto => "auto",
+            Self::Deepseek => "deepseek",
+            Self::DeepseekLegacy => "deepseek-legacy",
+        }
+    }
+
+    pub fn from_cli(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "auto" => Some(Self::Auto),
+            "deepseek" => Some(Self::Deepseek),
+            "deepseek-legacy" => Some(Self::DeepseekLegacy),
+            _ => None,
+        }
+    }
 }
 
 /// KV-cache quantization. Applies to llama.cpp (`--cache-type-{k,v}`).
@@ -113,6 +151,10 @@ pub struct ModelConfig {
     pub top_k: i32,
     #[serde(default = "default_min_p")]
     pub min_p: f32,
+    #[serde(default = "default_presence_penalty")]
+    pub presence_penalty: f32,
+    #[serde(default = "default_repeat_penalty")]
+    pub repeat_penalty: f32,
 
     // llama.cpp-specific backend flags. All optional; `None`/`false` means
     // "don't emit the flag, let llama.cpp pick its default".
@@ -144,6 +186,28 @@ pub struct ModelConfig {
     #[serde(default)]
     pub tensor_split: Option<String>,
 
+    /// `--threads N`. Number of CPU threads llama-server uses for generation.
+    /// llama.cpp's default is `-1` (auto).
+    #[serde(default)]
+    pub threads: Option<i32>,
+    /// `--cache-ram N` (MiB). Maximum cache size. llama.cpp defaults to 8192;
+    /// `-1` = no limit, `0` = disabled.
+    #[serde(default)]
+    pub cache_ram_mib: Option<i32>,
+    /// `--reasoning-format`. Controls how thought tags are returned in the
+    /// OpenAI response body.
+    #[serde(default)]
+    pub reasoning_format: Option<ReasoningFormat>,
+    /// `--reasoning-budget N`. `-1` = unrestricted, `0` = immediate end,
+    /// `N>0` = token budget.
+    #[serde(default)]
+    pub reasoning_budget: Option<i32>,
+    /// `--chat-template-kwargs STRING`. Raw JSON object passed verbatim to
+    /// llama.cpp's Jinja chat template (template-family-specific keys like
+    /// `enable_thinking`, `reasoning_effort`, `preserve_thinking`).
+    #[serde(default)]
+    pub chat_template_kwargs: Option<String>,
+
     #[serde(default)]
     pub state: ModelState,
     #[serde(default)]
@@ -152,6 +216,93 @@ pub struct ModelConfig {
     pub estimated_vram: u64,
     #[serde(default)]
     pub last_used: Option<f64>,
+}
+
+impl ModelConfig {
+    /// One-shot migration of raw `extra_args` into the structured fields
+    /// added after the fact. Called once per model at orchestrator startup;
+    /// returns `true` if anything was moved so the caller can mark the
+    /// store dirty.
+    ///
+    /// The strategy is token-pair: scan flag-value pairs and promote the
+    /// seven flags we now model as options. Anything unrecognized stays
+    /// in `extra_args`. Structured fields win if already set (we strip the
+    /// duplicate from extra_args but don't overwrite).
+    pub fn migrate_extra_args(&mut self) -> bool {
+        let mut changed = false;
+        let mut out: Vec<String> = Vec::with_capacity(self.extra_args.len());
+        let args = std::mem::take(&mut self.extra_args);
+        let mut i = 0;
+        while i < args.len() {
+            let flag = args[i].as_str();
+            let next = args.get(i + 1);
+            let mut consumed = 0;
+
+            match (flag, next) {
+                ("--threads" | "-t", Some(v)) => {
+                    if let Ok(n) = v.parse::<i32>() {
+                        if self.threads.is_none() {
+                            self.threads = Some(n);
+                        }
+                        consumed = 2;
+                    }
+                }
+                ("--cache-ram" | "-cram", Some(v)) => {
+                    if let Ok(n) = v.parse::<i32>() {
+                        if self.cache_ram_mib.is_none() {
+                            self.cache_ram_mib = Some(n);
+                        }
+                        consumed = 2;
+                    }
+                }
+                ("--reasoning-format", Some(v)) => {
+                    if let Some(rf) = ReasoningFormat::from_cli(v) {
+                        if self.reasoning_format.is_none() {
+                            self.reasoning_format = Some(rf);
+                        }
+                        consumed = 2;
+                    }
+                }
+                ("--reasoning-budget", Some(v)) => {
+                    if let Ok(n) = v.parse::<i32>() {
+                        if self.reasoning_budget.is_none() {
+                            self.reasoning_budget = Some(n);
+                        }
+                        consumed = 2;
+                    }
+                }
+                ("--presence-penalty", Some(v)) => {
+                    if let Ok(f) = v.parse::<f32>() {
+                        self.presence_penalty = f;
+                        consumed = 2;
+                    }
+                }
+                ("--repeat-penalty", Some(v)) => {
+                    if let Ok(f) = v.parse::<f32>() {
+                        self.repeat_penalty = f;
+                        consumed = 2;
+                    }
+                }
+                ("--chat-template-kwargs", Some(v)) => {
+                    if self.chat_template_kwargs.is_none() {
+                        self.chat_template_kwargs = Some(v.clone());
+                    }
+                    consumed = 2;
+                }
+                _ => {}
+            }
+
+            if consumed == 0 {
+                out.push(args[i].clone());
+                i += 1;
+            } else {
+                changed = true;
+                i += consumed;
+            }
+        }
+        self.extra_args = out;
+        changed
+    }
 }
 
 #[cfg(test)]
@@ -183,6 +334,13 @@ mod tests {
             split_mode: Some(SplitMode::Layer),
             main_gpu: Some(0),
             tensor_split: Some("0.5,0.5,0".into()),
+            threads: Some(16),
+            cache_ram_mib: Some(0),
+            reasoning_format: Some(ReasoningFormat::Auto),
+            reasoning_budget: Some(-1),
+            chat_template_kwargs: Some(r#"{"enable_thinking":true}"#.into()),
+            presence_penalty: 0.0,
+            repeat_penalty: 1.0,
             state: ModelState::Idle,
             pid: None,
             estimated_vram: 0,
@@ -235,6 +393,188 @@ mod tests {
         assert_eq!(parsed.split_mode, None);
         assert_eq!(parsed.main_gpu, None);
         assert_eq!(parsed.tensor_split, None);
+        // Post-migration structured fields default to unset / neutral.
+        assert_eq!(parsed.threads, None);
+        assert_eq!(parsed.cache_ram_mib, None);
+        assert_eq!(parsed.reasoning_format, None);
+        assert_eq!(parsed.reasoning_budget, None);
+        assert_eq!(parsed.chat_template_kwargs, None);
+        assert_eq!(parsed.presence_penalty, 0.0);
+        assert_eq!(parsed.repeat_penalty, 1.0);
+    }
+
+    #[test]
+    fn reasoning_format_serializes_kebab_case() {
+        assert_eq!(serde_json::to_string(&ReasoningFormat::None).unwrap(), "\"none\"");
+        assert_eq!(serde_json::to_string(&ReasoningFormat::Auto).unwrap(), "\"auto\"");
+        assert_eq!(serde_json::to_string(&ReasoningFormat::Deepseek).unwrap(), "\"deepseek\"");
+        assert_eq!(
+            serde_json::to_string(&ReasoningFormat::DeepseekLegacy).unwrap(),
+            "\"deepseek-legacy\"",
+        );
+    }
+
+    #[test]
+    fn reasoning_format_from_cli_covers_all_values() {
+        assert_eq!(ReasoningFormat::from_cli("none"), Some(ReasoningFormat::None));
+        assert_eq!(ReasoningFormat::from_cli("auto"), Some(ReasoningFormat::Auto));
+        assert_eq!(ReasoningFormat::from_cli("deepseek"), Some(ReasoningFormat::Deepseek));
+        assert_eq!(
+            ReasoningFormat::from_cli("deepseek-legacy"),
+            Some(ReasoningFormat::DeepseekLegacy),
+        );
+        assert_eq!(ReasoningFormat::from_cli("bogus"), None);
+    }
+
+    // ----- Migration -----
+
+    fn bare() -> ModelConfig {
+        ModelConfig {
+            id: "m".into(),
+            name: "M".into(),
+            weights_format: WeightsFormat::Gguf,
+            binary_preset: None,
+            binary: PathBuf::from("/bin/llama"),
+            model_path: PathBuf::from("/m.gguf"),
+            port: 9001,
+            extra_args: vec![],
+            context: 4096,
+            temperature: 0.6,
+            top_p: 0.95,
+            top_k: 40,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            repeat_penalty: 1.0,
+            flash_attn: false,
+            n_gpu_layers: None,
+            mlock: false,
+            no_mmap: false,
+            parallel_slots: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            split_mode: None,
+            main_gpu: None,
+            tensor_split: None,
+            threads: None,
+            cache_ram_mib: None,
+            reasoning_format: None,
+            reasoning_budget: None,
+            chat_template_kwargs: None,
+            state: ModelState::Idle,
+            pid: None,
+            estimated_vram: 0,
+            last_used: None,
+        }
+    }
+
+    #[test]
+    fn migrate_extracts_all_seven_flags() {
+        let mut m = bare();
+        m.extra_args = vec![
+            "--threads".into(), "16".into(),
+            "--reasoning-format".into(), "auto".into(),
+            "--cache-ram".into(), "0".into(),
+            "--presence-penalty".into(), "1.5".into(),
+            "--repeat-penalty".into(), "1.0".into(),
+            "--reasoning-budget".into(), "0".into(),
+            "--chat-template-kwargs".into(), r#"{"enable_thinking":false}"#.into(),
+        ];
+        assert!(m.migrate_extra_args());
+        assert_eq!(m.threads, Some(16));
+        assert_eq!(m.reasoning_format, Some(ReasoningFormat::Auto));
+        assert_eq!(m.cache_ram_mib, Some(0));
+        assert_eq!(m.presence_penalty, 1.5);
+        assert_eq!(m.repeat_penalty, 1.0);
+        assert_eq!(m.reasoning_budget, Some(0));
+        assert_eq!(m.chat_template_kwargs.as_deref(), Some(r#"{"enable_thinking":false}"#));
+        assert!(m.extra_args.is_empty());
+    }
+
+    #[test]
+    fn migrate_preserves_unknown_flags() {
+        let mut m = bare();
+        m.extra_args = vec![
+            "--override-kv".into(), "foo=bar".into(),
+            "--threads".into(), "16".into(),
+            "--custom-flag".into(),
+        ];
+        assert!(m.migrate_extra_args());
+        assert_eq!(m.threads, Some(16));
+        assert_eq!(
+            m.extra_args,
+            vec!["--override-kv", "foo=bar", "--custom-flag"],
+        );
+    }
+
+    #[test]
+    fn migrate_is_idempotent_after_first_pass() {
+        let mut m = bare();
+        m.extra_args = vec!["--threads".into(), "16".into()];
+        assert!(m.migrate_extra_args());
+        // Second pass: nothing to migrate, nothing changes.
+        assert!(!m.migrate_extra_args());
+        assert_eq!(m.threads, Some(16));
+        assert!(m.extra_args.is_empty());
+    }
+
+    #[test]
+    fn migrate_keeps_existing_structured_value_on_conflict() {
+        let mut m = bare();
+        m.threads = Some(32);
+        m.extra_args = vec!["--threads".into(), "16".into()];
+        assert!(m.migrate_extra_args()); // changed = dropped from extra_args
+        assert_eq!(m.threads, Some(32)); // structured wins
+        assert!(m.extra_args.is_empty());
+    }
+
+    #[test]
+    fn migrate_handles_short_aliases() {
+        let mut m = bare();
+        m.extra_args = vec!["-t".into(), "8".into(), "-cram".into(), "4096".into()];
+        assert!(m.migrate_extra_args());
+        assert_eq!(m.threads, Some(8));
+        assert_eq!(m.cache_ram_mib, Some(4096));
+        assert!(m.extra_args.is_empty());
+    }
+
+    #[test]
+    fn migrate_ignores_flag_with_unparseable_value() {
+        let mut m = bare();
+        m.extra_args = vec!["--threads".into(), "not-a-number".into()];
+        assert!(!m.migrate_extra_args());
+        assert_eq!(m.threads, None);
+        assert_eq!(m.extra_args, vec!["--threads", "not-a-number"]);
+    }
+
+    #[test]
+    fn migrate_rejects_unknown_reasoning_format_value() {
+        let mut m = bare();
+        m.extra_args = vec!["--reasoning-format".into(), "made-up".into()];
+        assert!(!m.migrate_extra_args());
+        assert_eq!(m.reasoning_format, None);
+        assert_eq!(m.extra_args, vec!["--reasoning-format", "made-up"]);
+    }
+
+    #[test]
+    fn migrate_real_world_qwen3_args() {
+        // Taken verbatim from the user's models.json.
+        let mut m = bare();
+        m.extra_args = vec![
+            "--threads".into(), "16".into(),
+            "--reasoning-format".into(), "auto".into(),
+            "--cache-ram".into(), "0".into(),
+            "--presence-penalty".into(), "1.5".into(),
+            "--repeat-penalty".into(), "1.0".into(),
+            "--chat-template-kwargs".into(), r#"{"enable_thinking":false}"#.into(),
+        ];
+        assert!(m.migrate_extra_args());
+        assert!(m.extra_args.is_empty());
+        assert_eq!(m.threads, Some(16));
+        assert_eq!(m.reasoning_format, Some(ReasoningFormat::Auto));
+        assert_eq!(m.cache_ram_mib, Some(0));
+        assert_eq!(m.presence_penalty, 1.5);
+        assert_eq!(m.repeat_penalty, 1.0);
+        assert_eq!(m.chat_template_kwargs.as_deref(), Some(r#"{"enable_thinking":false}"#));
     }
 
     #[test]

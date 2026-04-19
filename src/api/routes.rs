@@ -5,7 +5,9 @@ use axum::Json;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-use crate::config::{BinaryPreset, CacheType, ModelConfig, ModelState, SplitMode, WeightsFormat};
+use crate::config::{
+    BinaryPreset, CacheType, ModelConfig, ModelState, ReasoningFormat, SplitMode, WeightsFormat,
+};
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
 use crate::vram::estimator::GgufInfo;
 
@@ -13,6 +15,8 @@ fn default_temperature() -> f32 { 0.6 }
 fn default_top_p() -> f32 { 0.95 }
 fn default_top_k() -> i32 { 40 }
 fn default_min_p() -> f32 { 0.0 }
+fn default_presence_penalty() -> f32 { 0.0 }
+fn default_repeat_penalty() -> f32 { 1.0 }
 
 #[derive(Deserialize)]
 pub struct ModelRequest {
@@ -33,6 +37,10 @@ pub struct ModelRequest {
     pub top_k: i32,
     #[serde(default = "default_min_p")]
     pub min_p: f32,
+    #[serde(default = "default_presence_penalty")]
+    pub presence_penalty: f32,
+    #[serde(default = "default_repeat_penalty")]
+    pub repeat_penalty: f32,
     #[serde(default)]
     pub extra_args: Vec<String>,
     #[serde(default)]
@@ -55,6 +63,16 @@ pub struct ModelRequest {
     pub main_gpu: Option<u32>,
     #[serde(default)]
     pub tensor_split: Option<String>,
+    #[serde(default)]
+    pub threads: Option<i32>,
+    #[serde(default)]
+    pub cache_ram_mib: Option<i32>,
+    #[serde(default)]
+    pub reasoning_format: Option<ReasoningFormat>,
+    #[serde(default)]
+    pub reasoning_budget: Option<i32>,
+    #[serde(default)]
+    pub chat_template_kwargs: Option<String>,
 }
 
 impl ModelRequest {
@@ -73,6 +91,8 @@ impl ModelRequest {
             top_p: self.top_p,
             top_k: self.top_k,
             min_p: self.min_p,
+            presence_penalty: self.presence_penalty,
+            repeat_penalty: self.repeat_penalty,
             flash_attn: self.flash_attn,
             n_gpu_layers: self.n_gpu_layers,
             mlock: self.mlock,
@@ -83,6 +103,11 @@ impl ModelRequest {
             split_mode: self.split_mode,
             main_gpu: self.main_gpu,
             tensor_split: self.tensor_split,
+            threads: self.threads,
+            cache_ram_mib: self.cache_ram_mib,
+            reasoning_format: self.reasoning_format,
+            reasoning_budget: self.reasoning_budget,
+            chat_template_kwargs: self.chat_template_kwargs,
             state: ModelState::Idle,
             pid: None,
             estimated_vram: 0,

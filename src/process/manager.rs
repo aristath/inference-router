@@ -1,4 +1,4 @@
-use crate::config::{CacheType, ModelConfig, SplitMode, WeightsFormat};
+use crate::config::{CacheType, ModelConfig, ReasoningFormat, SplitMode, WeightsFormat};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -127,6 +127,10 @@ pub fn build_command_args(model: &ModelConfig) -> Vec<String> {
                 args.push("--min-p".into());
                 args.push(model.min_p.to_string());
             }
+            args.push("--presence-penalty".into());
+            args.push(model.presence_penalty.to_string());
+            args.push("--repeat-penalty".into());
+            args.push(model.repeat_penalty.to_string());
 
             // llama.cpp structured flags. User-typed `extra_args` appends
             // after these so it can override via last-wins.
@@ -174,6 +178,26 @@ pub fn build_command_args(model: &ModelConfig) -> Vec<String> {
             if let Some(ref ts) = model.tensor_split {
                 args.push("--tensor-split".into());
                 args.push(ts.clone());
+            }
+            if let Some(t) = model.threads {
+                args.push("--threads".into());
+                args.push(t.to_string());
+            }
+            if let Some(c) = model.cache_ram_mib {
+                args.push("--cache-ram".into());
+                args.push(c.to_string());
+            }
+            if let Some(rf) = model.reasoning_format {
+                args.push("--reasoning-format".into());
+                args.push(rf.as_arg().into());
+            }
+            if let Some(rb) = model.reasoning_budget {
+                args.push("--reasoning-budget".into());
+                args.push(rb.to_string());
+            }
+            if let Some(ref kw) = model.chat_template_kwargs {
+                args.push("--chat-template-kwargs".into());
+                args.push(kw.clone());
             }
         }
         WeightsFormat::Safetensors => {
@@ -289,6 +313,8 @@ mod tests {
             top_p: 0.95,
             top_k: 40,
             min_p: 0.0,
+            presence_penalty: 0.0,
+            repeat_penalty: 1.0,
             flash_attn: false,
             n_gpu_layers: None,
             mlock: false,
@@ -299,6 +325,11 @@ mod tests {
             split_mode: None,
             main_gpu: None,
             tensor_split: None,
+            threads: None,
+            cache_ram_mib: None,
+            reasoning_format: None,
+            reasoning_budget: None,
+            chat_template_kwargs: None,
             state: Default::default(),
             pid: None,
             estimated_vram: 0,
@@ -318,6 +349,8 @@ mod tests {
                 "--temp", "0.6",
                 "--top-p", "0.95",
                 "--top-k", "40",
+                "--presence-penalty", "0",
+                "--repeat-penalty", "1",
                 "--flash-attn", "off",
             ],
         );
@@ -409,6 +442,54 @@ mod tests {
         assert!(!joined.contains("--split-mode"));
         assert!(!joined.contains("--main-gpu"));
         assert!(!joined.contains("--tensor-split"));
+    }
+
+    #[test]
+    fn gguf_argv_emits_penalties_from_structured_fields() {
+        let mut m = gguf_model();
+        m.presence_penalty = 1.5;
+        m.repeat_penalty = 1.1;
+        let args = build_command_args(&m);
+        let joined = args.join(" ");
+        assert!(joined.contains("--presence-penalty 1.5"), "{joined}");
+        assert!(joined.contains("--repeat-penalty 1.1"), "{joined}");
+    }
+
+    #[test]
+    fn gguf_argv_emits_threads_cache_ram_reasoning_when_set() {
+        let mut m = gguf_model();
+        m.threads = Some(16);
+        m.cache_ram_mib = Some(0);
+        m.reasoning_format = Some(ReasoningFormat::Deepseek);
+        m.reasoning_budget = Some(0);
+        m.chat_template_kwargs = Some(r#"{"enable_thinking":false}"#.into());
+        let args = build_command_args(&m);
+        let joined = args.join(" ");
+        assert!(joined.contains("--threads 16"), "{joined}");
+        assert!(joined.contains("--cache-ram 0"), "{joined}");
+        assert!(joined.contains("--reasoning-format deepseek"), "{joined}");
+        assert!(joined.contains("--reasoning-budget 0"), "{joined}");
+        assert!(joined.contains(r#"--chat-template-kwargs {"enable_thinking":false}"#), "{joined}");
+    }
+
+    #[test]
+    fn gguf_argv_omits_new_flags_when_unset() {
+        let args = build_command_args(&gguf_model());
+        let joined = args.join(" ");
+        assert!(!joined.contains("--threads"));
+        assert!(!joined.contains("--cache-ram"));
+        assert!(!joined.contains("--reasoning-format"));
+        assert!(!joined.contains("--reasoning-budget"));
+        assert!(!joined.contains("--chat-template-kwargs"));
+    }
+
+    #[test]
+    fn gguf_argv_reasoning_format_kebab_for_deepseek_legacy() {
+        let mut m = gguf_model();
+        m.reasoning_format = Some(ReasoningFormat::DeepseekLegacy);
+        let args = build_command_args(&m);
+        let joined = args.join(" ");
+        assert!(joined.contains("--reasoning-format deepseek-legacy"), "{joined}");
     }
 
     #[test]

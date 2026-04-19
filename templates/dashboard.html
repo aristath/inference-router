@@ -259,6 +259,25 @@
                     </div>
                 </div>
 
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="presence_penalty">Presence penalty</label>
+                        <div class="slider-container">
+                            <input type="range" id="presence_penalty-slider" min="-2" max="2" step="0.01">
+                            <input type="number" id="presence_penalty" name="presence_penalty" step="0.01" min="-2" max="2" class="slider-number">
+                        </div>
+                        <small class="field-help">Penalize any token that has already appeared at least once, regardless of how many times. llama.cpp default <strong>0.0</strong> (disabled). Positive values discourage re-use of already-seen words; useful to break repetition loops on some Qwen3 variants (commonly <strong>1.5</strong>).</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="repeat_penalty">Repeat penalty</label>
+                        <div class="slider-container">
+                            <input type="range" id="repeat_penalty-slider" min="0.5" max="2" step="0.01">
+                            <input type="number" id="repeat_penalty" name="repeat_penalty" step="0.01" min="0.5" max="2" class="slider-number">
+                        </div>
+                        <small class="field-help">Multiplicative penalty on repeated token sequences. llama.cpp default <strong>1.0</strong> (disabled). <strong>1.1</strong> is a mild nudge against loops; values &gt;1.2 start hurting quality.</small>
+                    </div>
+                </div>
+
                 <div id="llama-section" class="card" style="padding: 1rem; margin-bottom: 0;">
                     <h2 style="margin-bottom: 0.25rem;">llama.cpp options</h2>
                     <small class="field-help" style="margin-bottom: 0.75rem;">Backend flags for <code>llama-server</code>. Applied only when Weights format is GGUF. Extra arguments below override any of these (llama.cpp takes the last value for a repeated flag).</small>
@@ -343,6 +362,44 @@
 
                     <div class="form-row">
                         <div class="form-group">
+                            <label for="threads">Threads (<code>--threads</code>)</label>
+                            <input type="number" id="threads" name="threads" min="-1" placeholder="-1 (auto)">
+                            <small class="field-help">CPU threads llama-server uses for generation. llama.cpp default <strong>-1</strong> (auto); set to your physical core count (e.g. <strong>16</strong>) for predictable behavior. Leave blank for the default.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="cache_ram_mib">Cache RAM / MiB (<code>--cache-ram</code>)</label>
+                            <input type="number" id="cache_ram_mib" name="cache_ram_mib" min="-1" placeholder="8192 (default)">
+                            <small class="field-help">Maximum KV cache held on CPU (MiB). llama.cpp default <strong>8192</strong>; <strong>-1</strong> = no limit, <strong>0</strong> = disable CPU-side caching. Leave blank for the default.</small>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="reasoning_format">Reasoning format (<code>--reasoning-format</code>)</label>
+                            <select id="reasoning_format" name="reasoning_format">
+                                <option value="">default (auto)</option>
+                                <option value="none">none — leave thoughts in message.content</option>
+                                <option value="auto">auto — same as deepseek when model emits think tags</option>
+                                <option value="deepseek">deepseek — split into message.reasoning_content</option>
+                                <option value="deepseek-legacy">deepseek-legacy — both inline tags and reasoning_content</option>
+                            </select>
+                            <small class="field-help">Controls how llama-server parses thought tags in the model's output back into the OpenAI response body. These are the only four values llama.cpp accepts.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="reasoning_budget">Reasoning budget (<code>--reasoning-budget</code>)</label>
+                            <input type="number" id="reasoning_budget" name="reasoning_budget" min="-1" placeholder="-1 (unrestricted)">
+                            <small class="field-help">Token budget for the thinking phase. llama.cpp default <strong>-1</strong> (unrestricted), <strong>0</strong> ends thinking immediately, <strong>N&gt;0</strong> caps thinking at N tokens. Leave blank for the default.</small>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="chat_template_kwargs">Chat template kwargs (<code>--chat-template-kwargs</code>)</label>
+                        <input type="text" id="chat_template_kwargs" name="chat_template_kwargs" placeholder='{"enable_thinking":false}'>
+                        <small id="chat_template_kwargs_help" class="field-help">JSON object passed into the model's Jinja chat template. Family-specific keys: Qwen3 uses <code>{"enable_thinking":bool}</code>; gpt-oss uses <code>{"reasoning_effort":"low"|"medium"|"high"|"none"}</code>; Qwen3.6 uses <code>{"preserve_thinking":true}</code>. Leave blank to pass nothing.</small>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
                             <label for="cache_type_k">K cache quantization</label>
                             <select id="cache_type_k" name="cache_type_k">
                                 <option value="">default (f16)</option>
@@ -382,7 +439,7 @@
 
 <!-- ===== Settings modal ===== -->
 <div class="modal-overlay" id="settings-modal">
-    <div class="modal" style="max-width: 640px;">
+    <div class="modal">
         <div class="modal-header">
             <h2>Settings</h2>
             <button type="button" class="modal-close" onclick="closeModal('settings-modal')">×</button>
@@ -468,9 +525,13 @@ const MODEL_DEFAULTS = {
     binary: '', model_path: '',
     port: 9001, context: 4096,
     temperature: 0.6, top_p: 0.95, top_k: 40, min_p: 0.0,
+    presence_penalty: 0.0, repeat_penalty: 1.0,
     flash_attn: false, n_gpu_layers: null, mlock: false, no_mmap: false,
     parallel_slots: null, cache_type_k: null, cache_type_v: null,
     split_mode: null, main_gpu: null, tensor_split: null,
+    threads: null, cache_ram_mib: null,
+    reasoning_format: null, reasoning_budget: null,
+    chat_template_kwargs: null,
     extra_args: [],
 };
 
@@ -571,6 +632,8 @@ function populateModelForm(m, mode) {
     setPair('top_p', m.top_p ?? 0.95);
     setPair('top_k', m.top_k ?? 40);
     setPair('min_p', m.min_p ?? 0.0);
+    setPair('presence_penalty', m.presence_penalty ?? 0.0);
+    setPair('repeat_penalty', m.repeat_penalty ?? 1.0);
 
     // llama.cpp flags
     f.flash_attn.checked = !!m.flash_attn;
@@ -583,6 +646,11 @@ function populateModelForm(m, mode) {
     f.split_mode.value = m.split_mode ?? '';
     f.main_gpu.value = m.main_gpu == null ? '' : String(m.main_gpu);
     f.tensor_split.value = m.tensor_split ?? '';
+    f.threads.value = m.threads == null ? '' : String(m.threads);
+    f.cache_ram_mib.value = m.cache_ram_mib == null ? '' : String(m.cache_ram_mib);
+    f.reasoning_format.value = m.reasoning_format ?? '';
+    f.reasoning_budget.value = m.reasoning_budget == null ? '' : String(m.reasoning_budget);
+    f.chat_template_kwargs.value = m.chat_template_kwargs ?? '';
 
     f.extra_args.value = (m.extra_args || []).join('\n');
 
@@ -650,6 +718,8 @@ async function deleteModel(id, name) {
         ['top_p-slider', 'top_p'],
         ['top_k-slider', 'top_k'],
         ['min_p-slider', 'min_p'],
+        ['presence_penalty-slider', 'presence_penalty'],
+        ['repeat_penalty-slider', 'repeat_penalty'],
     ].forEach(([sliderId, numberId]) => {
         const slider = document.getElementById(sliderId);
         const number = document.getElementById(numberId);
@@ -1029,6 +1099,8 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         top_p: parseFloat(f.top_p.value),
         top_k: parseInt(f.top_k.value, 10),
         min_p: parseFloat(f.min_p.value),
+        presence_penalty: parseFloat(f.presence_penalty.value),
+        repeat_penalty: parseFloat(f.repeat_penalty.value),
         flash_attn: f.flash_attn.checked,
         n_gpu_layers: toOptInt(f.n_gpu_layers.value),
         mlock: f.mlock.checked,
@@ -1039,8 +1111,25 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         split_mode: toOptStr(f.split_mode.value),
         main_gpu: toOptInt(f.main_gpu.value),
         tensor_split: toOptStr(f.tensor_split.value),
+        threads: toOptInt(f.threads.value),
+        cache_ram_mib: toOptInt(f.cache_ram_mib.value),
+        reasoning_format: toOptStr(f.reasoning_format.value),
+        reasoning_budget: toOptInt(f.reasoning_budget.value),
+        chat_template_kwargs: toOptStr(f.chat_template_kwargs.value),
         extra_args: extra,
     };
+    // Validate chat_template_kwargs is parseable JSON if supplied.
+    if (body.chat_template_kwargs) {
+        try {
+            const parsed = JSON.parse(body.chat_template_kwargs);
+            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new Error('must be a JSON object');
+            }
+        } catch (err) {
+            alert(`Chat template kwargs: ${err.message}`);
+            return;
+        }
+    }
     const url = mode === 'add' ? '/api/models' : `/api/models/${encodeURIComponent(body.id)}`;
     const method = mode === 'add' ? 'POST' : 'PUT';
     const r = await fetch(url, {

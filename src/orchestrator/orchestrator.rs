@@ -48,6 +48,20 @@ impl Orchestrator {
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
         server_port: u16,
     ) -> Self {
+        // One-shot migration of legacy `extra_args` into structured fields.
+        // If any model changed, rewrite the vec in the store under its lock
+        // and mark dirty so reconcile persists. Done before building the
+        // HashMap so the resulting in-memory view is already migrated.
+        let mut migrated_any = false;
+        {
+            let mut data = store.write();
+            for m in data.iter_mut() {
+                if m.migrate_extra_args() {
+                    migrated_any = true;
+                }
+            }
+        }
+
         let models: HashMap<String, ModelConfig> = store
             .read()
             .iter()
@@ -78,7 +92,7 @@ impl Orchestrator {
             load_guards: Arc::new(Mutex::new(HashMap::new())),
             store,
             presets_store,
-            dirty: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(AtomicBool::new(migrated_any)),
             presets_dirty: Arc::new(AtomicBool::new(false)),
             server_port,
         }
@@ -508,6 +522,13 @@ mod tests {
             split_mode: None,
             main_gpu: None,
             tensor_split: None,
+            threads: None,
+            cache_ram_mib: None,
+            reasoning_format: None,
+            reasoning_budget: None,
+            chat_template_kwargs: None,
+            presence_penalty: 0.0,
+            repeat_penalty: 1.0,
             state: ModelState::Idle,
             pid: None,
             estimated_vram: 0,
