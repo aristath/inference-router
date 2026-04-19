@@ -1,5 +1,5 @@
 pub mod allocation;
+pub mod engine;
 pub mod eviction;
-pub mod orchestrator;
 
-pub use orchestrator::{AppData, AppState, LoadError, MutationError, Orchestrator, StopError};
+pub use engine::{AppState, LoadError, MutationError, Orchestrator, StopError};

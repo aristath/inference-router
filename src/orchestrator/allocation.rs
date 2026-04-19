@@ -81,7 +81,6 @@ mod tests {
             id: id.into(),
             total_vram: free + 1_000_000_000,
             used_vram: 1_000_000_000,
-            reserved_vram: 0,
             busy_pct: 0,
             temp_c: None,
         }

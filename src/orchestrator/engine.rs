@@ -49,26 +49,23 @@ impl Orchestrator {
         server_port: u16,
     ) -> Self {
         // One-shot migration of legacy `extra_args` into structured fields.
-        // If any model changed, rewrite the vec in the store under its lock
-        // and mark dirty so reconcile persists. Done before building the
-        // HashMap so the resulting in-memory view is already migrated.
-        let mut migrated_any = false;
-        {
-            let mut data = store.write();
-            for m in data.iter_mut() {
+        // If any model changed, mark dirty so reconcile persists the
+        // migrated shape on the next tick.
+        let migrated_any = store.with_mut(|list| {
+            let mut changed = false;
+            for m in list.iter_mut() {
                 if m.migrate_extra_args() {
-                    migrated_any = true;
+                    changed = true;
                 }
             }
-        }
+            changed
+        });
 
         let models: HashMap<String, ModelConfig> = store
-            .read()
-            .iter()
-            .cloned()
-            .map(|m| {
+            .snapshot()
+            .into_iter()
+            .map(|mut m| {
                 // On restart, any model we *thought* was running is stale.
-                let mut m = m;
                 if m.state == ModelState::Running || m.state == ModelState::Loading {
                     m.state = ModelState::Idle;
                     m.pid = None;
@@ -77,17 +74,16 @@ impl Orchestrator {
             })
             .collect();
         let presets: HashMap<String, BinaryPreset> = presets_store
-            .read()
-            .iter()
-            .cloned()
+            .snapshot()
+            .into_iter()
             .map(|p| (p.id.clone(), p))
             .collect();
 
         Self {
             data: Arc::new(Mutex::new(AppData { models, gpus: Vec::new(), presets })),
-            process_manager: Arc::new(Mutex::new(ProcessManager::new())),
-            vram_tracker: Arc::new(VRAMTracker::new()),
-            system_tracker: Arc::new(SystemTracker::new()),
+            process_manager: Arc::new(Mutex::new(ProcessManager::default())),
+            vram_tracker: Arc::new(VRAMTracker),
+            system_tracker: Arc::new(SystemTracker::default()),
             admission: Arc::new(Mutex::new(())),
             load_guards: Arc::new(Mutex::new(HashMap::new())),
             store,
@@ -100,12 +96,28 @@ impl Orchestrator {
 
     // ----- CRUD -----
 
+    /// Lists every configured model, sorted by `id` so the JSON response and
+    /// dashboard have a stable deterministic order.
     pub async fn list_models(&self) -> Vec<ModelConfig> {
-        self.data.lock().await.models.values().cloned().collect()
+        let mut list: Vec<ModelConfig> =
+            self.data.lock().await.models.values().cloned().collect();
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        list
     }
 
     pub fn system_stats(&self) -> SystemStats {
         self.system_tracker.sample()
+    }
+
+    /// Bump `last_used` on the named model. Called by the proxy after a
+    /// successful request so the eviction heuristic sees live activity,
+    /// not just the initial load timestamp.
+    pub async fn mark_used(&self, id: &str) {
+        let mut data = self.data.lock().await;
+        if let Some(m) = data.models.get_mut(id) {
+            m.last_used = Some(unix_now());
+            self.dirty.store(true, Ordering::Relaxed);
+        }
     }
 
     pub async fn list_gpus(&self) -> Vec<GpuInfo> {
@@ -118,6 +130,7 @@ impl Orchestrator {
         fresh
     }
 
+    #[cfg(test)]
     pub async fn get_model(&self, id: &str) -> Option<ModelConfig> {
         self.data.lock().await.models.get(id).cloned()
     }
@@ -164,6 +177,9 @@ impl Orchestrator {
         if data.models.contains_key(&model.id) {
             return Err(MutationError::Conflict(model.id));
         }
+        if let Some(other) = data.models.values().find(|m| m.port == model.port) {
+            return Err(MutationError::PortConflict(model.port, other.id.clone()));
+        }
         data.models.insert(model.id.clone(), model);
         self.dirty.store(true, Ordering::Relaxed);
         Ok(())
@@ -171,6 +187,13 @@ impl Orchestrator {
 
     pub async fn update_model(&self, new: ModelConfig) -> Result<(), MutationError> {
         let mut data = self.data.lock().await;
+        if let Some(other) = data
+            .models
+            .values()
+            .find(|m| m.port == new.port && m.id != new.id)
+        {
+            return Err(MutationError::PortConflict(new.port, other.id.clone()));
+        }
         let existing = data.models.get_mut(&new.id)
             .ok_or_else(|| MutationError::NotFound(new.id.clone()))?;
 
@@ -198,17 +221,26 @@ impl Orchestrator {
     }
 
     pub async fn remove_model(&self, id: &str) -> Result<(), MutationError> {
-        let was_running = {
+        let pid = {
             let data = self.data.lock().await;
             let m = data.models.get(id).ok_or_else(|| MutationError::NotFound(id.into()))?;
-            m.state == ModelState::Running
+            m.pid
         };
-        if was_running {
-            if let Err(e) = self.stop_model_inner(id).await {
-                warn!(model = id, error = %e, "failed to stop model during delete");
-            }
+        // Try a graceful stop first so the child dies cleanly.
+        if let Err(e) = self.stop_model_inner(id).await {
+            warn!(model = id, error = %e, "failed to stop model during delete");
+        }
+        // Belt-and-braces: if the graceful stop left a tracked pid behind
+        // (e.g. signal failed, reconcile hasn't noticed), drop the handle
+        // so `kill_on_drop` fires when the ProcessManager Child is dropped
+        // on orchestrator shutdown — no orphan llama-server lingering on.
+        if let Some(pid) = pid {
+            self.process_manager.lock().await.forget(pid);
         }
         self.data.lock().await.models.remove(id);
+        // Drop the per-model load guard so the HashMap doesn't slowly grow
+        // as configs come and go.
+        self.load_guards.lock().await.remove(id);
         self.dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -259,101 +291,124 @@ impl Orchestrator {
         }
     }
 
-    /// Inner load path. Holds the admission lock across VRAM check + spawn.
+    /// Inner load path.
+    ///
+    /// The admission lock serializes VRAM accounting + eviction + fork/exec
+    /// — the steps where two concurrent loads could step on each other's
+    /// VRAM budget. We drop admission before waiting for health; that way
+    /// a 180-second health poll can't block a second model from starting
+    /// on a different GPU.
     async fn do_load(&self, id: &str) -> Result<u16, LoadError> {
-        let _admit = self.admission.lock().await;
+        let (mut pending, pid, port) = {
+            let _admit = self.admission.lock().await;
 
-        // Refresh VRAM into AppData.
-        let gpus = self.vram_tracker.refresh();
-        {
-            let mut data = self.data.lock().await;
-            data.gpus = gpus.clone();
-        }
+            // Refresh VRAM into AppData.
+            let gpus = self.vram_tracker.refresh();
+            {
+                let mut data = self.data.lock().await;
+                data.gpus = gpus.clone();
+            }
 
-        // Snapshot the model + resolve preset → binary path.
-        let mut model = {
-            let data = self.data.lock().await;
-            let mut m = data
-                .models
-                .get(id)
-                .cloned()
-                .ok_or_else(|| LoadError::ModelNotFound(id.into()))?;
-            if let Some(ref preset_id) = m.binary_preset {
-                match data.presets.get(preset_id) {
-                    Some(p) => m.binary = p.binary.clone(),
-                    None => {
-                        return Err(LoadError::PresetNotFound(preset_id.clone()));
+            // Snapshot the model + resolve preset → binary path.
+            let mut model = {
+                let data = self.data.lock().await;
+                let mut m = data
+                    .models
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| LoadError::ModelNotFound(id.into()))?;
+                if let Some(ref preset_id) = m.binary_preset {
+                    match data.presets.get(preset_id) {
+                        Some(p) => m.binary = p.binary.clone(),
+                        None => {
+                            return Err(LoadError::PresetNotFound(preset_id.clone()));
+                        }
                     }
                 }
-            }
-            m
-        };
+                m
+            };
 
-        if model.weights_format == WeightsFormat::Gguf {
-            match VramEstimate::from_gguf(&model.model_path, model.context) {
-                Ok(est) => model.estimated_vram = est.total_vram,
-                Err(e) => warn!(model = id, error = %e, "gguf parse failed; loading without estimate"),
+            if model.weights_format == WeightsFormat::Gguf {
+                match VramEstimate::from_gguf(&model.model_path, model.context) {
+                    Ok(est) => model.estimated_vram = est.total_vram,
+                    Err(e) => warn!(model = id, error = %e, "gguf parse failed; loading without estimate"),
+                }
+                let mut data = self.data.lock().await;
+                if let Some(m) = data.models.get_mut(id) {
+                    m.estimated_vram = model.estimated_vram;
+                }
             }
-            let mut data = self.data.lock().await;
-            if let Some(m) = data.models.get_mut(id) {
-                m.estimated_vram = model.estimated_vram;
-            }
-        }
 
-        // Evict if needed.
-        let free: u64 = gpus.iter().map(|g| g.free_vram()).sum();
-        if model.estimated_vram > free {
-            let snapshot = self.data.lock().await.models.clone();
-            for action in decide_eviction(&snapshot, &gpus, model.estimated_vram) {
-                if let EvictionAction::Evict(victim) = action {
+            // Evict if needed.
+            let free: u64 = gpus.iter().map(|g| g.free_vram()).sum();
+            if model.estimated_vram > free {
+                let snapshot = self.data.lock().await.models.clone();
+                for EvictionAction::Evict(victim) in
+                    decide_eviction(&snapshot, &gpus, model.estimated_vram)
+                {
                     info!(victim = victim, "evicting to make room");
                     if let Err(e) = self.stop_model_inner(&victim).await {
                         warn!(model = victim, error = %e, "eviction stop failed");
                     }
                 }
+                // Re-read VRAM after eviction so the allocator sees the freed space.
+                let gpus_after = self.vram_tracker.refresh();
+                self.data.lock().await.gpus = gpus_after;
             }
-            // Re-read VRAM after eviction so the allocator sees the freed space.
-            let gpus_after = self.vram_tracker.refresh();
-            self.data.lock().await.gpus = gpus_after;
-        }
 
-        // Auto-allocate across the smallest viable GPU subset, unless the user
-        // pinned an explicit tensor_split.
-        if model.weights_format == WeightsFormat::Gguf && model.tensor_split.is_none() {
-            let snapshot = self.data.lock().await.gpus.clone();
-            if snapshot.len() > 1 && model.estimated_vram > 0 {
-                if let Some(split) = plan_tensor_split(&snapshot, model.estimated_vram) {
-                    info!(
-                        model = id,
-                        gpus_used = gpus_used(&split),
-                        tensor_split = split,
-                        "auto-allocated across minimum GPU subset"
-                    );
-                    model.tensor_split = Some(split);
+            // Auto-allocate across the smallest viable GPU subset, unless the
+            // user pinned an explicit tensor_split.
+            if model.weights_format == WeightsFormat::Gguf && model.tensor_split.is_none() {
+                let snapshot = self.data.lock().await.gpus.clone();
+                if snapshot.len() > 1 && model.estimated_vram > 0 {
+                    if let Some(split) = plan_tensor_split(&snapshot, model.estimated_vram) {
+                        info!(
+                            model = id,
+                            gpus_used = gpus_used(&split),
+                            tensor_split = split,
+                            "auto-allocated across minimum GPU subset"
+                        );
+                        model.tensor_split = Some(split);
+                    }
                 }
             }
-        }
 
-        // Spawn.
-        let pid = self
-            .process_manager
-            .lock()
-            .await
-            .spawn(&model)
-            .await
-            .map_err(LoadError::SpawnFailed)?;
+            // Fork + exec (fast). Holding the admission lock across this is
+            // still cheap — just until the process exists on disk.
+            let pending = self
+                .process_manager
+                .lock()
+                .await
+                .spawn_child(&model)
+                .map_err(LoadError::SpawnFailed)?;
+            let pid = pending.pid;
+            let port = pending.port;
+            (pending, pid, port)
+        };
+        // Admission and process_manager mutexes are dropped here; other
+        // loads can proceed even while we're still waiting for `pending`
+        // to report healthy (up to 180 seconds).
 
-        // Record running state.
-        {
-            let mut data = self.data.lock().await;
-            if let Some(m) = data.models.get_mut(id) {
-                m.state = ModelState::Running;
-                m.pid = Some(pid);
-                m.last_used = Some(unix_now());
+        match pending.wait_for_health(std::time::Duration::from_secs(180)).await {
+            Ok(()) => {
+                self.process_manager.lock().await.register(pending);
+                let mut data = self.data.lock().await;
+                if let Some(m) = data.models.get_mut(id) {
+                    m.state = ModelState::Running;
+                    m.pid = Some(pid);
+                    m.last_used = Some(unix_now());
+                }
+                self.dirty.store(true, Ordering::Relaxed);
+                info!(pid, port, model = id, "inference server ready");
+                Ok(port)
+            }
+            Err(e) => {
+                // `pending` is dropped here; `kill_on_drop(true)` on the
+                // Child fires and the process is SIGKILLed.
+                error!(pid, port, error = %e, "health check failed; spawn cancelled");
+                Err(LoadError::SpawnFailed(crate::process::manager::SpawnError::HealthCheckFailed(e)))
             }
         }
-        self.dirty.store(true, Ordering::Relaxed);
-        Ok(model.port)
     }
 
     pub async fn stop_model(&self, id: &str) -> Result<(), StopError> {
@@ -369,7 +424,7 @@ impl Orchestrator {
             m.pid
         };
         if let Some(pid) = pid {
-            self.process_manager.lock().await.stop(pid);
+            self.process_manager.lock().await.stop(pid).await;
         }
         {
             let mut data = self.data.lock().await;
@@ -426,10 +481,7 @@ impl Orchestrator {
         if self.dirty.swap(false, Ordering::Relaxed) {
             let snapshot: Vec<ModelConfig> =
                 self.data.lock().await.models.values().cloned().collect();
-            {
-                let mut w = self.store.write();
-                *w = snapshot;
-            }
+            self.store.replace(snapshot);
             if let Err(e) = self.store.save() {
                 error!(error = %e, "failed to persist models.json");
                 self.dirty.store(true, Ordering::Relaxed);
@@ -439,10 +491,7 @@ impl Orchestrator {
         if self.presets_dirty.swap(false, Ordering::Relaxed) {
             let snapshot: Vec<BinaryPreset> =
                 self.data.lock().await.presets.values().cloned().collect();
-            {
-                let mut w = self.presets_store.write();
-                *w = snapshot;
-            }
+            self.presets_store.replace(snapshot);
             if let Err(e) = self.presets_store.save() {
                 error!(error = %e, "failed to persist presets.json");
                 self.presets_dirty.store(true, Ordering::Relaxed);
@@ -483,6 +532,9 @@ pub enum MutationError {
 
     #[error("model '{0}' already exists")]
     Conflict(String),
+
+    #[error("port {0} is already in use by model '{1}'")]
+    PortConflict(u16, String),
 }
 
 #[cfg(test)]
@@ -501,38 +553,10 @@ mod tests {
         ModelConfig {
             id: id.into(),
             name: id.into(),
-            weights_format: WeightsFormat::Gguf,
-            binary_preset: None,
             binary: PathBuf::from("/bin/true"),
             model_path: PathBuf::from("/tmp/m.gguf"),
             port,
-            extra_args: vec![],
-            context: 4096,
-            temperature: 0.6,
-            top_p: 0.95,
-            top_k: 40,
-            min_p: 0.0,
-            flash_attn: false,
-            n_gpu_layers: None,
-            mlock: false,
-            no_mmap: false,
-            parallel_slots: None,
-            cache_type_k: None,
-            cache_type_v: None,
-            split_mode: None,
-            main_gpu: None,
-            tensor_split: None,
-            threads: None,
-            cache_ram_mib: None,
-            reasoning_format: None,
-            reasoning_budget: None,
-            chat_template_kwargs: None,
-            presence_penalty: 0.0,
-            repeat_penalty: 1.0,
-            state: ModelState::Idle,
-            pid: None,
-            estimated_vram: 0,
-            last_used: None,
+            ..ModelConfig::default()
         }
     }
 
@@ -553,6 +577,97 @@ mod tests {
         o.add_model(model("a", 9001)).await.unwrap();
         let err = o.add_model(model("a", 9002)).await.unwrap_err();
         assert!(matches!(err, MutationError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn add_model_duplicate_port_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("a", 9001)).await.unwrap();
+        let err = o.add_model(model("b", 9001)).await.unwrap_err();
+        match err {
+            MutationError::PortConflict(port, holder) => {
+                assert_eq!(port, 9001);
+                assert_eq!(holder, "a");
+            }
+            other => panic!("expected PortConflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_model_rejects_colliding_port_from_another_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("a", 9001)).await.unwrap();
+        o.add_model(model("b", 9002)).await.unwrap();
+        // Try to point `b` at `a`'s port.
+        let mut b_on_a_port = model("b", 9001);
+        b_on_a_port.name = "b-renamed".into();
+        let err = o.update_model(b_on_a_port).await.unwrap_err();
+        assert!(matches!(err, MutationError::PortConflict(9001, ref h) if h == "a"));
+    }
+
+    #[tokio::test]
+    async fn update_model_allows_reusing_its_own_port() {
+        // Self-port isn't a collision — `update` may touch any field while
+        // leaving the port alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("a", 9001)).await.unwrap();
+        let mut a = model("a", 9001);
+        a.name = "renamed".into();
+        assert!(o.update_model(a).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mark_used_updates_last_used_and_marks_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("a", 9001)).await.unwrap();
+        // last_used starts as None.
+        assert!(o.get_model("a").await.unwrap().last_used.is_none());
+
+        o.dirty.store(false, Ordering::Relaxed);
+        o.mark_used("a").await;
+        assert!(o.get_model("a").await.unwrap().last_used.is_some());
+        assert!(o.dirty.load(Ordering::Relaxed), "mark_used must mark dirty so reconcile persists");
+    }
+
+    #[tokio::test]
+    async fn mark_used_unknown_model_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.dirty.store(false, Ordering::Relaxed);
+        o.mark_used("does-not-exist").await;
+        assert!(!o.dirty.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn remove_model_clears_per_model_load_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("a", 9001)).await.unwrap();
+
+        // Prime the load-guard entry (ensure_loaded would insert one).
+        o.load_guards.lock().await
+            .entry("a".into())
+            .or_insert_with(|| Arc::new(Mutex::new(())));
+        assert!(o.load_guards.lock().await.contains_key("a"));
+
+        o.remove_model("a").await.unwrap();
+        assert!(!o.load_guards.lock().await.contains_key("a"),
+            "load_guards must drop entries for removed models so the map doesn't grow forever");
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_sorted_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("charlie", 9001)).await.unwrap();
+        o.add_model(model("alpha", 9002)).await.unwrap();
+        o.add_model(model("bravo", 9003)).await.unwrap();
+        let ids: Vec<String> = o.list_models().await.into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["alpha", "bravo", "charlie"]);
     }
 
     #[tokio::test]

@@ -34,14 +34,16 @@ struct CpuSample {
     idle: u64,
 }
 
-impl SystemTracker {
-    pub fn new() -> Self {
+impl Default for SystemTracker {
+    fn default() -> Self {
         Self {
             prev_cpu: Mutex::new(None),
             cpu_temp_path: Mutex::new(None),
         }
     }
+}
 
+impl SystemTracker {
     /// Reads fresh metrics. Must be called repeatedly — CPU % is derived from
     /// the delta against the previous sample.
     pub fn sample(&self) -> SystemStats {
@@ -188,7 +190,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let stat = tmp.path().join("stat");
         fs::write(&stat, "cpu  100 0 50 1000 0 0 0 0 0 0\n").unwrap();
-        let tracker = SystemTracker::new();
+        let tracker = SystemTracker::default();
         let s = tracker.sample_from(
             stat.to_str().unwrap(),
             "/nonexistent",
@@ -201,7 +203,7 @@ mod tests {
     fn cpu_sample_computes_delta() {
         let tmp = tempfile::tempdir().unwrap();
         let stat = tmp.path().join("stat");
-        let tracker = SystemTracker::new();
+        let tracker = SystemTracker::default();
 
         // First sample: 100 busy, 1000 idle → total 1100.
         fs::write(&stat, "cpu  100 0 0 1000 0 0 0 0 0 0\n").unwrap();
@@ -223,7 +225,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mem = tmp.path().join("meminfo");
         fs::write(&mem, "MemTotal:       1000 kB\nMemFree:  100 kB\nMemAvailable:   400 kB\nBuffers: 0 kB\n").unwrap();
-        let tracker = SystemTracker::new();
+        let tracker = SystemTracker::default();
         let s = tracker.sample_from("/nonexistent", mem.to_str().unwrap(), "/nonexistent");
         assert_eq!(s.ram_total, 1000 * 1024);
         assert_eq!(s.ram_used, (1000 - 400) * 1024);
@@ -263,7 +265,7 @@ mod tests {
         let meminfo = root.join("meminfo");
         fs::write(&meminfo, "MemTotal: 1 kB\nMemAvailable: 0 kB\n").unwrap();
 
-        let tracker = SystemTracker::new();
+        let tracker = SystemTracker::default();
         let s = tracker.sample_from(
             stat.to_str().unwrap(),
             meminfo.to_str().unwrap(),

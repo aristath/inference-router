@@ -3,162 +3,67 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path as StdPath, PathBuf};
 
-use crate::config::{
-    BinaryPreset, CacheType, ModelConfig, ModelState, ReasoningFormat, SplitMode, WeightsFormat,
-};
+use crate::config::{BinaryPreset, ModelConfig};
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
 use crate::vram::estimator::GgufInfo;
-
-fn default_temperature() -> f32 { 0.6 }
-fn default_top_p() -> f32 { 0.95 }
-fn default_top_k() -> i32 { 40 }
-fn default_min_p() -> f32 { 0.0 }
-fn default_presence_penalty() -> f32 { 0.0 }
-fn default_repeat_penalty() -> f32 { 1.0 }
-
-#[derive(Deserialize)]
-pub struct ModelRequest {
-    pub id: String,
-    pub name: String,
-    pub weights_format: WeightsFormat,
-    #[serde(default)]
-    pub binary_preset: Option<String>,
-    pub binary: String,
-    pub model_path: String,
-    pub port: u16,
-    pub context: u32,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
-    #[serde(default = "default_top_p")]
-    pub top_p: f32,
-    #[serde(default = "default_top_k")]
-    pub top_k: i32,
-    #[serde(default = "default_min_p")]
-    pub min_p: f32,
-    #[serde(default = "default_presence_penalty")]
-    pub presence_penalty: f32,
-    #[serde(default = "default_repeat_penalty")]
-    pub repeat_penalty: f32,
-    #[serde(default)]
-    pub extra_args: Vec<String>,
-    #[serde(default)]
-    pub flash_attn: bool,
-    #[serde(default)]
-    pub n_gpu_layers: Option<u32>,
-    #[serde(default)]
-    pub mlock: bool,
-    #[serde(default)]
-    pub no_mmap: bool,
-    #[serde(default)]
-    pub parallel_slots: Option<u32>,
-    #[serde(default)]
-    pub cache_type_k: Option<CacheType>,
-    #[serde(default)]
-    pub cache_type_v: Option<CacheType>,
-    #[serde(default)]
-    pub split_mode: Option<SplitMode>,
-    #[serde(default)]
-    pub main_gpu: Option<u32>,
-    #[serde(default)]
-    pub tensor_split: Option<String>,
-    #[serde(default)]
-    pub threads: Option<i32>,
-    #[serde(default)]
-    pub cache_ram_mib: Option<i32>,
-    #[serde(default)]
-    pub reasoning_format: Option<ReasoningFormat>,
-    #[serde(default)]
-    pub reasoning_budget: Option<i32>,
-    #[serde(default)]
-    pub chat_template_kwargs: Option<String>,
-}
-
-impl ModelRequest {
-    fn into_config(self) -> ModelConfig {
-        ModelConfig {
-            id: self.id,
-            name: self.name,
-            weights_format: self.weights_format,
-            binary_preset: self.binary_preset,
-            binary: PathBuf::from(self.binary),
-            model_path: PathBuf::from(self.model_path),
-            port: self.port,
-            extra_args: self.extra_args,
-            context: self.context,
-            temperature: self.temperature,
-            top_p: self.top_p,
-            top_k: self.top_k,
-            min_p: self.min_p,
-            presence_penalty: self.presence_penalty,
-            repeat_penalty: self.repeat_penalty,
-            flash_attn: self.flash_attn,
-            n_gpu_layers: self.n_gpu_layers,
-            mlock: self.mlock,
-            no_mmap: self.no_mmap,
-            parallel_slots: self.parallel_slots,
-            cache_type_k: self.cache_type_k,
-            cache_type_v: self.cache_type_v,
-            split_mode: self.split_mode,
-            main_gpu: self.main_gpu,
-            tensor_split: self.tensor_split,
-            threads: self.threads,
-            cache_ram_mib: self.cache_ram_mib,
-            reasoning_format: self.reasoning_format,
-            reasoning_budget: self.reasoning_budget,
-            chat_template_kwargs: self.chat_template_kwargs,
-            state: ModelState::Idle,
-            pid: None,
-            estimated_vram: 0,
-            last_used: None,
-        }
-    }
-}
 
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.list_models().await)
 }
 
-pub async fn create_model(
-    State(state): State<AppState>,
-    Json(req): Json<ModelRequest>,
-) -> impl IntoResponse {
-    let id = req.id.clone();
-    let model = req.into_config();
-    match state.add_model(model).await {
-        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
-        Err(MutationError::Conflict(id)) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": format!("model '{id}' already exists")})),
+/// Convert the orchestrator's mutation errors into an HTTP response. Used by
+/// every create/update/delete handler so the mapping lives in one place.
+fn mutation_response(e: MutationError) -> axum::response::Response {
+    match e {
+        MutationError::NotFound(id) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("'{id}' not found")})),
         )
             .into_response(),
-        Err(MutationError::NotFound(_)) => unreachable!("add_model never returns NotFound"),
+        MutationError::Conflict(id) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("'{id}' already exists")})),
+        )
+            .into_response(),
+        MutationError::PortConflict(port, holder) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("port {port} is already in use by model '{holder}'"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn create_model(
+    State(state): State<AppState>,
+    Json(model): Json<ModelConfig>,
+) -> impl IntoResponse {
+    let id = model.id.clone();
+    match state.add_model(model).await {
+        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+        Err(e) => mutation_response(e),
     }
 }
 
 pub async fn update_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<ModelRequest>,
+    Json(model): Json<ModelConfig>,
 ) -> impl IntoResponse {
     // Enforce URL id == body id to avoid renaming confusion.
-    if req.id != id {
+    if model.id != id {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "id in URL and body must match"})),
         )
             .into_response();
     }
-    let model = req.into_config();
     match state.update_model(model).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(MutationError::NotFound(id)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("model '{id}' not found")})),
-        )
-            .into_response(),
-        Err(MutationError::Conflict(_)) => unreachable!("update_model never returns Conflict"),
+        Err(e) => mutation_response(e),
     }
 }
 
@@ -168,12 +73,7 @@ pub async fn delete_model(
 ) -> impl IntoResponse {
     match state.remove_model(&id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(MutationError::NotFound(id)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("model '{id}' not found")})),
-        )
-            .into_response(),
-        Err(MutationError::Conflict(_)) => unreachable!(),
+        Err(e) => mutation_response(e),
     }
 }
 
@@ -207,63 +107,36 @@ pub async fn load_model(
 
 // ===== Binary presets =====
 
-#[derive(Deserialize)]
-pub struct PresetRequest {
-    pub id: String,
-    pub name: String,
-    pub binary: String,
-}
-
-impl PresetRequest {
-    fn into_preset(self) -> BinaryPreset {
-        BinaryPreset {
-            id: self.id,
-            name: self.name,
-            binary: PathBuf::from(self.binary),
-        }
-    }
-}
-
 pub async fn list_presets(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.list_presets().await)
 }
 
 pub async fn create_preset(
     State(state): State<AppState>,
-    Json(req): Json<PresetRequest>,
+    Json(preset): Json<BinaryPreset>,
 ) -> impl IntoResponse {
-    let id = req.id.clone();
-    match state.add_preset(req.into_preset()).await {
+    let id = preset.id.clone();
+    match state.add_preset(preset).await {
         Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
-        Err(MutationError::Conflict(id)) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": format!("preset '{id}' already exists")})),
-        )
-            .into_response(),
-        Err(MutationError::NotFound(_)) => unreachable!(),
+        Err(e) => mutation_response(e),
     }
 }
 
 pub async fn update_preset(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<PresetRequest>,
+    Json(preset): Json<BinaryPreset>,
 ) -> impl IntoResponse {
-    if req.id != id {
+    if preset.id != id {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "id in URL and body must match"})),
         )
             .into_response();
     }
-    match state.update_preset(req.into_preset()).await {
+    match state.update_preset(preset).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(MutationError::NotFound(id)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("preset '{id}' not found")})),
-        )
-            .into_response(),
-        Err(MutationError::Conflict(_)) => unreachable!(),
+        Err(e) => mutation_response(e),
     }
 }
 
@@ -273,12 +146,7 @@ pub async fn delete_preset(
 ) -> impl IntoResponse {
     match state.remove_preset(&id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(MutationError::NotFound(id)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("preset '{id}' not found")})),
-        )
-            .into_response(),
-        Err(MutationError::Conflict(_)) => unreachable!(),
+        Err(e) => mutation_response(e),
     }
 }
 
@@ -296,6 +164,28 @@ pub async fn stop_model(
     }
 }
 
+// ===== File-browser + GGUF metadata =====
+//
+// Both endpoints accept arbitrary paths from the browser. The dashboard is
+// localhost-only and single-user, but the endpoints still sandbox to `$HOME`
+// so a stray script or browser redirection can't list `/etc`, `/root`, etc.
+
+fn home_root() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|p| std::fs::canonicalize(p).ok())
+}
+
+/// Resolve `raw` against `$HOME` and return the canonicalized path only if
+/// it lives under `$HOME`. Returns `None` on any form of escape (symlinks,
+/// `..`, absolute paths pointing outside the sandbox).
+fn sandboxed(raw: &str) -> Option<PathBuf> {
+    let expanded = shellexpand::tilde(raw).to_string();
+    let resolved = std::fs::canonicalize(StdPath::new(&expanded)).ok()?;
+    let home = home_root()?;
+    resolved.starts_with(&home).then_some(resolved)
+}
+
 #[derive(Deserialize)]
 pub struct GgufInfoQuery {
     pub path: String,
@@ -304,8 +194,14 @@ pub struct GgufInfoQuery {
 /// Reads GGUF metadata for a file on disk. Used by the model form to drive
 /// the context slider's upper bound and the live VRAM preview.
 pub async fn gguf_info(Query(q): Query<GgufInfoQuery>) -> impl IntoResponse {
-    let expanded = shellexpand::tilde(&q.path).to_string();
-    match GgufInfo::read(std::path::Path::new(&expanded)) {
+    let Some(path) = sandboxed(&q.path) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "path must be inside $HOME"})),
+        )
+            .into_response();
+    };
+    match GgufInfo::read(&path) {
         Ok(info) => (StatusCode::OK, Json(info)).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -321,9 +217,14 @@ pub struct FileBrowserQuery {
 }
 
 pub async fn list_files(Query(req): Query<FileBrowserQuery>) -> impl IntoResponse {
-    let expanded = shellexpand::tilde(&req.path).to_string();
-    let path = std::path::Path::new(&expanded);
-    if !path.exists() || !path.is_dir() {
+    let Some(path) = sandboxed(&req.path) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "path must be inside $HOME"})),
+        )
+            .into_response();
+    };
+    if !path.is_dir() {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "not a directory"})),
@@ -332,7 +233,7 @@ pub async fn list_files(Query(req): Query<FileBrowserQuery>) -> impl IntoRespons
     }
 
     let mut entries = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(path) {
+    if let Ok(read_dir) = std::fs::read_dir(&path) {
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = entry.path().is_dir();

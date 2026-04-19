@@ -6,14 +6,17 @@ use tracing::debug;
 
 /// A generic file-backed JSON store.
 ///
-/// Provides atomic load/save operations using write-to-temp-then-rename.
-/// Thread-safe via `std::sync::Mutex`.
-pub struct JsonStore<T: DeserializeOwned + Serialize + Send + Sync> {
+/// Provides atomic load/save (write-to-temp-then-rename) and snapshot /
+/// replace semantics. The internal `std::sync::Mutex` never escapes this
+/// module, and the public API only returns owned values, so callers cannot
+/// accidentally hold the lock across an `await` and block the tokio
+/// runtime.
+pub struct JsonStore<T: Clone + DeserializeOwned + Serialize + Send + Sync> {
     path: PathBuf,
     data: std::sync::Mutex<T>,
 }
 
-impl<T: DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
+impl<T: Clone + DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
     /// Creates a new store at the given path, loading existing data if present.
     pub fn new(path: PathBuf) -> Self {
         let data = match Self::load_file(&path) {
@@ -22,7 +25,11 @@ impl<T: DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
                 data
             }
             Err(e) => {
-                debug!("No existing config at {}, will create on first save: {}", path.display(), e);
+                debug!(
+                    "No existing config at {}, will create on first save: {}",
+                    path.display(),
+                    e,
+                );
                 Self::empty_data()
             }
         };
@@ -32,52 +39,46 @@ impl<T: DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
         }
     }
 
-    /// Creates a store with empty initial data (for testing).
-    pub fn with_data(path: PathBuf, data: T) -> Self {
-        Self {
-            path,
-            data: std::sync::Mutex::new(data),
-        }
+    /// Returns a cloned snapshot of the current data. Never holds the
+    /// underlying mutex across the caller's code paths.
+    pub fn snapshot(&self) -> T {
+        self.data.lock().expect("JsonStore lock poisoned").clone()
     }
 
-    /// Returns the path this store writes to.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Replaces the in-memory data with `new`. Paired with `snapshot` for
+    /// read-modify-write on the caller's owned value.
+    pub fn replace(&self, new: T) {
+        *self.data.lock().expect("JsonStore lock poisoned") = new;
     }
 
-    /// Reads the current data under the lock.
-    pub fn read(&self) -> std::sync::MutexGuard<'_, T> {
-        self.data.lock().expect("JsonStore lock poisoned")
-    }
-
-    /// Mutates the data under the lock.
-    pub fn write(&self) -> std::sync::MutexGuard<'_, T> {
-        self.data.lock().expect("JsonStore lock poisoned")
+    /// Mutates the in-memory data under the lock via a short closure. The
+    /// closure must NOT await, call back into this store, or block — it
+    /// runs while the synchronous mutex is held.
+    pub fn with_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        let mut guard = self.data.lock().expect("JsonStore lock poisoned");
+        f(&mut guard)
     }
 
     /// Saves the current data to disk atomically.
     pub fn save(&self) -> Result<(), StoreError> {
-        let data = self.read();
-        let json = serde_json::to_string_pretty(&*data)
-            .map_err(|e| StoreError::Serialization(e))?;
+        let snapshot = self.snapshot();
+        let json = serde_json::to_string_pretty(&snapshot).map_err(StoreError::Serialization)?;
 
-        // Ensure parent directory exists
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| StoreError::Io(e))?;
+            fs::create_dir_all(parent).map_err(StoreError::Io)?;
         }
 
-        // Write to temp file, then rename for atomicity
+        // Write to temp file, then rename for atomicity.
         let temp_path = self.path.with_extension("json.tmp");
         {
-            let mut file = fs::File::create(&temp_path)
-                .map_err(|e| StoreError::Io(e))?;
-            file.write_all(json.as_bytes())
-                .map_err(|e| StoreError::Io(e))?;
-            file.sync_all()
-                .map_err(|e| StoreError::Io(e))?;
+            let mut file = fs::File::create(&temp_path).map_err(StoreError::Io)?;
+            file.write_all(json.as_bytes()).map_err(StoreError::Io)?;
+            file.sync_all().map_err(StoreError::Io)?;
         }
-        fs::rename(&temp_path, &self.path)
-            .map_err(|e| StoreError::Io(e))?;
+        fs::rename(&temp_path, &self.path).map_err(StoreError::Io)?;
 
         debug!("Saved config to {}", self.path.display());
         Ok(())
@@ -88,25 +89,19 @@ impl<T: DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
         if !path.exists() {
             return Err(StoreError::NotFound(path.to_path_buf()));
         }
-        let contents = fs::read_to_string(path)
-            .map_err(|e| StoreError::Io(e))?;
-        let data = serde_json::from_str(&contents)
-            .map_err(|e| StoreError::Deserialization(e))?;
-        Ok(data)
+        let contents = fs::read_to_string(path).map_err(StoreError::Io)?;
+        serde_json::from_str(&contents).map_err(StoreError::Deserialization)
     }
 
     /// Returns the default empty data.
     fn empty_data() -> T {
-        // This requires T to implement Default, which we can't enforce.
-        // Instead, we use a workaround: try to load an empty JSON value.
-        // For Vec<T>, this means []. For other types, we'll need specific handling.
-        // Since most of our stores use Vec<T>, this works for those.
-        serde_json::from_value(serde_json::Value::Array(vec![]))
-            .unwrap_or_else(|_| {
-                // Fallback: try object
-                serde_json::from_value(serde_json::Value::Object(serde_json::Map::new()))
-                    .expect("Failed to create empty data")
-            })
+        // We don't require T: Default; most of our stores use Vec<T>, so an
+        // empty JSON array deserializes cleanly. Fall back to an empty JSON
+        // object for map-shaped configs.
+        serde_json::from_value(serde_json::Value::Array(vec![])).unwrap_or_else(|_| {
+            serde_json::from_value(serde_json::Value::Object(serde_json::Map::new()))
+                .expect("Failed to create empty data")
+        })
     }
 }
 
@@ -148,10 +143,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = create_test_store(&dir);
 
-        let mut items = store.write();
-        items.push(TestItem { id: "a".into(), value: 1 });
-        drop(items);
-
+        store.with_mut(|items| items.push(TestItem { id: "a".into(), value: 1 }));
         store.save().unwrap();
 
         assert!(dir.path().join("items.json").exists());
@@ -162,7 +154,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("items.json");
 
-        // Create file manually
         let items = vec![
             TestItem { id: "a".into(), value: 1 },
             TestItem { id: "b".into(), value: 2 },
@@ -170,9 +161,8 @@ mod tests {
         let json = serde_json::to_string_pretty(&items).unwrap();
         fs::write(&path, json).unwrap();
 
-        // Store should load it
         let store: JsonStore<Vec<TestItem>> = JsonStore::new(path);
-        let loaded = store.read();
+        let loaded = store.snapshot();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].id, "a");
         assert_eq!(loaded[1].value, 2);
@@ -183,25 +173,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = create_test_store(&dir);
 
-        let items = store.read();
-        assert!(items.is_empty());
+        assert!(store.snapshot().is_empty());
     }
 
     #[test]
     fn test_store_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let store = create_test_store(&dir);
+        let path = dir.path().join("items.json");
+        let store: JsonStore<Vec<TestItem>> = JsonStore::new(path.clone());
 
-        // Write
-        {
-            let mut items = store.write();
-            items.push(TestItem { id: "x".into(), value: 42 });
-        }
+        store.with_mut(|items| items.push(TestItem { id: "x".into(), value: 42 }));
         store.save().unwrap();
 
-        // Reload from disk
-        let store2: JsonStore<Vec<TestItem>> = JsonStore::new(store.path().to_path_buf());
-        let items = store2.read();
+        let store2: JsonStore<Vec<TestItem>> = JsonStore::new(path);
+        let items = store2.snapshot();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "x");
         assert_eq!(items[0].value, 42);
@@ -210,44 +195,32 @@ mod tests {
     #[test]
     fn test_store_atomic_write() {
         let dir = tempfile::tempdir().unwrap();
-        let store = create_test_store(&dir);
+        let path = dir.path().join("items.json");
+        let store: JsonStore<Vec<TestItem>> = JsonStore::new(path.clone());
 
-        // Save initial data
-        {
-            let mut items = store.write();
-            items.push(TestItem { id: "initial".into(), value: 0 });
-        }
+        store.with_mut(|items| items.push(TestItem { id: "initial".into(), value: 0 }));
         store.save().unwrap();
 
-        // Modify and save again
-        {
-            let mut items = store.write();
-            items[0].value = 100;
-        }
+        store.with_mut(|items| items[0].value = 100);
         store.save().unwrap();
 
-        // Verify the final state is correct
-        let store2: JsonStore<Vec<TestItem>> = JsonStore::new(store.path().to_path_buf());
-        let items = store2.read();
+        let store2: JsonStore<Vec<TestItem>> = JsonStore::new(path);
+        let items = store2.snapshot();
         assert_eq!(items[0].value, 100);
 
-        // No temp file should be left behind
         assert!(!dir.path().join("items.json.tmp").exists());
     }
 
     #[test]
     fn test_store_preserves_formatting() {
         let dir = tempfile::tempdir().unwrap();
-        let store = create_test_store(&dir);
+        let path = dir.path().join("items.json");
+        let store: JsonStore<Vec<TestItem>> = JsonStore::new(path.clone());
 
-        {
-            let mut items = store.write();
-            items.push(TestItem { id: "fmt".into(), value: 1 });
-        }
+        store.with_mut(|items| items.push(TestItem { id: "fmt".into(), value: 1 }));
         store.save().unwrap();
 
-        let contents = fs::read_to_string(store.path()).unwrap();
-        // Should be pretty-printed (indented)
+        let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains('\n'));
         assert!(contents.contains(' '));
     }

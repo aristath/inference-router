@@ -1,39 +1,37 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-fn default_temperature() -> f32 { 0.6 }
-fn default_top_p() -> f32 { 0.95 }
-fn default_top_k() -> i32 { 40 }
-fn default_min_p() -> f32 { 0.0 }
-fn default_presence_penalty() -> f32 { 0.0 }
-fn default_repeat_penalty() -> f32 { 1.0 }
+// Default values for sampling params. These are the llama.cpp defaults; we
+// keep them in one place so `ModelConfig`, `ModelRequest`, and any future
+// DTO all share a single source of truth (visible via `pub` for serde
+// `#[serde(default = "...")]` callers in other modules).
+pub fn default_temperature() -> f32 { 0.6 }
+pub fn default_top_p() -> f32 { 0.95 }
+pub fn default_top_k() -> i32 { 40 }
+pub fn default_min_p() -> f32 { 0.0 }
+pub fn default_presence_penalty() -> f32 { 0.0 }
+pub fn default_repeat_penalty() -> f32 { 1.0 }
 
 /// Weights file format. Drives the argv style used when spawning the backend.
 ///
 /// - `Gguf` → llama.cpp-style (`-m <file> -c <ctx> --port ...`)
 /// - `Safetensors` → vLLM-style (`--model <dir> --port ... --max-model-len <ctx>`)
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WeightsFormat {
+    #[default]
     Gguf,
     Safetensors,
 }
 
-impl Default for WeightsFormat {
-    fn default() -> Self { Self::Gguf }
-}
-
 /// Runtime state of a model.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum ModelState {
+    #[default]
     Idle,
     Loading,
     Running,
     Error(String),
-}
-
-impl Default for ModelState {
-    fn default() -> Self { Self::Idle }
 }
 
 /// How llama.cpp splits the model across multiple GPUs.
@@ -91,16 +89,13 @@ impl ReasoningFormat {
 }
 
 /// KV-cache quantization. Applies to llama.cpp (`--cache-type-{k,v}`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheType {
+    #[default]
     F16,
     Q8_0,
     Q4_0,
-}
-
-impl Default for CacheType {
-    fn default() -> Self { Self::F16 }
 }
 
 impl CacheType {
@@ -112,18 +107,14 @@ impl CacheType {
             Self::Q4_0 => "q4_0",
         }
     }
-
-    /// Approximate bytes per value for VRAM estimates.
-    pub fn bytes_per_value(&self) -> f64 {
-        match self {
-            Self::F16 => 2.0,
-            Self::Q8_0 => 1.0,
-            Self::Q4_0 => 0.5,
-        }
-    }
 }
 
 /// Self-contained per-model configuration. No external framework entity.
+///
+/// `Default` produces a blank GGUF model with llama.cpp's sampling defaults
+/// and no binary / model / port set. It exists so tests can use
+/// `ModelConfig { id: "x".into(), ..Default::default() }` instead of
+/// re-listing 30 fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelConfig {
     pub id: String,
@@ -216,6 +207,47 @@ pub struct ModelConfig {
     pub estimated_vram: u64,
     #[serde(default)]
     pub last_used: Option<f64>,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            weights_format: WeightsFormat::default(),
+            binary_preset: None,
+            binary: PathBuf::new(),
+            model_path: PathBuf::new(),
+            port: 0,
+            extra_args: Vec::new(),
+            context: 4096,
+            temperature: default_temperature(),
+            top_p: default_top_p(),
+            top_k: default_top_k(),
+            min_p: default_min_p(),
+            presence_penalty: default_presence_penalty(),
+            repeat_penalty: default_repeat_penalty(),
+            flash_attn: false,
+            n_gpu_layers: None,
+            mlock: false,
+            no_mmap: false,
+            parallel_slots: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            split_mode: None,
+            main_gpu: None,
+            tensor_split: None,
+            threads: None,
+            cache_ram_mib: None,
+            reasoning_format: None,
+            reasoning_budget: None,
+            chat_template_kwargs: None,
+            state: ModelState::default(),
+            pid: None,
+            estimated_vram: 0,
+            last_used: None,
+        }
+    }
 }
 
 impl ModelConfig {
@@ -313,21 +345,15 @@ mod tests {
         ModelConfig {
             id: "qwen3-30b".into(),
             name: "Qwen3 30B".into(),
-            weights_format: WeightsFormat::Gguf,
             binary_preset: Some("llama-vulkan".into()),
             binary: PathBuf::from("/home/u/llama.cpp/build-vulkan/bin/llama-server"),
             model_path: PathBuf::from("/models/qwen3-30b.gguf"),
             port: 9001,
             extra_args: vec!["--override-kv".into(), "something=1".into()],
             context: 32768,
-            temperature: 0.6,
-            top_p: 0.95,
-            top_k: 40,
-            min_p: 0.0,
             flash_attn: true,
             n_gpu_layers: Some(99),
             mlock: true,
-            no_mmap: false,
             parallel_slots: Some(4),
             cache_type_k: Some(CacheType::Q8_0),
             cache_type_v: Some(CacheType::Q8_0),
@@ -339,12 +365,7 @@ mod tests {
             reasoning_format: Some(ReasoningFormat::Auto),
             reasoning_budget: Some(-1),
             chat_template_kwargs: Some(r#"{"enable_thinking":true}"#.into()),
-            presence_penalty: 0.0,
-            repeat_penalty: 1.0,
-            state: ModelState::Idle,
-            pid: None,
-            estimated_vram: 0,
-            last_used: None,
+            ..ModelConfig::default()
         }
     }
 
@@ -432,38 +453,10 @@ mod tests {
         ModelConfig {
             id: "m".into(),
             name: "M".into(),
-            weights_format: WeightsFormat::Gguf,
-            binary_preset: None,
             binary: PathBuf::from("/bin/llama"),
             model_path: PathBuf::from("/m.gguf"),
             port: 9001,
-            extra_args: vec![],
-            context: 4096,
-            temperature: 0.6,
-            top_p: 0.95,
-            top_k: 40,
-            min_p: 0.0,
-            presence_penalty: 0.0,
-            repeat_penalty: 1.0,
-            flash_attn: false,
-            n_gpu_layers: None,
-            mlock: false,
-            no_mmap: false,
-            parallel_slots: None,
-            cache_type_k: None,
-            cache_type_v: None,
-            split_mode: None,
-            main_gpu: None,
-            tensor_split: None,
-            threads: None,
-            cache_ram_mib: None,
-            reasoning_format: None,
-            reasoning_budget: None,
-            chat_template_kwargs: None,
-            state: ModelState::Idle,
-            pid: None,
-            estimated_vram: 0,
-            last_used: None,
+            ..ModelConfig::default()
         }
     }
 

@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
 use axum::Json;
 use inference_router::api::proxy;
-use inference_router::config::{JsonStore, ModelConfig, ModelState, WeightsFormat};
+use inference_router::config::{JsonStore, ModelConfig, ModelState};
 use inference_router::orchestrator::{AppState, Orchestrator};
 use tokio::net::TcpListener;
 
@@ -74,38 +74,10 @@ async fn build_proxy_app(upstream_port: u16) -> axum::Router {
         .add_model(ModelConfig {
             id: "fake".into(),
             name: "fake".into(),
-            weights_format: WeightsFormat::Gguf,
-            binary_preset: None,
             binary: std::path::PathBuf::from("/bin/true"),
             model_path: std::path::PathBuf::from("/dev/null"),
             port: upstream_port,
-            extra_args: vec![],
-            context: 4096,
-            temperature: 0.6,
-            top_p: 0.95,
-            top_k: 40,
-            min_p: 0.0,
-            flash_attn: false,
-            n_gpu_layers: None,
-            mlock: false,
-            no_mmap: false,
-            parallel_slots: None,
-            cache_type_k: None,
-            cache_type_v: None,
-            split_mode: None,
-            main_gpu: None,
-            tensor_split: None,
-            threads: None,
-            cache_ram_mib: None,
-            reasoning_format: None,
-            reasoning_budget: None,
-            chat_template_kwargs: None,
-            presence_penalty: 0.0,
-            repeat_penalty: 1.0,
-            state: ModelState::Idle,
-            pid: None,
-            estimated_vram: 0,
-            last_used: None,
+            ..ModelConfig::default()
         })
         .await
         .unwrap();

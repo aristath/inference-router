@@ -7,8 +7,6 @@ pub struct GpuInfo {
     pub id: String,
     pub total_vram: u64,
     pub used_vram: u64,
-    #[serde(default)]
-    pub reserved_vram: u64,
     /// GPU compute utilization 0..=100, from
     /// `/sys/class/drm/cardN/device/gpu_busy_percent`.
     #[serde(default)]
@@ -20,23 +18,16 @@ pub struct GpuInfo {
 }
 
 impl GpuInfo {
-    pub fn new(id: impl Into<String>, total_vram: u64) -> Self {
-        Self { id: id.into(), total_vram, used_vram: 0, reserved_vram: 0, busy_pct: 0, temp_c: None }
-    }
-
     pub fn free_vram(&self) -> u64 {
-        self.total_vram
-            .saturating_sub(self.used_vram)
-            .saturating_sub(self.reserved_vram)
+        self.total_vram.saturating_sub(self.used_vram)
     }
 }
 
 /// Reads AMD GPU VRAM from sysfs. Pure — holds no state.
+#[derive(Default)]
 pub struct VRAMTracker;
 
 impl VRAMTracker {
-    pub fn new() -> Self { Self }
-
     /// Scans `/sys/class/drm/card*` for real GPU entries (excluding connector
     /// and writeback sub-nodes like `card1-DP-1`) and returns their VRAM stats,
     /// sorted by card id.
@@ -78,7 +69,7 @@ impl VRAMTracker {
             let temp_c = read_gpu_junction_temp(&device);
 
             let id = name.trim_start_matches("card").to_string();
-            gpus.push(GpuInfo { id, total_vram: total, used_vram: used, reserved_vram: 0, busy_pct, temp_c });
+            gpus.push(GpuInfo { id, total_vram: total, used_vram: used, busy_pct, temp_c });
         }
 
         gpus.sort_by(|a, b| a.id.cmp(&b.id));
@@ -115,7 +106,7 @@ mod tests {
 
     #[test]
     fn free_vram_saturates() {
-        let g = GpuInfo { id: "0".into(), total_vram: 100, used_vram: 80, reserved_vram: 30, busy_pct: 0, temp_c: None };
+        let g = GpuInfo { id: "0".into(), total_vram: 100, used_vram: 150, busy_pct: 0, temp_c: None };
         assert_eq!(g.free_vram(), 0);
     }
 
@@ -132,7 +123,7 @@ mod tests {
         fs::write(hwmon.join("temp1_input"), "41000").unwrap();
         fs::write(hwmon.join("temp2_input"), "43500").unwrap();
 
-        let gpus = VRAMTracker::new().refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
         assert_eq!(gpus[0].temp_c, Some(43.5));
     }
 
@@ -151,7 +142,7 @@ mod tests {
         fs::create_dir_all(&card2).unwrap();
         fs::write(card2.join("mem_info_vram_total"), "34208743424").unwrap();
 
-        let gpus = VRAMTracker::new().refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
         assert_eq!(gpus[0].busy_pct, 42);
         assert_eq!(gpus[1].busy_pct, 0);
     }
@@ -164,7 +155,7 @@ mod tests {
         fs::create_dir_all(&dev).unwrap();
         fs::write(dev.join("mem_info_vram_total"), "1").unwrap();
         fs::write(dev.join("gpu_busy_percent"), "250").unwrap();
-        let gpus = VRAMTracker::new().refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
         assert_eq!(gpus[0].busy_pct, 100);
     }
 
@@ -188,7 +179,7 @@ mod tests {
         fs::create_dir_all(&card2).unwrap();
         fs::write(card2.join("mem_info_vram_total"), "34208743424").unwrap();
 
-        let gpus = VRAMTracker::new().refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].id, "1");
         assert_eq!(gpus[0].total_vram, 32061259776);
@@ -205,7 +196,7 @@ mod tests {
         // Non-GPU card (integrated display w/o vram files).
         fs::create_dir_all(root.join("card0").join("device")).unwrap();
 
-        let gpus = VRAMTracker::new().refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
         assert!(gpus.is_empty());
     }
 }

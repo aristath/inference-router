@@ -1,8 +1,8 @@
-use crate::config::{CacheType, ModelConfig, ReasoningFormat, SplitMode, WeightsFormat};
+use crate::config::{ModelConfig, SplitMode, WeightsFormat};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// A live inference-server process owned by the orchestrator.
 ///
@@ -12,23 +12,34 @@ use tracing::{debug, error, info, warn};
 struct RunningChild {
     port: u16,
     model_id: String,
+    // Kept alive purely so tokio's `kill_on_drop(true)` applies on shutdown:
+    // reading the field itself is not meaningful, dropping it is.
+    #[allow(dead_code)]
     child: tokio::process::Child,
 }
 
 /// Owns running inference-server processes. Single instance per `Orchestrator`.
+#[derive(Default)]
 pub struct ProcessManager {
     running: HashMap<i32, RunningChild>,
 }
 
-impl ProcessManager {
-    pub fn new() -> Self {
-        Self { running: HashMap::new() }
-    }
+/// A freshly spawned but not-yet-healthy child. Returned by `spawn_child`
+/// so the caller can await readiness WITHOUT holding the ProcessManager
+/// mutex across the 180s health check.
+pub struct PendingChild {
+    pub pid: i32,
+    pub port: u16,
+    model_id: String,
+    child: tokio::process::Child,
+}
 
-    /// Spawn an inference server for `model`. Waits for `/health` on the
-    /// model's own port before returning. On timeout or failure, kills the
-    /// process and returns an error.
-    pub async fn spawn(&mut self, model: &ModelConfig) -> Result<i32, SpawnError> {
+impl ProcessManager {
+    /// Fork + exec the inference server. Returns immediately — the caller
+    /// must drive health via `wait_for_health` and then `register` the PID
+    /// back into this manager on success (or drop the `PendingChild` on
+    /// failure, which SIGKILLs via `kill_on_drop`).
+    pub fn spawn_child(&self, model: &ModelConfig) -> Result<PendingChild, SpawnError> {
         let args = build_command_args(model);
 
         info!(
@@ -43,7 +54,7 @@ impl ProcessManager {
         // when the Child is dropped (process_manager → running → RunningChild)
         // tokio sends SIGKILL synchronously. Inherit stdio so llama-server's
         // own logs (errors on bad args, OOM, missing files) land next to ours.
-        let mut child = tokio::process::Command::new(&model.binary)
+        let child = tokio::process::Command::new(&model.binary)
             .args(&args)
             .process_group(0)
             .stdout(std::process::Stdio::inherit())
@@ -53,56 +64,62 @@ impl ProcessManager {
             .map_err(|e| SpawnError::SpawnFailed(e, model.binary.clone()))?;
 
         let pid = child.id().expect("spawned child has no PID") as i32;
-
-        match wait_for_health_or_exit(&mut child, model.port, Duration::from_secs(180)).await {
-            Ok(()) => {
-                info!(pid, port = model.port, model = model.id, "inference server ready");
-                // Retain the Child so kill_on_drop applies on shutdown.
-                self.running.insert(
-                    pid,
-                    RunningChild { port: model.port, model_id: model.id.clone(), child },
-                );
-                Ok(pid)
-            }
-            Err(e) => {
-                error!(pid, port = model.port, error = %e, "spawn failed; cleaning up");
-                let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGTERM);
-                let _ = child.wait().await; // reap
-                Err(SpawnError::HealthCheckFailed(e))
-            }
-        }
+        Ok(PendingChild { pid, port: model.port, model_id: model.id.clone(), child })
     }
 
-    /// SIGTERM the process group, wait briefly, then SIGKILL if still alive.
-    /// Drops our Child handle too, which makes tokio reap the process.
-    pub fn stop(&mut self, pid: i32) {
-        let entry = self.running.remove(&pid);
-        if entry.is_none() {
-            warn!(pid, "stopping process not in running table");
-        }
+    /// Install a healthy child into the running table so its `kill_on_drop`
+    /// survives until explicit `stop`/`forget` or orchestrator shutdown.
+    pub fn register(&mut self, pending: PendingChild) {
+        self.running.insert(
+            pending.pid,
+            RunningChild {
+                port: pending.port,
+                model_id: pending.model_id,
+                child: pending.child,
+            },
+        );
+    }
+
+    /// SIGTERM, wait briefly, SIGKILL if still alive, then drop our Child
+    /// handle so tokio reaps it. Only signals when the PID is tracked —
+    /// callers asking us to stop an untracked PID get a warning but no
+    /// signal (defends against PID reuse after a crashed/forgotten child).
+    pub async fn stop(&mut self, pid: i32) {
+        let Some(rc) = self.running.remove(&pid) else {
+            warn!(pid, "stopping process not in running table; skipping signal");
+            return;
+        };
 
         let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGTERM);
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
         if is_process_alive(pid) {
             warn!(pid, "process didn't exit after SIGTERM, sending SIGKILL");
             let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGKILL);
         }
 
-        if let Some(rc) = entry {
-            info!(pid, port = rc.port, model = rc.model_id, "inference server stopped");
-            // rc.child drops here; kill_on_drop is a no-op on an already-
-            // terminated process but the drop drives tokio's reaper.
-        }
+        info!(pid, port = rc.port, model = rc.model_id, "inference server stopped");
+        // rc.child drops here; kill_on_drop is a no-op on an already-
+        // terminated process but the drop drives tokio's reaper.
     }
 
     pub fn is_alive(&self, pid: i32) -> bool {
         is_process_alive(pid)
     }
 
-    /// Forget a pid (used when reconcile observes the process has died).
-    /// Dropping the `RunningChild` lets tokio reap it.
+    /// Forget a pid (used when reconcile observes the process has died, or
+    /// when delete fails to stop cleanly). Dropping the `RunningChild` lets
+    /// tokio reap it and fires `kill_on_drop` as a safety net.
     pub fn forget(&mut self, pid: i32) {
         self.running.remove(&pid);
+    }
+}
+
+impl PendingChild {
+    /// Waits until `/health` returns 200 on the child's port, or until the
+    /// child exits, whichever comes first. `&mut self` so we can observe
+    /// early exits via `try_wait`.
+    pub async fn wait_for_health(&mut self, timeout: Duration) -> Result<(), HealthCheckError> {
+        wait_for_health_or_exit(&mut self.child, self.port, timeout).await
     }
 }
 
@@ -213,11 +230,6 @@ pub fn build_command_args(model: &ModelConfig) -> Vec<String> {
     args
 }
 
-/// Default-ish unused helper to silence CacheType unused-variant warnings in
-/// builds without the form. Ignore.
-#[allow(dead_code)]
-fn _ensure_cache_type_used() -> CacheType { CacheType::F16 }
-
 /// Polls `/health` on `port` until success, OR returns an error as soon as
 /// the child process exits (so bad argv / OOM / missing model manifest as
 /// a concrete error instead of a timeout).
@@ -297,43 +309,16 @@ pub enum HealthCheckError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CacheType, ReasoningFormat};
 
     fn gguf_model() -> ModelConfig {
         ModelConfig {
             id: "m".into(),
             name: "M".into(),
-            weights_format: WeightsFormat::Gguf,
-            binary_preset: None,
             binary: PathBuf::from("/usr/local/bin/llama-server"),
             model_path: PathBuf::from("/models/m.gguf"),
             port: 9001,
-            extra_args: vec![],
-            context: 4096,
-            temperature: 0.6,
-            top_p: 0.95,
-            top_k: 40,
-            min_p: 0.0,
-            presence_penalty: 0.0,
-            repeat_penalty: 1.0,
-            flash_attn: false,
-            n_gpu_layers: None,
-            mlock: false,
-            no_mmap: false,
-            parallel_slots: None,
-            cache_type_k: None,
-            cache_type_v: None,
-            split_mode: None,
-            main_gpu: None,
-            tensor_split: None,
-            threads: None,
-            cache_ram_mib: None,
-            reasoning_format: None,
-            reasoning_budget: None,
-            chat_template_kwargs: None,
-            state: Default::default(),
-            pid: None,
-            estimated_vram: 0,
-            last_used: None,
+            ..ModelConfig::default()
         }
     }
 
@@ -361,7 +346,7 @@ mod tests {
         let mut m = gguf_model();
         m.min_p = 0.05;
         let args = build_command_args(&m);
-        assert!(args.windows(2).any(|w| w == &["--min-p", "0.05"]));
+        assert!(args.windows(2).any(|w| w == ["--min-p", "0.05"]));
     }
 
     #[test]

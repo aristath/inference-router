@@ -72,6 +72,10 @@ pub async fn proxy_handler(
         }
     };
 
+    // Bump `last_used` on every request so the eviction heuristic sees real
+    // activity instead of just the original load timestamp.
+    state.mark_used(&model_id).await;
+
     let path_and_query = parts
         .uri
         .path_and_query()
