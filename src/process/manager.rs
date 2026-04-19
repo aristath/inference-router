@@ -1,0 +1,452 @@
+use crate::config::{CacheType, ModelConfig, SplitMode, WeightsFormat};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
+
+/// A live inference-server process owned by the orchestrator.
+///
+/// The `Child` is retained for the process's lifetime so that
+/// `kill_on_drop(true)` actually fires when the orchestrator shuts down —
+/// ensuring llama-server processes die with us instead of orphaning.
+struct RunningChild {
+    port: u16,
+    model_id: String,
+    child: tokio::process::Child,
+}
+
+/// Owns running inference-server processes. Single instance per `Orchestrator`.
+pub struct ProcessManager {
+    running: HashMap<i32, RunningChild>,
+}
+
+impl ProcessManager {
+    pub fn new() -> Self {
+        Self { running: HashMap::new() }
+    }
+
+    /// Spawn an inference server for `model`. Waits for `/health` on the
+    /// model's own port before returning. On timeout or failure, kills the
+    /// process and returns an error.
+    pub async fn spawn(&mut self, model: &ModelConfig) -> Result<i32, SpawnError> {
+        let args = build_command_args(model);
+
+        info!(
+            model = model.id,
+            port = model.port,
+            binary = ?model.binary,
+            ?args,
+            "spawning inference server",
+        );
+
+        // `kill_on_drop(true)` is the safety net for orchestrator shutdown:
+        // when the Child is dropped (process_manager → running → RunningChild)
+        // tokio sends SIGKILL synchronously. Inherit stdio so llama-server's
+        // own logs (errors on bad args, OOM, missing files) land next to ours.
+        let mut child = tokio::process::Command::new(&model.binary)
+            .args(&args)
+            .process_group(0)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| SpawnError::SpawnFailed(e, model.binary.clone()))?;
+
+        let pid = child.id().expect("spawned child has no PID") as i32;
+
+        match wait_for_health_or_exit(&mut child, model.port, Duration::from_secs(180)).await {
+            Ok(()) => {
+                info!(pid, port = model.port, model = model.id, "inference server ready");
+                // Retain the Child so kill_on_drop applies on shutdown.
+                self.running.insert(
+                    pid,
+                    RunningChild { port: model.port, model_id: model.id.clone(), child },
+                );
+                Ok(pid)
+            }
+            Err(e) => {
+                error!(pid, port = model.port, error = %e, "spawn failed; cleaning up");
+                let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGTERM);
+                let _ = child.wait().await; // reap
+                Err(SpawnError::HealthCheckFailed(e))
+            }
+        }
+    }
+
+    /// SIGTERM the process group, wait briefly, then SIGKILL if still alive.
+    /// Drops our Child handle too, which makes tokio reap the process.
+    pub fn stop(&mut self, pid: i32) {
+        let entry = self.running.remove(&pid);
+        if entry.is_none() {
+            warn!(pid, "stopping process not in running table");
+        }
+
+        let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGTERM);
+        std::thread::sleep(Duration::from_millis(500));
+        if is_process_alive(pid) {
+            warn!(pid, "process didn't exit after SIGTERM, sending SIGKILL");
+            let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+
+        if let Some(rc) = entry {
+            info!(pid, port = rc.port, model = rc.model_id, "inference server stopped");
+            // rc.child drops here; kill_on_drop is a no-op on an already-
+            // terminated process but the drop drives tokio's reaper.
+        }
+    }
+
+    pub fn is_alive(&self, pid: i32) -> bool {
+        is_process_alive(pid)
+    }
+
+    /// Forget a pid (used when reconcile observes the process has died).
+    /// Dropping the `RunningChild` lets tokio reap it.
+    pub fn forget(&mut self, pid: i32) {
+        self.running.remove(&pid);
+    }
+}
+
+/// Builds the argv (excluding the binary itself) for a model.
+pub fn build_command_args(model: &ModelConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    match model.weights_format {
+        WeightsFormat::Gguf => {
+            args.push("-m".into());
+            args.push(model.model_path.to_string_lossy().into_owned());
+            args.push("-c".into());
+            args.push(model.context.to_string());
+            args.push("--port".into());
+            args.push(model.port.to_string());
+            args.push("--temp".into());
+            args.push(model.temperature.to_string());
+            args.push("--top-p".into());
+            args.push(model.top_p.to_string());
+            args.push("--top-k".into());
+            args.push(model.top_k.to_string());
+            if model.min_p > 0.0 {
+                args.push("--min-p".into());
+                args.push(model.min_p.to_string());
+            }
+
+            // llama.cpp structured flags. User-typed `extra_args` appends
+            // after these so it can override via last-wins.
+            //
+            // Modern llama-server's `--flash-attn` expects a value (`on|off|
+            // auto`); a bare `--flash-attn` consumes the next argv token,
+            // which breaks everything. Always emit the value.
+            args.push("--flash-attn".into());
+            args.push(if model.flash_attn { "on".into() } else { "off".into() });
+            if let Some(n) = model.n_gpu_layers {
+                args.push("-ngl".into());
+                args.push(n.to_string());
+            }
+            if model.mlock {
+                args.push("--mlock".into());
+            }
+            if model.no_mmap {
+                args.push("--no-mmap".into());
+            }
+            if let Some(n) = model.parallel_slots {
+                args.push("--parallel".into());
+                args.push(n.to_string());
+            }
+            if let Some(k) = model.cache_type_k {
+                args.push("--cache-type-k".into());
+                args.push(k.as_arg().into());
+            }
+            if let Some(v) = model.cache_type_v {
+                args.push("--cache-type-v".into());
+                args.push(v.as_arg().into());
+            }
+            if let Some(mode) = model.split_mode {
+                args.push("--split-mode".into());
+                args.push(match mode {
+                    SplitMode::None => "none".into(),
+                    SplitMode::Layer => "layer".into(),
+                    SplitMode::Row => "row".into(),
+                    SplitMode::Tensor => "tensor".into(),
+                });
+            }
+            if let Some(g) = model.main_gpu {
+                args.push("--main-gpu".into());
+                args.push(g.to_string());
+            }
+            if let Some(ref ts) = model.tensor_split {
+                args.push("--tensor-split".into());
+                args.push(ts.clone());
+            }
+        }
+        WeightsFormat::Safetensors => {
+            args.push("--model".into());
+            args.push(model.model_path.to_string_lossy().into_owned());
+            args.push("--port".into());
+            args.push(model.port.to_string());
+            args.push("--max-model-len".into());
+            args.push(model.context.to_string());
+        }
+    }
+    args.extend(model.extra_args.iter().cloned());
+    args
+}
+
+/// Default-ish unused helper to silence CacheType unused-variant warnings in
+/// builds without the form. Ignore.
+#[allow(dead_code)]
+fn _ensure_cache_type_used() -> CacheType { CacheType::F16 }
+
+/// Polls `/health` on `port` until success, OR returns an error as soon as
+/// the child process exits (so bad argv / OOM / missing model manifest as
+/// a concrete error instead of a timeout).
+async fn wait_for_health_or_exit(
+    child: &mut tokio::process::Child,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), HealthCheckError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("reqwest client");
+    let url = format!("http://127.0.0.1:{}/health", port);
+    let start = std::time::Instant::now();
+
+    loop {
+        // Fast-fail on early child exit.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(HealthCheckError::ChildExited(status.code(), status.to_string()));
+            }
+            Ok(None) => {} // still running
+            Err(e) => {
+                return Err(HealthCheckError::ChildExited(None, format!("try_wait: {e}")));
+            }
+        }
+
+        if start.elapsed() > timeout {
+            return Err(HealthCheckError::Timeout(timeout));
+        }
+
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                debug!(port, "health check passed");
+                return Ok(());
+            }
+            Ok(response) => {
+                debug!(port, status = response.status().as_u16(), "health non-2xx, retrying");
+            }
+            Err(e) => {
+                debug!(port, error = %e, "health connect failed, retrying");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn is_process_alive(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+fn kill_process_group(pid: i32, sig: nix::sys::signal::Signal) -> nix::Result<()> {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), sig)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    #[error("failed to spawn '{}': {}", .1.display(), .0)]
+    SpawnFailed(std::io::Error, PathBuf),
+
+    #[error("health check failed: {}", .0)]
+    HealthCheckFailed(HealthCheckError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HealthCheckError {
+    #[error("timed out after {}s", .0.as_secs())]
+    Timeout(Duration),
+
+    #[error("http error: {}", .0)]
+    Http(#[from] reqwest::Error),
+
+    #[error("inference server exited before becoming ready (exit code {:?}): {}", .0, .1)]
+    ChildExited(Option<i32>, String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gguf_model() -> ModelConfig {
+        ModelConfig {
+            id: "m".into(),
+            name: "M".into(),
+            weights_format: WeightsFormat::Gguf,
+            binary_preset: None,
+            binary: PathBuf::from("/usr/local/bin/llama-server"),
+            model_path: PathBuf::from("/models/m.gguf"),
+            port: 9001,
+            extra_args: vec![],
+            context: 4096,
+            temperature: 0.6,
+            top_p: 0.95,
+            top_k: 40,
+            min_p: 0.0,
+            flash_attn: false,
+            n_gpu_layers: None,
+            mlock: false,
+            no_mmap: false,
+            parallel_slots: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            split_mode: None,
+            main_gpu: None,
+            tensor_split: None,
+            state: Default::default(),
+            pid: None,
+            estimated_vram: 0,
+            last_used: None,
+        }
+    }
+
+    #[test]
+    fn gguf_argv_shape() {
+        let args = build_command_args(&gguf_model());
+        assert_eq!(
+            args,
+            vec![
+                "-m", "/models/m.gguf",
+                "-c", "4096",
+                "--port", "9001",
+                "--temp", "0.6",
+                "--top-p", "0.95",
+                "--top-k", "40",
+                "--flash-attn", "off",
+            ],
+        );
+    }
+
+    #[test]
+    fn gguf_argv_includes_min_p_when_positive() {
+        let mut m = gguf_model();
+        m.min_p = 0.05;
+        let args = build_command_args(&m);
+        assert!(args.windows(2).any(|w| w == &["--min-p", "0.05"]));
+    }
+
+    #[test]
+    fn gguf_argv_omits_min_p_when_zero() {
+        let args = build_command_args(&gguf_model());
+        assert!(!args.iter().any(|a| a == "--min-p"));
+    }
+
+    #[test]
+    fn safetensors_argv_shape() {
+        let mut m = gguf_model();
+        m.weights_format = WeightsFormat::Safetensors;
+        m.model_path = PathBuf::from("/models/m-safetensors");
+        let args = build_command_args(&m);
+        assert_eq!(
+            args,
+            vec![
+                "--model", "/models/m-safetensors",
+                "--port", "9001",
+                "--max-model-len", "4096",
+            ],
+        );
+    }
+
+    #[test]
+    fn extra_args_appended_last_for_gguf() {
+        let mut m = gguf_model();
+        m.extra_args = vec!["--flash-attn".into(), "-ngl".into(), "99".into()];
+        let args = build_command_args(&m);
+        assert_eq!(
+            &args[args.len() - 3..],
+            &["--flash-attn", "-ngl", "99"],
+        );
+    }
+
+    #[test]
+    fn gguf_argv_emits_structured_llama_flags() {
+        let mut m = gguf_model();
+        m.flash_attn = true;
+        m.n_gpu_layers = Some(99);
+        m.mlock = true;
+        m.no_mmap = true;
+        m.parallel_slots = Some(4);
+        m.cache_type_k = Some(CacheType::Q8_0);
+        m.cache_type_v = Some(CacheType::Q8_0);
+        let args = build_command_args(&m);
+        let joined = args.join(" ");
+        assert!(joined.contains("--flash-attn on"), "{joined}");
+        assert!(joined.contains("-ngl 99"), "{joined}");
+        assert!(joined.contains("--mlock"), "{joined}");
+        assert!(joined.contains("--no-mmap"), "{joined}");
+        assert!(joined.contains("--parallel 4"), "{joined}");
+        assert!(joined.contains("--cache-type-k q8_0"), "{joined}");
+        assert!(joined.contains("--cache-type-v q8_0"), "{joined}");
+    }
+
+    #[test]
+    fn gguf_argv_emits_flash_attn_off_when_disabled() {
+        let args = build_command_args(&gguf_model());
+        // --flash-attn is always emitted as `off` by default — it used to be
+        // a bare flag; modern llama-server requires a value.
+        assert_eq!(
+            args.windows(2).find(|w| w[0] == "--flash-attn").map(|w| w[1].as_str()),
+            Some("off"),
+        );
+    }
+
+    #[test]
+    fn gguf_argv_omits_other_structured_flags_when_unset() {
+        let args = build_command_args(&gguf_model());
+        let joined = args.join(" ");
+        assert!(!joined.contains("-ngl"));
+        assert!(!joined.contains("--mlock"));
+        assert!(!joined.contains("--no-mmap"));
+        assert!(!joined.contains("--parallel"));
+        assert!(!joined.contains("--cache-type-k"));
+        assert!(!joined.contains("--cache-type-v"));
+        assert!(!joined.contains("--split-mode"));
+        assert!(!joined.contains("--main-gpu"));
+        assert!(!joined.contains("--tensor-split"));
+    }
+
+    #[test]
+    fn gguf_argv_emits_split_mode_main_gpu_tensor_split() {
+        let mut m = gguf_model();
+        m.split_mode = Some(SplitMode::Row);
+        m.main_gpu = Some(2);
+        m.tensor_split = Some("0.5,0.5,0".into());
+        let args = build_command_args(&m);
+        let j = args.join(" ");
+        assert!(j.contains("--split-mode row"), "{j}");
+        assert!(j.contains("--main-gpu 2"), "{j}");
+        assert!(j.contains("--tensor-split 0.5,0.5,0"), "{j}");
+    }
+
+    #[test]
+    fn extra_args_appended_after_structured_flags_for_last_wins() {
+        let mut m = gguf_model();
+        m.n_gpu_layers = Some(50);
+        m.extra_args = vec!["-ngl".into(), "99".into()];
+        let args = build_command_args(&m);
+        // Both present, extra_args version is last → wins on llama.cpp.
+        let idx_first = args.iter().position(|a| a == "-ngl").unwrap();
+        let idx_last = args.iter().rposition(|a| a == "-ngl").unwrap();
+        assert_ne!(idx_first, idx_last);
+        assert_eq!(args[idx_first + 1], "50");
+        assert_eq!(args[idx_last + 1], "99");
+    }
+
+    #[test]
+    fn extra_args_appended_last_for_safetensors() {
+        let mut m = gguf_model();
+        m.weights_format = WeightsFormat::Safetensors;
+        m.extra_args = vec!["--tensor-parallel-size".into(), "2".into()];
+        let args = build_command_args(&m);
+        assert_eq!(
+            &args[args.len() - 2..],
+            &["--tensor-parallel-size", "2"],
+        );
+    }
+}

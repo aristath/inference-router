@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} — Inference Router</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { font-size: 16px; }
+        body {
+            font-family: 'JetBrains Mono', 'SF Mono', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+            font-size: 1rem;
+            line-height: 1.5;
+            background: #020617;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+        header.topbar {
+            background: #1e293b;
+            padding: 0.75rem 2rem;
+            display: flex; align-items: center; justify-content: space-between;
+            border-bottom: 1px solid #334155;
+        }
+        header.topbar .brand {
+            display: flex; align-items: center; gap: 0.65rem;
+            font-weight: 600; color: #f1f5f9; font-size: 1.125rem;
+        }
+        header.topbar .brand .dot {
+            width: 9px; height: 9px; border-radius: 50%;
+            background: #22c55e;
+            box-shadow: 0 0 10px #22c55e;
+        }
+        header.topbar .actions { display: flex; gap: 0.5rem; }
+        header.topbar .icon-btn {
+            background: transparent;
+            border: 1px solid #334155;
+            color: #cbd5e1;
+            width: 2.1rem; height: 2.1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            display: inline-flex; align-items: center; justify-content: center;
+            font-size: 1rem;
+            transition: all 0.15s;
+        }
+        header.topbar .icon-btn:hover { background: #334155; color: #e2e8f0; }
+        .container { padding: 1.5rem 2rem; }
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: minmax(300px, 380px) 1fr;
+            gap: 1.5rem;
+            align-items: start;
+        }
+        .dashboard-grid > .col { min-width: 0; } /* prevent table overflow from blowing up grid */
+        .dashboard-grid h2.section { margin-bottom: 1rem; color: #cbd5e1; font-size: 1rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+        @media (max-width: 960px) {
+            .dashboard-grid { grid-template-columns: 1fr; }
+        }
+        h1 { font-size: 1.5rem; margin-bottom: 1.5rem; color: #f1f5f9; }
+        h2 { font-size: 1.125rem; margin-bottom: 1rem; color: #cbd5e1; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+        .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; font-size: 1rem; font-weight: 500; text-decoration: none; cursor: pointer; border: none; transition: all 0.2s; font-family: inherit; }
+        .btn-primary { background: #2563eb; color: white; }
+        .btn-primary:hover { background: #3b82f6; }
+        .btn-success { background: #16a34a; color: white; }
+        .btn-success:hover { background: #22c55e; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn-danger:hover { background: #ef4444; }
+        .btn-secondary { background: #64748b; color: white; }
+        .btn-secondary:hover { background: #94a3b8; }
+        .btn-sm { padding: 0.25rem 0.75rem; font-size: 1rem; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 0.75rem 1rem; border-bottom: 1px solid #334155; }
+        th { color: #cbd5e1; font-weight: 600; font-size: 1rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        th.sortable { cursor: pointer; user-select: none; }
+        th.sortable:hover { color: #e2e8f0; }
+        th.sortable::after { content: ''; display: inline-block; margin-left: 0.5rem; opacity: 0.3; }
+        th.sortable.sort-asc::after  { content: '▲'; opacity: 1; color: #38bdf8; }
+        th.sortable.sort-desc::after { content: '▼'; opacity: 1; color: #38bdf8; }
+        td { font-size: 1rem; }
+        .badge { display: inline-block; padding: 0.25rem 0.6rem; border-radius: 9999px; font-size: 1rem; font-weight: 600; }
+        .badge-running { background: #166534; color: #86efac; }
+        .badge-loading { background: #713f12; color: #fde047; }
+        .badge-idle { background: #1e293b; color: #cbd5e1; }
+        .badge-error { background: #7f1d1d; color: #fca5a5; }
+        .gpu-metric-head {
+            display: flex; justify-content: space-between; align-items: baseline;
+            margin-bottom: 0.35rem;
+        }
+        .gpu-metric-label {
+            font-size: 1rem; font-weight: 600; color: #94a3b8;
+            text-transform: uppercase; letter-spacing: 0.05em;
+        }
+        .gpu-metric-value { font-size: 1rem; color: #cbd5e1; }
+        .progress-bar { background: #334155; border-radius: 4px; height: 8px; overflow: hidden; }
+        .progress-bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+        .progress-bar-fill.green { background: #22c55e; }
+        .progress-bar-fill.yellow { background: #eab308; }
+        .progress-bar-fill.red { background: #ef4444; }
+        .progress-bar-fill.muted { background: #64748b; }
+        .chip-temp {
+            display: inline-flex; align-items: baseline;
+            padding: 0.1rem 0.5rem; border-radius: 9999px;
+            font-size: 1rem; font-weight: 600;
+            background: #0f172a; border: 1px solid #334155;
+        }
+        .chip-temp.green { color: #86efac; border-color: #166534; }
+        .chip-temp.yellow { color: #fde047; border-color: #713f12; }
+        .chip-temp.red { color: #fca5a5; border-color: #7f1d1d; }
+        .chip-temp.muted { color: #94a3b8; }
+        .actions { display: flex; gap: 0.5rem; }
+        .empty-state { text-align: center; padding: 3rem; color: #94a3b8; }
+        form { display: flex; flex-direction: column; gap: 1rem; }
+        label { font-size: 1rem; font-weight: 500; color: #cbd5e1; }
+        input, select, textarea { background: #020617; border: 1px solid #334155; border-radius: 6px; padding: 0.5rem 0.75rem; color: #e2e8f0; font-size: 1rem; font-family: inherit; }
+        input:focus, select:focus, textarea:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3); }
+        .form-group { display: flex; flex-direction: column; gap: 0.25rem; }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+        .slider-container { display: flex; align-items: center; gap: 1rem; }
+        input[type="range"] { flex: 1; accent-color: #3b82f6; }
+        .slider-value { min-width: 80px; text-align: center; font-weight: 600; color: #38bdf8; }
+        .vr-estimate { color: #38bdf8; font-weight: 600; font-size: 1rem; }
+        footer { text-align: center; padding: 2rem; color: #64748b; font-size: 1rem; }
+        code { background: #334155; padding: 0.125rem 0.375rem; border-radius: 4px; font-size: 1em; font-family: inherit; }
+
+        /* File-path picker */
+        .path-picker { position: relative; }
+        .path-dropdown {
+            position: absolute;
+            top: calc(100% + 4px); left: 0; right: 0;
+            z-index: 1000;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            max-height: 320px;
+            overflow-y: auto;
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+            padding: 4px 0;
+        }
+        .path-dropdown-item {
+            padding: 0.45rem 0.75rem;
+            cursor: pointer;
+            color: #e2e8f0;
+            font-size: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .path-dropdown-item:hover,
+        .path-dropdown-item.active { background: #334155; }
+        .path-dropdown-item .icon { flex-shrink: 0; }
+        .path-dropdown-item .name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            flex: 1;
+        }
+        .path-dropdown-empty {
+            padding: 0.5rem 0.75rem;
+            color: #94a3b8;
+            font-size: 1rem;
+            font-style: italic;
+        }
+        .path-dropdown-hint {
+            padding: 0.45rem 0.75rem;
+            color: #94a3b8;
+            font-size: 1rem;
+            border-top: 1px solid #334155;
+            background: #020617;
+            position: sticky; bottom: 0;
+        }
+        .path-dropdown-hint kbd {
+            background: #334155;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 1rem;
+            color: #cbd5e1;
+        }
+
+        /* Modals */
+        .modal-overlay {
+            position: fixed; inset: 0; z-index: 2000;
+            background: rgba(2, 6, 23, 0.72);
+            display: none;
+            align-items: flex-start; justify-content: center;
+            overflow-y: auto;
+            padding: 3rem 1rem;
+            backdrop-filter: blur(2px);
+        }
+        .modal-overlay.open { display: flex; }
+        .modal {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 10px;
+            width: 100%;
+            max-width: 780px;
+            box-shadow: 0 30px 80px rgba(0,0,0,0.6);
+            margin-bottom: 3rem;
+        }
+        .modal-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid #334155;
+        }
+        .modal-header h2 { margin: 0; font-size: 1.125rem; color: #f1f5f9; }
+        .modal-close {
+            background: transparent; border: none; color: #cbd5e1;
+            font-size: 1.5rem; line-height: 1; cursor: pointer;
+            width: 2rem; height: 2rem; border-radius: 4px;
+            font-family: inherit;
+        }
+        .modal-close:hover { background: #334155; color: #e2e8f0; }
+        .modal-body { padding: 1.25rem 1.5rem; }
+    </style>
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand"><span class="dot"></span> Inference Router</div>
+        <div class="actions">
+            <button type="button" class="icon-btn" title="Settings" onclick="openSettingsModal()">⚙</button>
+        </div>
+    </header>
+    <div class="container">
+        {% block body %}{% endblock %}
+    </div>
+    <footer>Inference Router v0.1.0</footer>
+
+    <script>
+    // Generic modal open/close.
+    function openModal(id) {
+        const m = document.getElementById(id);
+        if (m) m.classList.add('open');
+    }
+    function closeModal(id) {
+        const m = document.getElementById(id);
+        if (m) m.classList.remove('open');
+    }
+    document.addEventListener('click', (e) => {
+        // Click on the overlay (but not the inner modal) closes.
+        if (e.target.classList && e.target.classList.contains('modal-overlay')) {
+            e.target.classList.remove('open');
+        }
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            document.querySelectorAll('.modal-overlay.open').forEach(m => m.classList.remove('open'));
+        }
+    });
+    async function openSettingsModal() {
+        openModal('settings-modal');
+        if (typeof refreshPresetList === 'function') await refreshPresetList();
+    }
+    </script>
+    <script>
+        async function poll() {
+            try {
+                const res = await fetch('/api/status');
+                if (!res.ok) return;
+                const data = await res.json();
+                updateDashboard(data);
+            } catch (e) {}
+        }
+        function barClass(pct) { return pct > 90 ? 'red' : pct > 70 ? 'yellow' : 'green'; }
+        function tempClass(c) {
+            if (c == null) return 'muted';
+            return c > 85 ? 'red' : c > 70 ? 'yellow' : 'green';
+        }
+        function setBar(container, pct, klass) {
+            if (!container) return;
+            const fill = container.querySelector('.progress-bar-fill');
+            if (!fill) return;
+            fill.style.width = (pct || 0) + '%';
+            fill.className = 'progress-bar-fill ' + (klass || barClass(pct || 0));
+        }
+        function setText(id, value) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = value;
+        }
+        function setTempChip(id, c) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const klass = tempClass(c);
+            el.className = 'chip-temp ' + klass;
+            const v = el.querySelector('.gpu-temp') || el.firstElementChild;
+            if (v) v.textContent = c == null ? '—' : Math.round(c);
+        }
+        function updateDashboard(data) {
+            // Host (CPU / RAM / CPU temp)
+            if (data.system) {
+                const sys = data.system;
+                setBar(document.getElementById('host-cpu'), sys.cpu_pct);
+                setText('host-cpu-pct', Math.round(sys.cpu_pct));
+                const ramPct = sys.ram_total > 0 ? (sys.ram_used / sys.ram_total * 100) : 0;
+                setBar(document.getElementById('host-ram'), ramPct);
+                setText('host-ram-used', (sys.ram_used / 1073741824).toFixed(1));
+                const chip = document.getElementById('host-cpu-temp-chip');
+                if (chip) {
+                    chip.className = 'chip-temp ' + tempClass(sys.cpu_temp_c);
+                    setText('host-cpu-temp', sys.cpu_temp_c == null ? '—' : Math.round(sys.cpu_temp_c));
+                }
+            }
+            (data.gpus || []).forEach(gpu => {
+                // VRAM bar + numbers
+                const vramCard = document.getElementById('gpu-vram-' + gpu.id);
+                if (vramCard) {
+                    const pct = gpu.total_vram > 0 ? (gpu.used_vram / gpu.total_vram * 100) : 0;
+                    setBar(vramCard, pct);
+                    const used = vramCard.querySelector('.gpu-vram-used');
+                    const free = vramCard.querySelector('.gpu-vram-free');
+                    if (used) used.textContent = (gpu.used_vram / 1073741824).toFixed(1);
+                    if (free) free.textContent = ((gpu.total_vram - gpu.used_vram) / 1073741824).toFixed(1);
+                }
+                setBar(document.getElementById('gpu-busy-' + gpu.id), gpu.busy_pct);
+                const busyVal = document.querySelector('#gpu-busy-' + gpu.id + ' .gpu-busy-pct');
+                if (busyVal) busyVal.textContent = gpu.busy_pct || 0;
+                // Temperature chip
+                setTempChip('gpu-temp-chip-' + gpu.id, gpu.temp_c);
+            });
+            (data.models || []).forEach(model => {
+                const el = document.getElementById('model-status-' + model.id);
+                if (el) {
+                    const cls = model.state; // "idle" | "loading" | "running" | "error"
+                    el.className = 'badge badge-' + cls;
+                    const label = cls.charAt(0).toUpperCase() + cls.slice(1);
+                    el.textContent = model.state_message ? `${label}: ${model.state_message}` : label;
+                }
+            });
+        }
+        poll();
+        setInterval(poll, 500); // 2 Hz — sysfs reads are cheap
+    </script>
+
+    <script>
+    // File-path autocomplete. Attached to every <input data-path-field>.
+    //
+    // Keyboard:
+    //   ↑ / ↓     navigate list
+    //   Enter     pick highlighted entry (descends into dirs, selects files)
+    //   Tab       same as Enter
+    //   /         descend when a directory is highlighted
+    //   Esc       close
+    // Mouse:
+    //   click     pick entry (descend or select)
+    (function setupPathPickers() {
+        document.querySelectorAll('input[data-path-field]').forEach(attach);
+
+        function attach(input) {
+            // Wrap the input so the dropdown can position: absolute relative
+            // to it. The dropdown follows the input through scroll, reflow,
+            // and window resize for free.
+            const wrapper = document.createElement('div');
+            wrapper.className = 'path-picker';
+            input.parentNode.insertBefore(wrapper, input);
+            wrapper.appendChild(input);
+
+            let dropdown = null;
+            let items = [];       // last fetched dir listing
+            let loadedDir = null; // dir the current `items` came from
+            let activeIdx = -1;
+            let fetchTimer = null;
+            let fetchSeq = 0;
+
+            function splitPath(val) {
+                if (!val) return ['', ''];
+                const i = val.lastIndexOf('/');
+                if (i < 0) return ['', val];
+                return [val.slice(0, i + 1), val.slice(i + 1)];
+            }
+
+            async function refresh() {
+                const [dir, leaf] = splitPath(input.value);
+                const target = dir || '/';
+                if (target !== loadedDir) {
+                    const seq = ++fetchSeq;
+                    try {
+                        const r = await fetch(`/api/files?path=${encodeURIComponent(target)}`);
+                        if (seq !== fetchSeq) return; // a newer fetch superseded us
+                        items = r.ok ? await r.json() : [];
+                        loadedDir = target;
+                    } catch {
+                        items = [];
+                        loadedDir = target;
+                    }
+                }
+                render(leaf);
+            }
+
+            function render(leaf) {
+                ensureDropdown();
+                dropdown.innerHTML = '';
+
+                const needle = leaf.toLowerCase();
+                const matches = items
+                    .filter(it => !needle || it.name.toLowerCase().includes(needle))
+                    .sort((a, b) => {
+                        if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+                        return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+                    })
+                    .slice(0, 200);
+
+                if (matches.length === 0) {
+                    const empty = document.createElement('div');
+                    empty.className = 'path-dropdown-empty';
+                    empty.textContent = needle
+                        ? `No matches in ${loadedDir}`
+                        : `Empty directory: ${loadedDir}`;
+                    dropdown.appendChild(empty);
+                } else {
+                    matches.forEach((item, i) => {
+                        const el = document.createElement('div');
+                        el.className = 'path-dropdown-item';
+                        el.dataset.path = item.path;
+                        el.dataset.isDir = item.is_dir ? '1' : '';
+                        el.innerHTML =
+                            `<span class="icon">${item.is_dir ? '📁' : '📄'}</span>` +
+                            `<span class="name">${escapeHtml(item.name)}${item.is_dir ? '/' : ''}</span>`;
+                        el.addEventListener('mouseenter', () => { activeIdx = i; highlight(); });
+                        el.addEventListener('mousedown', (e) => { e.preventDefault(); pick(item); });
+                        dropdown.appendChild(el);
+                    });
+                }
+
+                const hint = document.createElement('div');
+                hint.className = 'path-dropdown-hint';
+                hint.innerHTML =
+                    '<kbd>↑</kbd><kbd>↓</kbd> navigate · ' +
+                    '<kbd>Enter</kbd> / <kbd>Tab</kbd> select · ' +
+                    '<kbd>/</kbd> descend · <kbd>Esc</kbd> close';
+                dropdown.appendChild(hint);
+
+                activeIdx = matches.length > 0 ? 0 : -1;
+                highlight();
+            }
+
+            function ensureDropdown() {
+                if (dropdown) return;
+                dropdown = document.createElement('div');
+                dropdown.className = 'path-dropdown';
+                // mousedown inside the dropdown shouldn't blur the input
+                dropdown.addEventListener('mousedown', (e) => e.preventDefault());
+                wrapper.appendChild(dropdown);
+            }
+
+            function close() {
+                if (dropdown) { dropdown.remove(); dropdown = null; }
+                activeIdx = -1;
+            }
+
+            function highlight() {
+                if (!dropdown) return;
+                dropdown.querySelectorAll('.path-dropdown-item').forEach((el, i) => {
+                    el.classList.toggle('active', i === activeIdx);
+                });
+                const cur = dropdown.querySelector('.path-dropdown-item.active');
+                if (cur) cur.scrollIntoView({ block: 'nearest' });
+            }
+
+            function pick(item) {
+                if (item.is_dir) {
+                    // Descend: set value to dir-with-trailing-slash and reload
+                    // listing for that directory.
+                    input.value = item.path.replace(/\/+$/, '') + '/';
+                    loadedDir = null;
+                    refresh();
+                    input.focus();
+                } else {
+                    input.value = item.path;
+                    input.dispatchEvent(new Event('input'));
+                    close();
+                }
+            }
+
+            function pickActive() {
+                if (!dropdown || activeIdx < 0) return false;
+                const els = dropdown.querySelectorAll('.path-dropdown-item');
+                const el = els[activeIdx];
+                if (!el) return false;
+                pick({ path: el.dataset.path, is_dir: el.dataset.isDir === '1' });
+                return true;
+            }
+
+            function schedule() {
+                if (fetchTimer) clearTimeout(fetchTimer);
+                fetchTimer = setTimeout(refresh, 120);
+            }
+
+            input.addEventListener('input', schedule);
+            input.addEventListener('focus', schedule);
+            input.addEventListener('keydown', (e) => {
+                if (!dropdown) {
+                    if (['ArrowDown', 'ArrowUp'].includes(e.key)) {
+                        e.preventDefault();
+                        schedule();
+                    }
+                    return;
+                }
+                const els = dropdown.querySelectorAll('.path-dropdown-item');
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    if (els.length) { activeIdx = (activeIdx + 1) % els.length; highlight(); }
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    if (els.length) { activeIdx = (activeIdx - 1 + els.length) % els.length; highlight(); }
+                } else if (e.key === 'Enter' || e.key === 'Tab') {
+                    if (pickActive()) e.preventDefault();
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    close();
+                } else if (e.key === '/') {
+                    // Let the typed '/' flow through if no directory is
+                    // currently highlighted. If the highlighted entry IS a
+                    // directory, treat the slash as "descend into it."
+                    const el = els[activeIdx];
+                    if (el && el.dataset.isDir === '1') {
+                        e.preventDefault();
+                        pick({ path: el.dataset.path, is_dir: true });
+                    }
+                }
+            });
+
+            document.addEventListener('mousedown', (e) => {
+                if (dropdown && !wrapper.contains(e.target)) close();
+            });
+        }
+
+        function escapeHtml(s) {
+            return s.replace(/[&<>"']/g, c => (
+                {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+            ));
+        }
+    })();
+    </script>
+</body>
+</html>

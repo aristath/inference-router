@@ -1,0 +1,1011 @@
+{% extends "base.html" %}
+
+{% block body %}
+
+<div class="dashboard-grid">
+    <!-- ===== Left column: host + GPUs ===== -->
+    <div class="col">
+        <h2 class="section">Host</h2>
+        <div class="card" id="host-card">
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                <h2 style="margin: 0;">CPU &amp; RAM</h2>
+                <span class="chip-temp {{ system.cpu_temp_class }}" id="host-cpu-temp-chip"
+                      title="CPU temperature">
+                    <span id="host-cpu-temp">{{ system.cpu_temp_c_str }}</span>°C
+                </span>
+            </div>
+            <div class="gpu-metric" id="host-cpu" style="margin-top: 0.9rem;">
+                <div class="gpu-metric-head">
+                    <span class="gpu-metric-label">CPU</span>
+                    <span class="gpu-metric-value"><span id="host-cpu-pct">{{ system.cpu_pct_str }}</span>%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill {{ system.cpu_class }}" style="width: {{ system.cpu_pct_str }}%"></div>
+                </div>
+            </div>
+            <div class="gpu-metric" id="host-ram" style="margin-top: 0.75rem;">
+                <div class="gpu-metric-head">
+                    <span class="gpu-metric-label">RAM</span>
+                    <span class="gpu-metric-value">
+                        <span id="host-ram-used">{{ system.ram_used_gib_str }}</span> /
+                        {{ system.ram_total_gib_str }} GiB
+                    </span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill {{ system.ram_class }}" style="width: {{ system.ram_pct_str }}%"></div>
+                </div>
+            </div>
+        </div>
+
+        <h2 class="section" style="margin-top: 1.5rem;">GPUs</h2>
+        {% for gpu in gpus %}
+        <div class="card" id="gpu-card-{{ gpu.id }}">
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                <h2 style="margin: 0;">GPU {{ gpu.id }}</h2>
+                <span class="chip-temp {{ gpu.temp_class }}" id="gpu-temp-chip-{{ gpu.id }}"
+                      title="GPU junction temperature">
+                    <span class="gpu-temp">{{ gpu.temp_c_str }}</span>°C
+                </span>
+            </div>
+            <div class="gpu-metric" id="gpu-vram-{{ gpu.id }}" style="margin-top: 0.9rem;">
+                <div class="gpu-metric-head">
+                    <span class="gpu-metric-label">VRAM</span>
+                    <span class="gpu-metric-value">
+                        <span class="gpu-vram-used">{{ gpu.used_gib_str }}</span> /
+                        {{ gpu.total_gib_str }} GiB
+                        &middot; <span class="gpu-vram-free">{{ gpu.free_gib_str }}</span> GiB free
+                    </span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill {{ gpu.usage_class }}" style="width: {{ gpu.usage_pct_str }}%"></div>
+                </div>
+            </div>
+            <div class="gpu-metric" id="gpu-busy-{{ gpu.id }}" style="margin-top: 0.75rem;">
+                <div class="gpu-metric-head">
+                    <span class="gpu-metric-label">Activity</span>
+                    <span class="gpu-metric-value"><span class="gpu-busy-pct">{{ gpu.busy_pct_str }}</span>%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill {{ gpu.busy_class }}" style="width: {{ gpu.busy_pct_str }}%"></div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+        {% if gpus.is_empty() %}
+        <div class="card">
+            <h2>No GPUs detected</h2>
+            <p style="color: #94a3b8;">No AMD GPUs found via sysfs.</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- ===== Right column: Models ===== -->
+    <div class="col">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: 1rem;">
+            <h2 class="section" style="margin: 0;">Models</h2>
+            <input type="search" id="model-filter" placeholder="Filter by name…" autocomplete="off"
+                   style="flex: 1; max-width: 22rem;">
+            <button type="button" class="btn btn-primary" onclick="openAddModelModal()">+ Add Model</button>
+        </div>
+
+        {% if models.is_empty() %}
+        <div class="card">
+            <div class="empty-state">
+                <p>No models configured.</p>
+                <button type="button" class="btn btn-primary" style="margin-top: 1rem;" onclick="openAddModelModal()">Add your first model</button>
+            </div>
+        </div>
+        {% else %}
+        <div class="card" style="padding: 0; overflow-x: auto;">
+            <table id="models-table">
+                <thead>
+                    <tr>
+                        <th class="sortable" data-col="name"    data-type="text">Name</th>
+                        <th class="sortable" data-col="format"  data-type="text">Format</th>
+                        <th class="sortable" data-col="port"    data-type="num">Port</th>
+                        <th class="sortable" data-col="context" data-type="num">Context</th>
+                        <th class="sortable" data-col="size"    data-type="num">Size (GB)</th>
+                        <th class="sortable" data-col="reqvram" data-type="num">Required VRAM</th>
+                        <th class="sortable" data-col="status"  data-type="text">Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for model in models %}
+                    <tr id="model-row-{{ model.id }}" data-name="{{ model.name }}">
+                        <td data-sort="{{ model.name }}">{{ model.name }}</td>
+                        <td data-sort="{{ model.format_str }}">{{ model.format_str }}</td>
+                        <td data-sort="{{ model.port }}">{{ model.port }}</td>
+                        <td data-sort="{{ model.context }}">{{ model.context }}</td>
+                        <td data-sort="{{ model.file_size_bytes }}">{{ model.file_size_gib_str }} GiB</td>
+                        <td data-sort="{{ model.required_vram_bytes }}">{{ model.required_vram_gib_str }} GiB</td>
+                        <td data-sort="{{ model.state_class }}">
+                            <span class="badge badge-{{ model.state_class }}" id="model-status-{{ model.id }}">
+                                {{ model.state_display }}
+                            </span>
+                        </td>
+                        <td>
+                            <div class="actions">
+                                {% if model.state_class == "idle" || model.state_class == "error" %}
+                                <button type="button" class="btn btn-success btn-sm" onclick="loadModel('{{ model.id }}')">Load</button>
+                                {% endif %}
+                                {% if model.state_class == "running" %}
+                                <button type="button" class="btn btn-danger btn-sm" onclick="stopModel('{{ model.id }}')">Stop</button>
+                                {% endif %}
+                                <button type="button" class="btn btn-secondary btn-sm" onclick="editModel('{{ model.id }}')">Edit</button>
+                                <button type="button" class="btn btn-danger btn-sm" onclick="deleteModel('{{ model.id }}', '{{ model.name }}')">Delete</button>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- ===== Model add/edit modal ===== -->
+<div class="modal-overlay" id="model-modal">
+    <div class="modal">
+        <div class="modal-header">
+            <h2 id="model-modal-title">Add Model</h2>
+            <button type="button" class="modal-close" onclick="closeModal('model-modal')">×</button>
+        </div>
+        <div class="modal-body">
+            <form id="model-form">
+                <input type="hidden" id="form-mode" value="add">
+
+                <div class="form-group">
+                    <label for="id">ID</label>
+                    <input type="text" id="id" name="id" required placeholder="e.g. qwen3-30b">
+                    <small class="field-help">A short unique handle. This is the <code>"model"</code> value clients send in API requests (e.g. <code>{"model":"qwen3-30b"}</code>). Can't be changed after the model is created.</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="name">Name</label>
+                    <input type="text" id="name" name="name" required placeholder="e.g. Qwen3 30B">
+                    <small class="field-help">A friendly label shown in the dashboard. Doesn't affect anything else.</small>
+                </div>
+
+                <div class="form-group">
+                    <label>Weights format</label>
+                    <div style="display: flex; gap: 1.5rem;">
+                        <label style="display: flex; align-items: center; gap: 0.5rem; font-weight: normal;">
+                            <input type="radio" name="weights_format" value="gguf" checked>
+                            GGUF (llama.cpp)
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 0.5rem; font-weight: normal;">
+                            <input type="radio" name="weights_format" value="safetensors">
+                            Safetensors (vLLM)
+                        </label>
+                    </div>
+                    <small class="field-help">The file layout your model weights are in. GGUF is the single-file quantized format llama.cpp uses; Safetensors is the multi-file format Hugging Face / vLLM use. Pick the one that matches what you downloaded.</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="binary_preset">Binary</label>
+                    <select id="binary_preset" name="binary_preset">
+                        <option value="__custom__">Custom path…</option>
+                        <!-- Preset options injected by JS at modal-open time. -->
+                    </select>
+                    <small class="field-help">Pick a named binary from <strong>Settings → Backends</strong>, or choose <em>Custom path</em> to set a one-off path for this model.</small>
+                </div>
+                <div class="form-group" id="binary-custom-group">
+                    <label for="binary">Binary path</label>
+                    <input type="text" id="binary" name="binary" data-path-field placeholder="/home/you/llama.cpp/build-vulkan/bin/llama-server">
+                    <small class="field-help">Absolute path to the inference server program — your <code>llama-server</code> binary for GGUF, or your <code>vllm</code> binary for Safetensors.</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="model_path">Model path</label>
+                    <input type="text" id="model_path" name="model_path" data-path-field required placeholder="/models/qwen3-30b.gguf">
+                    <small class="field-help">For GGUF, the absolute path to the <code>.gguf</code> file. For Safetensors, the directory that contains the model files.</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="port">Port</label>
+                    <input type="number" id="port" name="port" min="1" max="65535" required style="max-width: 12rem;">
+                    <small class="field-help">Local port the inference server will listen on. Each loaded model needs its own; the proxy routes incoming OpenAI requests to the right port. Pick something free in 9000–9999 if unsure.</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="context">
+                        Context
+                        <span id="context-model-max" style="color: #94a3b8; font-weight: normal; font-size: 1rem; margin-left: 0.5rem;"></span>
+                    </label>
+                    <input type="number" id="context" name="context" min="0" required>
+                    <input type="range" id="context-slider" min="0" max="131072" step="1024" style="display: none; margin-top: 0.5rem;">
+                    <div id="vram-readout" style="display: none; margin-top: 0.5rem; font-size: 1rem; color: #38bdf8;"></div>
+                    <small id="context-hint" class="field-help">Enter a model path to get a VRAM estimate and slider.</small>
+                    <small class="field-help">How many tokens (prompt + reply combined) the model can keep in mind for a single conversation. Bigger = remembers more, but uses dramatically more VRAM. Roughly 1 token ≈ ¾ of an English word.</small>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="temperature">Temperature</label>
+                        <div class="slider-container">
+                            <input type="range" id="temperature-slider" min="0" max="2" step="0.01">
+                            <input type="number" id="temperature" name="temperature" step="0.01" min="0" max="2" class="slider-number">
+                        </div>
+                        <small class="field-help">How adventurous the model is when picking the next word. <strong>0</strong> = always picks the single most likely word (deterministic, repeatable). <strong>0.7</strong> = balanced. <strong>1.5+</strong> = wild and creative, sometimes incoherent. Use low values for code and facts, higher for brainstorming and fiction.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="top_p">Top P</label>
+                        <div class="slider-container">
+                            <input type="range" id="top_p-slider" min="0" max="1" step="0.01">
+                            <input type="number" id="top_p" name="top_p" step="0.01" min="0" max="1" class="slider-number">
+                        </div>
+                        <small class="field-help">"Nucleus sampling." Only consider next-word candidates from the smallest group whose probabilities add up to this fraction. <strong>0.95</strong> is the common default — ignore the bottom 5% of unlikely guesses. <strong>1.0</strong> disables the filter.</small>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="top_k">Top K</label>
+                        <div class="slider-container">
+                            <input type="range" id="top_k-slider" min="0" max="200" step="1">
+                            <input type="number" id="top_k" name="top_k" min="0" class="slider-number">
+                        </div>
+                        <small class="field-help">Only consider the K most likely next words at each step. <strong>40</strong> is a common default — narrow enough to stay on-topic, wide enough to feel natural. Lower (e.g. 20) = more focused; higher (e.g. 100) = more variety. <strong>0</strong> disables the filter.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="min_p">Min P</label>
+                        <div class="slider-container">
+                            <input type="range" id="min_p-slider" min="0" max="1" step="0.01">
+                            <input type="number" id="min_p" name="min_p" step="0.01" min="0" max="1" class="slider-number">
+                        </div>
+                        <small class="field-help">Drop any candidate word that's less than this fraction as likely as the top candidate. <strong>0.05</strong> is a common quality floor — kills the obviously-wrong guesses. <strong>0</strong> disables the filter.</small>
+                    </div>
+                </div>
+
+                <div id="llama-section" class="card" style="padding: 1rem; margin-bottom: 0;">
+                    <h2 style="margin-bottom: 0.25rem;">llama.cpp options</h2>
+                    <small class="field-help" style="margin-bottom: 0.75rem;">Backend flags for <code>llama-server</code>. Applied only when Weights format is GGUF. Extra arguments below override any of these (llama.cpp takes the last value for a repeated flag).</small>
+
+                    <div class="form-row" style="margin-top: 0.75rem;">
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 0.5rem;">
+                                <input type="checkbox" id="flash_attn" name="flash_attn">
+                                Flash attention
+                            </label>
+                            <small class="field-help">Faster attention with lower VRAM. Safe to enable on modern builds; a must for longer contexts.</small>
+                        </div>
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 0.5rem;">
+                                <input type="checkbox" id="mlock" name="mlock">
+                                Lock in RAM (mlock)
+                            </label>
+                            <small class="field-help">Pin the model in RAM so it can never be swapped out. Use it if your system swaps under pressure and inference stalls.</small>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 0.5rem;">
+                                <input type="checkbox" id="no_mmap" name="no_mmap">
+                                Disable mmap
+                            </label>
+                            <small class="field-help">Load the full model into RAM up front instead of memory-mapping it from disk. Slower to start; avoids page-cache churn on fast NVMe.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="parallel_slots">
+                                Parallel slots
+                                <span id="parallel_slots_display" style="color: #38bdf8; font-weight: normal; margin-left: 0.5rem;"></span>
+                            </label>
+                            <div class="slider-container">
+                                <input type="range" id="parallel_slots_slider" min="0" max="16" step="1" value="0">
+                                <input type="hidden" id="parallel_slots" name="parallel_slots" value="">
+                            </div>
+                            <small class="field-help">How many requests this model can handle concurrently. Each slot gets <code>context / N</code> tokens. <strong>0</strong> = leave at llama.cpp's default (usually 1). Useful &gt;1 for multi-agent workflows.</small>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="n_gpu_layers">
+                            GPU layers (<code>-ngl</code>)
+                            <span id="ngl_display" style="color: #38bdf8; font-weight: normal; margin-left: 0.5rem;"></span>
+                        </label>
+                        <div class="slider-container">
+                            <input type="range" id="n_gpu_layers_slider" min="0" max="128" step="1" value="0">
+                            <input type="hidden" id="n_gpu_layers" name="n_gpu_layers" value="">
+                        </div>
+                        <small class="field-help" id="ngl_help">Number of model layers to offload to the GPU. <strong>0</strong> = leave the flag off (default). The slider's max follows the model's actual layer count once the GGUF metadata loads.</small>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="split_mode">Split mode</label>
+                            <select id="split_mode" name="split_mode">
+                                <option value="">auto (let llama.cpp pick)</option>
+                                <option value="none">none — single GPU (model must fit)</option>
+                                <option value="layer">layer — pipeline parallelism (split by layer)</option>
+                                <option value="row">row — split each tensor by rows</option>
+                                <option value="tensor">tensor — tensor parallelism (run all GPUs in parallel)</option>
+                            </select>
+                            <small class="field-help">How the model is distributed across GPUs. <strong>layer</strong> is the safe default — each GPU holds a contiguous range of layers, low inter-GPU traffic. <strong>row</strong> splits each tensor row-wise. <strong>tensor</strong> is full tensor parallelism — generally the fastest mode when supported, but bandwidth-sensitive. <strong>none</strong> forces a single GPU. <strong>Note:</strong> the Vulkan backend in practice only supports <code>none</code> and <code>layer</code>; <code>row</code> and <code>tensor</code> work with the ROCm build.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="tensor_split">Tensor split</label>
+                            <input type="text" id="tensor_split" name="tensor_split" placeholder="leave blank for auto">
+                            <small class="field-help">Comma-separated fractions per GPU (e.g. <code>0.5,0.5,0</code> to use only the first two of three cards). <strong>Leave blank</strong> and the orchestrator picks the smallest GPU subset whose free VRAM fits the model. Filled in manually pins the split exactly.</small>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="main_gpu">Main GPU</label>
+                            <input type="number" id="main_gpu" name="main_gpu" min="0" placeholder="auto">
+                            <small class="field-help">Index of the GPU that holds small intermediate tensors (scalars, temp buffers). Usually irrelevant for <strong>layer</strong> split; matters more for <strong>row</strong>. Leave blank for llama.cpp's default.</small>
+                        </div>
+                        <div class="form-group"></div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="cache_type_k">K cache quantization</label>
+                            <select id="cache_type_k" name="cache_type_k">
+                                <option value="">default (f16)</option>
+                                <option value="f16">f16 (full precision)</option>
+                                <option value="q8_0">q8_0 (½ VRAM, negligible quality loss)</option>
+                                <option value="q4_0">q4_0 (¼ VRAM, some quality loss)</option>
+                            </select>
+                            <small class="field-help">Quantize the KV cache's keys to shrink VRAM. q8_0 is almost free; q4_0 can hurt quality on long contexts.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="cache_type_v">V cache quantization</label>
+                            <select id="cache_type_v" name="cache_type_v">
+                                <option value="">default (f16)</option>
+                                <option value="f16">f16 (full precision)</option>
+                                <option value="q8_0">q8_0 (½ VRAM, negligible quality loss)</option>
+                                <option value="q4_0">q4_0 (¼ VRAM, some quality loss)</option>
+                            </select>
+                            <small class="field-help">Quantize the KV cache's values. Same tradeoffs as K. Requires flash attention to be enabled if not f16.</small>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="extra_args">Extra arguments (one per line)</label>
+                    <textarea id="extra_args" name="extra_args" rows="5" placeholder="--flash-attn&#10;-ngl&#10;99"></textarea>
+                    <small class="field-help">Raw flags appended to the inference server's command line — use for anything not represented as a field above. One argument per line.</small>
+                </div>
+
+                <div style="display: flex; gap: 1rem; margin-top: 1rem;">
+                    <button type="submit" class="btn btn-primary">Save</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('model-modal')">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Settings modal ===== -->
+<div class="modal-overlay" id="settings-modal">
+    <div class="modal" style="max-width: 640px;">
+        <div class="modal-header">
+            <h2>Settings</h2>
+            <button type="button" class="modal-close" onclick="closeModal('settings-modal')">×</button>
+        </div>
+        <div class="modal-body">
+            <div class="card" style="margin-bottom: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                    <h2 style="margin: 0;">Backends</h2>
+                    <button type="button" class="btn btn-primary btn-sm" onclick="openPresetEditor()">+ Add preset</button>
+                </div>
+                <small class="field-help" style="margin-bottom: 0.75rem;">
+                    Named inference-server binaries. Models reference a preset by name, so you can rebuild
+                    <code>llama-server</code> in-place and every model that uses it picks up the new path.
+                </small>
+                <div id="preset-list" style="margin-top: 1rem;"></div>
+
+                <div id="preset-editor" style="display: none; margin-top: 1rem; border-top: 1px solid #334155; padding-top: 1rem;">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="preset-id">ID</label>
+                            <input type="text" id="preset-id" placeholder="e.g. llama-vulkan">
+                            <small class="field-help">Short, unique. Can't change after creation.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="preset-name">Name</label>
+                            <input type="text" id="preset-name" placeholder="e.g. llama.cpp (Vulkan)">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="preset-binary">Binary path</label>
+                        <input type="text" id="preset-binary" data-path-field placeholder="/home/you/llama.cpp/build-vulkan/bin/llama-server">
+                    </div>
+                    <div style="display: flex; gap: 0.75rem; margin-top: 0.75rem;">
+                        <button type="button" class="btn btn-primary btn-sm" onclick="savePreset()">Save</button>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="closePresetEditor()">Cancel</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card" style="margin-bottom: 1rem;">
+                <h2>Server</h2>
+                <div class="form-group">
+                    <label>Server port</label>
+                    <input type="number" value="{{ server_port }}" readonly>
+                    <small class="field-help">The web UI and proxy endpoint. Change it by restarting with a different port.</small>
+                </div>
+            </div>
+            <div class="card" style="margin-bottom: 0;">
+                <h2>OpenAI-compatible endpoint</h2>
+                <p style="color: #cbd5e1; font-size: 1rem; margin-bottom: 0.75rem;">Point any OpenAI client at this base URL:</p>
+                <code>http://localhost:{{ server_port }}/v1</code>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.slider-number { width: 5.5rem; text-align: right; }
+.field-help { display: block; color: #94a3b8; font-size: 1rem; margin-top: 0.25rem; line-height: 1.5; }
+.field-help code { background: #334155; padding: 0 0.25rem; border-radius: 3px; font-size: 1em; }
+</style>
+
+<script>
+// Defaults for the "Add model" state.
+const MODEL_DEFAULTS = {
+    id: '', name: '',
+    weights_format: 'gguf',
+    binary: '', model_path: '',
+    port: 9001, context: 4096,
+    temperature: 0.6, top_p: 0.95, top_k: 40, min_p: 0.0,
+    flash_attn: false, n_gpu_layers: null, mlock: false, no_mmap: false,
+    parallel_slots: null, cache_type_k: null, cache_type_v: null,
+    split_mode: null, main_gpu: null, tensor_split: null,
+    extra_args: [],
+};
+
+async function openAddModelModal() {
+    await refreshPresetSelect();
+    populateModelForm(MODEL_DEFAULTS, 'add');
+    openModal('model-modal');
+    setTimeout(() => document.getElementById('id').focus(), 50);
+}
+
+// Fetch the current presets and rebuild the select in the model form.
+async function refreshPresetSelect() {
+    const sel = document.getElementById('binary_preset');
+    if (!sel) return;
+    try {
+        const r = await fetch('/api/presets');
+        const list = r.ok ? await r.json() : [];
+        // Rebuild: "Custom path…" sentinel first, then presets.
+        const currentValue = sel.value;
+        sel.innerHTML = '';
+        const opt = document.createElement('option');
+        opt.value = '__custom__';
+        opt.textContent = 'Custom path…';
+        sel.appendChild(opt);
+        list.forEach(p => {
+            const o = document.createElement('option');
+            o.value = p.id;
+            o.textContent = `${p.name} (${p.binary})`;
+            sel.appendChild(o);
+        });
+        // Re-select previous if still present.
+        if ([...sel.options].some(o => o.value === currentValue)) sel.value = currentValue;
+    } catch {}
+}
+
+function applyPresetSelection() {
+    const sel = document.getElementById('binary_preset');
+    const customGroup = document.getElementById('binary-custom-group');
+    const binaryInput = document.getElementById('binary');
+    if (!sel || !customGroup || !binaryInput) return;
+    if (sel.value === '__custom__') {
+        customGroup.style.display = '';
+        binaryInput.required = true;
+    } else {
+        customGroup.style.display = 'none';
+        binaryInput.required = false;
+    }
+}
+
+// Bind once.
+(function bindPresetSelect() {
+    const sel = document.getElementById('binary_preset');
+    if (sel) sel.addEventListener('change', applyPresetSelection);
+})();
+
+async function editModel(id) {
+    try {
+        await refreshPresetSelect();
+        const r = await fetch('/api/models');
+        if (!r.ok) throw new Error(r.statusText);
+        const models = await r.json();
+        const m = models.find(x => x.id === id);
+        if (!m) { alert(`Model ${id} not found.`); return; }
+        populateModelForm(m, 'edit');
+        openModal('model-modal');
+    } catch (e) {
+        alert(`Could not load model: ${e}`);
+    }
+}
+
+function populateModelForm(m, mode) {
+    document.getElementById('form-mode').value = mode;
+    document.getElementById('model-modal-title').textContent = mode === 'add' ? 'Add Model' : `Edit ${m.name || m.id}`;
+    const f = document.getElementById('model-form');
+
+    f.id.value = m.id || '';
+    f.id.readOnly = (mode === 'edit');
+    f.name.value = m.name || '';
+    f.weights_format.value = m.weights_format || 'gguf';
+    // radio groups need per-input checking
+    [...f.querySelectorAll('input[name="weights_format"]')].forEach(r => r.checked = (r.value === (m.weights_format || 'gguf')));
+    // Preset selection: pick the matching option if the model references a
+    // preset that still exists; otherwise fall back to Custom path.
+    const presetSel = document.getElementById('binary_preset');
+    if (presetSel) {
+        const wanted = m.binary_preset || '';
+        const found = wanted && [...presetSel.options].some(o => o.value === wanted);
+        presetSel.value = found ? wanted : '__custom__';
+    }
+    f.binary.value = m.binary || '';
+    applyPresetSelection();
+    f.model_path.value = m.model_path || '';
+    f.port.value = m.port ?? 9001;
+    f.context.value = m.context ?? 4096;
+
+    // sampling
+    setPair('temperature', m.temperature ?? 0.6);
+    setPair('top_p', m.top_p ?? 0.95);
+    setPair('top_k', m.top_k ?? 40);
+    setPair('min_p', m.min_p ?? 0.0);
+
+    // llama.cpp flags
+    f.flash_attn.checked = !!m.flash_attn;
+    f.mlock.checked = !!m.mlock;
+    f.no_mmap.checked = !!m.no_mmap;
+    setOptionalSlider('n_gpu_layers', m.n_gpu_layers);
+    setOptionalSlider('parallel_slots', m.parallel_slots);
+    f.cache_type_k.value = m.cache_type_k ?? '';
+    f.cache_type_v.value = m.cache_type_v ?? '';
+    f.split_mode.value = m.split_mode ?? '';
+    f.main_gpu.value = m.main_gpu == null ? '' : String(m.main_gpu);
+    f.tensor_split.value = m.tensor_split ?? '';
+
+    f.extra_args.value = (m.extra_args || []).join('\n');
+
+    // Reset context slider state — the GGUF info fetch will reapply if it
+    // resolves a new path.
+    const ctxSlider = document.getElementById('context-slider');
+    ctxSlider.style.display = 'none';
+    document.getElementById('vram-readout').style.display = 'none';
+    document.getElementById('context-model-max').textContent = '';
+    const ctxHint = document.getElementById('context-hint');
+    ctxHint.style.display = '';
+    ctxHint.textContent = 'Enter a model path to get a VRAM estimate and slider.';
+
+    // Reapply format-dependent visibility + trigger GGUF info fetch.
+    document.getElementById('llama-section').style.display =
+        (m.weights_format || 'gguf') === 'gguf' ? '' : 'none';
+    if ((m.weights_format || 'gguf') === 'gguf' && m.model_path) {
+        document.getElementById('model_path').dispatchEvent(new Event('input'));
+    }
+}
+
+function setPair(name, value) {
+    const num = document.getElementById(name);
+    const slider = document.getElementById(`${name}-slider`);
+    if (num) num.value = value;
+    if (slider) slider.value = value;
+}
+
+function setOptionalSlider(name, value) {
+    const slider = document.getElementById(`${name}_slider`);
+    const hidden = document.getElementById(name);
+    if (!slider || !hidden) return;
+    if (value == null) {
+        slider.value = 0;
+        hidden.value = '';
+    } else {
+        slider.value = value;
+        hidden.value = String(value);
+    }
+    slider.dispatchEvent(new Event('input'));
+}
+
+// ----- Row actions -----
+async function loadModel(id) {
+    const r = await fetch(`/api/models/${encodeURIComponent(id)}/load`, { method: 'POST' });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Load failed: ' + (j.error || r.statusText)); }
+    else location.reload();
+}
+async function stopModel(id) {
+    const r = await fetch(`/api/models/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Stop failed: ' + (j.error || r.statusText)); }
+    else location.reload();
+}
+async function deleteModel(id, name) {
+    if (!confirm(`Delete ${name}?`)) return;
+    const r = await fetch(`/api/models/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Delete failed: ' + (j.error || r.statusText)); }
+    else location.reload();
+}
+
+// ----- Slider/number pair sync (sampling) -----
+(function bindSliderPairs() {
+    [
+        ['temperature-slider', 'temperature'],
+        ['top_p-slider', 'top_p'],
+        ['top_k-slider', 'top_k'],
+        ['min_p-slider', 'min_p'],
+    ].forEach(([sliderId, numberId]) => {
+        const slider = document.getElementById(sliderId);
+        const number = document.getElementById(numberId);
+        if (!slider || !number) return;
+        slider.addEventListener('input', () => { number.value = slider.value; });
+        number.addEventListener('input', () => {
+            const v = parseFloat(number.value);
+            if (!Number.isNaN(v)) {
+                const max = parseFloat(slider.max);
+                const min = parseFloat(slider.min);
+                slider.value = Math.min(Math.max(v, min), max);
+            }
+        });
+    });
+})();
+
+// ----- Optional sliders (0 = "don't set the flag") -----
+(function bindOptionalSliders() {
+    [
+        { slider: 'n_gpu_layers_slider', hidden: 'n_gpu_layers', display: 'ngl_display', suffix: '' },
+        { slider: 'parallel_slots_slider', hidden: 'parallel_slots', display: 'parallel_slots_display', suffix: ' slots' },
+    ].forEach(spec => {
+        const slider = document.getElementById(spec.slider);
+        const hidden = document.getElementById(spec.hidden);
+        const disp = document.getElementById(spec.display);
+        if (!slider || !hidden) return;
+        function sync() {
+            const v = parseInt(slider.value, 10);
+            if (v === 0) {
+                hidden.value = '';
+                if (disp) disp.textContent = '(default)';
+            } else {
+                hidden.value = String(v);
+                if (disp) disp.textContent = `${v}${spec.suffix}${spec.slider === 'n_gpu_layers_slider' && slider.max ? ` of ${slider.max}` : ''}`;
+            }
+        }
+        slider.addEventListener('input', sync);
+        sync();
+    });
+})();
+
+// ----- Format toggle -----
+(function toggleLlamaSection() {
+    const section = document.getElementById('llama-section');
+    const radios = document.querySelectorAll('input[name="weights_format"]');
+    function apply() {
+        const fmt = document.querySelector('input[name="weights_format"]:checked').value;
+        section.style.display = fmt === 'gguf' ? '' : 'none';
+    }
+    radios.forEach(r => r.addEventListener('change', apply));
+    apply();
+})();
+
+// ----- Live GGUF metadata + VRAM preview -----
+(function() {
+    const pathInput = document.getElementById('model_path');
+    const formatInputs = document.querySelectorAll('input[name="weights_format"]');
+    const ctxInput = document.getElementById('context');
+    const slider = document.getElementById('context-slider');
+    const readout = document.getElementById('vram-readout');
+    const modelMaxEl = document.getElementById('context-model-max');
+    const hint = document.getElementById('context-hint');
+    let info = null;
+    let pending = null;
+
+    function gib(bytes) { return (bytes / 1073741824).toFixed(2); }
+
+    function cacheBytes(sel) {
+        const v = (document.getElementById(sel) || {}).value || '';
+        if (v === 'q8_0') return 1.0;
+        if (v === 'q4_0') return 0.5;
+        return 2.0;
+    }
+
+    function recompute(ctx) {
+        if (!info) return;
+        const nEmbdHead = info.n_head > 0 ? Math.floor(info.n_embd / info.n_head) : 128;
+        const nHeadKv = Math.max(info.n_head_kv || 0, 1);
+        const perK = cacheBytes('cache_type_k');
+        const perV = cacheBytes('cache_type_v');
+        const kv = info.n_layers * ctx * nHeadKv * nEmbdHead * (perK + perV);
+        const total = Math.floor((info.file_size + kv) * 11 / 10);
+        readout.textContent =
+            `Weights ${gib(info.file_size)} GiB  +  KV ${gib(kv)} GiB  =  ${gib(total)} GiB total`;
+    }
+
+    function applyInfo(newInfo) {
+        info = newInfo;
+        modelMaxEl.textContent = `(trained for ${info.max_context.toLocaleString()} tokens)`;
+        slider.max = info.max_context;
+        hint.style.display = 'none';
+        slider.style.display = '';
+        readout.style.display = '';
+        const current = Math.min(parseInt(ctxInput.value, 10) || info.max_context, info.max_context);
+        ctxInput.value = current;
+        slider.value = current;
+        ctxInput.max = info.max_context;
+
+        const ngl = document.getElementById('n_gpu_layers_slider');
+        const nglHidden = document.getElementById('n_gpu_layers');
+        const nglHelp = document.getElementById('ngl_help');
+        if (ngl) {
+            ngl.max = info.n_layers;
+            if (nglHelp) nglHelp.innerHTML = `Number of model layers to offload to the GPU. The model has <strong>${info.n_layers}</strong> layers; <strong>${info.n_layers}</strong> offloads everything. <strong>0</strong> = leave the flag off (default).`;
+            if (!nglHidden.value) {
+                ngl.value = info.n_layers;
+                nglHidden.value = info.n_layers;
+                const disp = document.getElementById('ngl_display');
+                if (disp) disp.textContent = `${info.n_layers} of ${info.n_layers}`;
+            }
+        }
+        recompute(current);
+    }
+
+    function clearInfo(msg) {
+        info = null;
+        slider.style.display = 'none';
+        readout.style.display = 'none';
+        modelMaxEl.textContent = '';
+        hint.style.display = '';
+        hint.textContent = msg || 'Enter a model path to get a VRAM estimate and slider.';
+        ctxInput.removeAttribute('max');
+    }
+
+    async function fetchInfo() {
+        const path = pathInput.value.trim();
+        const fmt = document.querySelector('input[name="weights_format"]:checked').value;
+        if (!path || fmt !== 'gguf') {
+            clearInfo(fmt === 'safetensors' ? 'GGUF metadata preview only available for GGUF.' : undefined);
+            return;
+        }
+        hint.style.display = '';
+        hint.textContent = 'Reading GGUF metadata…';
+        try {
+            const r = await fetch(`/api/gguf-info?path=${encodeURIComponent(path)}`);
+            if (!r.ok) {
+                const j = await r.json().catch(() => ({}));
+                clearInfo(`GGUF read failed: ${j.error || r.statusText}`);
+                return;
+            }
+            applyInfo(await r.json());
+        } catch (e) {
+            clearInfo(`GGUF read failed: ${e}`);
+        }
+    }
+
+    function schedule() {
+        if (pending) clearTimeout(pending);
+        pending = setTimeout(fetchInfo, 300);
+    }
+
+    pathInput.addEventListener('input', schedule);
+    pathInput.addEventListener('blur', fetchInfo);
+    formatInputs.forEach(el => el.addEventListener('change', schedule));
+    slider.addEventListener('input', () => {
+        ctxInput.value = slider.value;
+        recompute(parseInt(slider.value, 10));
+    });
+    ctxInput.addEventListener('input', () => {
+        if (info) {
+            const v = Math.min(Math.max(parseInt(ctxInput.value, 10) || 0, 0), info.max_context);
+            slider.value = v;
+            recompute(v);
+        }
+    });
+    document.getElementById('cache_type_k').addEventListener('change', () => {
+        if (info) recompute(parseInt(slider.value || ctxInput.value, 10) || 0);
+    });
+    document.getElementById('cache_type_v').addEventListener('change', () => {
+        if (info) recompute(parseInt(slider.value || ctxInput.value, 10) || 0);
+    });
+})();
+
+// ===== Models table: filter + sort =====
+
+(function wireModelTableControls() {
+    const table  = document.getElementById('models-table');
+    const filter = document.getElementById('model-filter');
+    if (!table || !filter) return;
+    const tbody = table.querySelector('tbody');
+
+    function applyFilter() {
+        const needle = filter.value.trim().toLowerCase();
+        tbody.querySelectorAll('tr').forEach(tr => {
+            const name = (tr.dataset.name || '').toLowerCase();
+            tr.style.display = !needle || name.includes(needle) ? '' : 'none';
+        });
+    }
+    filter.addEventListener('input', applyFilter);
+
+    // Click-to-sort on every <th class="sortable">. Repeated clicks on the
+    // same column toggle asc / desc. Sort keys come from each cell's
+    // `data-sort` attribute so numbers sort numerically regardless of the
+    // displayed suffix (e.g. "12.3 GiB" sorts by raw bytes).
+    table.querySelectorAll('th.sortable').forEach((th, colIdx) => {
+        th.addEventListener('click', () => {
+            const type = th.dataset.type || 'text';
+            const currentlyAsc = th.classList.contains('sort-asc');
+            // Clear siblings.
+            table.querySelectorAll('th.sortable').forEach(other => {
+                other.classList.remove('sort-asc', 'sort-desc');
+            });
+            const asc = !currentlyAsc;
+            th.classList.add(asc ? 'sort-asc' : 'sort-desc');
+
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            rows.sort((a, b) => {
+                const av = a.children[colIdx].dataset.sort ?? a.children[colIdx].textContent;
+                const bv = b.children[colIdx].dataset.sort ?? b.children[colIdx].textContent;
+                let cmp;
+                if (type === 'num') {
+                    cmp = (parseFloat(av) || 0) - (parseFloat(bv) || 0);
+                } else {
+                    cmp = av.toString().localeCompare(bv.toString(), undefined, { sensitivity: 'base' });
+                }
+                return asc ? cmp : -cmp;
+            });
+            // Reinsert in the sorted order (DocumentFragment avoids reflows per-row).
+            const frag = document.createDocumentFragment();
+            rows.forEach(r => frag.appendChild(r));
+            tbody.appendChild(frag);
+        });
+    });
+})();
+
+// ===== Preset management (Settings modal) =====
+
+let _presetEditorMode = 'add';  // 'add' | 'edit'
+
+async function refreshPresetList() {
+    const list = document.getElementById('preset-list');
+    if (!list) return;
+    list.innerHTML = '<div style="color:#94a3b8;">Loading…</div>';
+    try {
+        const r = await fetch('/api/presets');
+        if (!r.ok) { list.innerHTML = '<div style="color:#fca5a5;">Failed to load presets.</div>'; return; }
+        const presets = await r.json();
+        if (presets.length === 0) {
+            list.innerHTML = '<div style="color:#94a3b8; font-style:italic;">No presets yet. Add one above.</div>';
+        } else {
+            list.innerHTML = '';
+            presets.forEach(p => list.appendChild(renderPresetRow(p)));
+        }
+    } catch (e) {
+        list.innerHTML = `<div style="color:#fca5a5;">Error: ${e}</div>`;
+    }
+}
+
+function renderPresetRow(p) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:0.75rem; align-items:center; padding:0.5rem 0; border-bottom:1px solid #334155;';
+    row.innerHTML = `
+        <div style="flex:1; min-width:0;">
+            <div style="font-weight:600;">${escapeHtmlText(p.name)}</div>
+            <div style="color:#94a3b8; font-size:0.95rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${escapeHtmlText(p.binary)}">
+                <code>${escapeHtmlText(p.id)}</code> · ${escapeHtmlText(p.binary)}
+            </div>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm">Edit</button>
+        <button type="button" class="btn btn-danger btn-sm">Delete</button>
+    `;
+    row.querySelectorAll('button')[0].addEventListener('click', () => openPresetEditor(p));
+    row.querySelectorAll('button')[1].addEventListener('click', () => deletePreset(p.id, p.name));
+    return row;
+}
+
+function escapeHtmlText(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => (
+        {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+    ));
+}
+
+function openPresetEditor(existing) {
+    _presetEditorMode = existing ? 'edit' : 'add';
+    document.getElementById('preset-editor').style.display = '';
+    const idEl = document.getElementById('preset-id');
+    idEl.value = existing ? existing.id : '';
+    idEl.readOnly = !!existing;
+    document.getElementById('preset-name').value = existing ? existing.name : '';
+    document.getElementById('preset-binary').value = existing ? existing.binary : '';
+    setTimeout(() => (existing ? document.getElementById('preset-name') : idEl).focus(), 20);
+}
+
+function closePresetEditor() {
+    document.getElementById('preset-editor').style.display = 'none';
+}
+
+async function savePreset() {
+    const id = document.getElementById('preset-id').value.trim();
+    const name = document.getElementById('preset-name').value.trim();
+    const binary = document.getElementById('preset-binary').value.trim();
+    if (!id || !name || !binary) { alert('All fields are required.'); return; }
+    const body = JSON.stringify({ id, name, binary });
+    const url = _presetEditorMode === 'add' ? '/api/presets' : `/api/presets/${encodeURIComponent(id)}`;
+    const method = _presetEditorMode === 'add' ? 'POST' : 'PUT';
+    const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body });
+    if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        alert('Save failed: ' + (j.error || r.statusText));
+        return;
+    }
+    closePresetEditor();
+    await refreshPresetList();
+}
+
+async function deletePreset(id, name) {
+    if (!confirm(`Delete preset "${name}"? Models referencing it will fail to load until you pick a different binary.`)) return;
+    const r = await fetch(`/api/presets/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        alert('Delete failed: ' + (j.error || r.statusText));
+        return;
+    }
+    await refreshPresetList();
+}
+
+// ----- Submit -----
+document.getElementById('model-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const mode = document.getElementById('form-mode').value;
+    const extraRaw = f.extra_args.value || '';
+    const extra = extraRaw.split('\n').map(s => s.trim()).filter(s => s.length > 0);
+    const toOptInt = (v) => {
+        const s = (v || '').toString().trim();
+        if (!s) return null;
+        const n = parseInt(s, 10);
+        return Number.isNaN(n) ? null : n;
+    };
+    const toOptStr = (v) => {
+        const s = (v || '').toString().trim();
+        return s ? s : null;
+    };
+    const presetSel = document.getElementById('binary_preset');
+    const presetChoice = presetSel ? presetSel.value : '__custom__';
+    const body = {
+        id: f.id.value.trim(),
+        name: f.name.value.trim(),
+        weights_format: f.weights_format.value,
+        binary_preset: presetChoice === '__custom__' ? null : presetChoice,
+        binary: presetChoice === '__custom__' ? f.binary.value.trim() : '',
+        model_path: f.model_path.value.trim(),
+        port: parseInt(f.port.value, 10),
+        context: parseInt(f.context.value, 10),
+        temperature: parseFloat(f.temperature.value),
+        top_p: parseFloat(f.top_p.value),
+        top_k: parseInt(f.top_k.value, 10),
+        min_p: parseFloat(f.min_p.value),
+        flash_attn: f.flash_attn.checked,
+        n_gpu_layers: toOptInt(f.n_gpu_layers.value),
+        mlock: f.mlock.checked,
+        no_mmap: f.no_mmap.checked,
+        parallel_slots: toOptInt(f.parallel_slots.value),
+        cache_type_k: toOptStr(f.cache_type_k.value),
+        cache_type_v: toOptStr(f.cache_type_v.value),
+        split_mode: toOptStr(f.split_mode.value),
+        main_gpu: toOptInt(f.main_gpu.value),
+        tensor_split: toOptStr(f.tensor_split.value),
+        extra_args: extra,
+    };
+    const url = mode === 'add' ? '/api/models' : `/api/models/${encodeURIComponent(body.id)}`;
+    const method = mode === 'add' ? 'POST' : 'PUT';
+    const r = await fetch(url, {
+        method, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    if (r.ok) {
+        location.reload();
+    } else {
+        const j = await r.json().catch(() => ({}));
+        alert('Error: ' + (j.error || r.statusText));
+    }
+});
+</script>
+{% endblock %}
