@@ -26,7 +26,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            port: 8081,
+            port: 8080,
             config_dir: PathBuf::from(DEFAULT_CONFIG_DIR),
         }
     }

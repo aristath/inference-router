@@ -251,6 +251,7 @@
     async function openSettingsModal() {
         openModal('settings-modal');
         if (typeof refreshPresetList === 'function') await refreshPresetList();
+        if (typeof syncPollIntervalField === 'function') syncPollIntervalField();
     }
     </script>
     <script>
@@ -328,8 +329,36 @@
                 }
             });
         }
+        // Polling interval is a per-browser UI preference, stored in
+        // localStorage. The dashboard Settings modal exposes a field to
+        // change it. Clamped to keep the range sane; 0 would DoS the UA.
+        const POLL_KEY = 'inferenceRouterPollIntervalMs';
+        const POLL_DEFAULT = 500;
+        const POLL_MIN = 20;
+        const POLL_MAX = 60000;
+        let pollTimer = null;
+
+        function getPollInterval() {
+            const raw = parseInt(localStorage.getItem(POLL_KEY), 10);
+            if (!Number.isFinite(raw)) return POLL_DEFAULT;
+            return Math.min(POLL_MAX, Math.max(POLL_MIN, raw));
+        }
+        function setPollInterval(ms) {
+            const n = Math.min(POLL_MAX, Math.max(POLL_MIN, Math.round(ms)));
+            localStorage.setItem(POLL_KEY, String(n));
+            restartPoll();
+            return n;
+        }
+        function restartPoll() {
+            if (pollTimer) clearInterval(pollTimer);
+            pollTimer = setInterval(poll, getPollInterval());
+        }
+        window.getPollInterval = getPollInterval;
+        window.setPollInterval = setPollInterval;
+        window.pollIntervalBounds = { min: POLL_MIN, max: POLL_MAX, default: POLL_DEFAULT };
+
         poll();
-        setInterval(poll, 500); // 2 Hz — sysfs reads are cheap
+        restartPoll();
     </script>
 
     <script>

@@ -423,6 +423,21 @@
             </div>
 
             <div class="card" style="margin-bottom: 1rem;">
+                <h2>Dashboard</h2>
+                <div class="form-group">
+                    <label for="poll-interval">Polling interval (ms)</label>
+                    <div class="slider-container">
+                        <input type="range" id="poll-interval-slider" min="20" max="5000" step="10">
+                        <input type="number" id="poll-interval" min="20" max="60000" step="10" class="slider-number">
+                    </div>
+                    <small class="field-help">
+                        How often this browser re-fetches <code>/api/status</code> to update live GPU/CPU stats and model status.
+                        Lower = smoother updates, more requests. Saved per browser (localStorage). Default 500 ms; clamped 20–60000 ms.
+                    </small>
+                </div>
+            </div>
+
+            <div class="card" style="margin-bottom: 1rem;">
                 <h2>Server</h2>
                 <div class="form-group">
                     <label>Server port</label>
@@ -939,6 +954,37 @@ async function savePreset() {
     closePresetEditor();
     await refreshPresetList();
 }
+
+// ----- Polling interval setting (base.html owns localStorage + poll loop) -----
+
+function syncPollIntervalField() {
+    if (typeof window.getPollInterval !== 'function') return;
+    const number = document.getElementById('poll-interval');
+    const slider = document.getElementById('poll-interval-slider');
+    if (!number || !slider) return;
+    const current = window.getPollInterval();
+    number.value = current;
+    slider.value = Math.min(parseInt(slider.max, 10), current);
+}
+
+(function bindPollIntervalField() {
+    const number = document.getElementById('poll-interval');
+    const slider = document.getElementById('poll-interval-slider');
+    if (!number || !slider) return;
+
+    function commit(raw) {
+        const v = parseInt(raw, 10);
+        if (!Number.isFinite(v)) { syncPollIntervalField(); return; }
+        const applied = window.setPollInterval(v);
+        number.value = applied;
+        slider.value = Math.min(parseInt(slider.max, 10), applied);
+    }
+    slider.addEventListener('input', () => { number.value = slider.value; });
+    slider.addEventListener('change', () => commit(slider.value));
+    number.addEventListener('change', () => commit(number.value));
+    number.addEventListener('blur', () => commit(number.value));
+    syncPollIntervalField();
+})();
 
 async function deletePreset(id, name) {
     if (!confirm(`Delete preset "${name}"? Models referencing it will fail to load until you pick a different binary.`)) return;
