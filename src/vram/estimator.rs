@@ -43,51 +43,30 @@ impl KvPerElement {
 }
 
 impl VramEstimate {
-    /// Pure formula, independent of GGUF parsing. Unit-tested directly.
-    ///
-    /// ```text
-    /// per_token_bytes = n_embd_head * kv_heads_total * (k_bytes + v_bytes)
-    /// kv_cache        = context * per_token_bytes
-    /// total           = (file_size + kv_cache) * 1.1                  // 10% overhead
-    /// ```
-    ///
-    /// `kv_heads_total` is the sum of `n_head_kv` across every layer —
-    /// for a uniform model this equals `n_layers * n_head_kv`; for
-    /// hybrid models (linear-attention layers mixed with full-attention
-    /// layers, as in kimi-linear) it correctly excludes layers with
-    /// zero KV heads, which `max * n_layers` would over-count.
-    pub fn compute(
-        file_size: u64,
-        context: u32,
-        n_embd_head: u64,
-        kv_heads_total: u64,
-        kv_bytes: KvPerElement,
-    ) -> Self {
-        let elements = context as u64 * n_embd_head.max(1) * kv_heads_total;
-        // K + V stored separately; each may have its own quantization.
-        // `(num/den)` is multiplied into the element count to keep q4_0
-        // (half-a-byte) exact instead of rounding early.
-        let k_bytes = elements * kv_bytes.k.0 / kv_bytes.k.1;
-        let v_bytes = elements * kv_bytes.v.0 / kv_bytes.v.1;
-        let kv_cache = k_bytes + v_bytes;
-        let total = (file_size + kv_cache).saturating_mul(11) / 10;
-        Self { weight_vram: file_size, kv_cache_vram: kv_cache, total_vram: total }
+    /// Combine weight size and pre-computed KV cache bytes into a
+    /// total that includes a 10% runtime overhead. The KV-cache
+    /// computation itself lives on `GgufInfo::kv_cache_bytes`, which
+    /// knows how to handle sliding-window attention, per-layer KV
+    /// head counts, and mixed-quantization caches.
+    pub fn compute(file_size: u64, kv_cache_bytes: u64) -> Self {
+        let total = (file_size + kv_cache_bytes).saturating_mul(11) / 10;
+        Self { weight_vram: file_size, kv_cache_vram: kv_cache_bytes, total_vram: total }
     }
-
 }
 
 /// All the GGUF metadata fields the orchestrator + form UI care about.
 ///
 /// The fields split cleanly into two groups:
-/// - **Display** (`n_head`, `n_head_kv`): one representative integer
-///   per field; arrays are reduced to their max element. These exist
-///   so the UI can show "this model has 96 heads, 8 KV heads" without
-///   cluttering the form.
-/// - **Math** (`kv_heads_total`, `n_embd`, `key_length`): the
-///   primitives used by `VramEstimate::compute`. For uniform models
-///   these equal the obvious products; for hybrid and per-layer MoE
-///   architectures they carry the summed-over-layers shape directly
-///   so the KV-cache estimate stays correct.
+/// - **Display** (`n_head`, `n_head_kv`, `kv_heads_total`): convenience
+///   aggregates for the form UI and model list.
+/// - **KV-cache math** (`full_kv_heads`, `swa_kv_heads`,
+///   `sliding_window`, `key_length`, `key_length_swa`): the exact
+///   primitives needed by `kv_cache_bytes`. For uniform models these
+///   collapse to the scalar case; for hybrid architectures (Step-3.5
+///   per-layer MoE, kimi-linear with linear-attention mixed in,
+///   gemma with sliding-window attention on most layers) they carry
+///   the per-layer shape so the estimate stays grounded in what
+///   llama.cpp actually allocates.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct GgufInfo {
     pub max_context: u32,
@@ -96,15 +75,27 @@ pub struct GgufInfo {
     pub n_head: u32,
     pub n_head_kv: u32,
     /// `<arch>.attention.key_length` when the GGUF exposes it, else 0.
-    /// When present, KV-cache math uses this directly instead of
-    /// `n_embd / n_head` — which is wrong for models like Step-3.5
-    /// where the head dim is 128 but `n_embd / n_head` = 42.
+    /// The per-head dim for **full-context** attention layers. Step-3.5
+    /// publishes 128 here even though `n_embd / n_head = 42`; gemma-4
+    /// publishes 512 for its global-attention layers.
     pub key_length: u32,
-    /// `sum over layers of n_head_kv[layer]`. Equals `n_layers *
-    /// n_head_kv` for uniform models; for hybrid models (e.g.
-    /// kimi-linear) it excludes layers with 0 KV heads so the estimate
-    /// doesn't double-count linear-attention layers.
+    /// Per-head dim for **sliding-window** attention layers, when the
+    /// model has separate SWA layers. 0 when the model has no SWA.
+    pub key_length_swa: u32,
+    /// Sum of `n_head_kv` across **full-context** layers. Equals
+    /// `kv_heads_total` for a pure full-attention model; for models
+    /// with SWA, this counts only the subset that caches full context.
+    pub full_kv_heads: u64,
+    /// Sum of `n_head_kv` across **sliding-window** layers only.
+    /// Their effective context is capped at `sliding_window` tokens.
+    /// Zero for models without SWA.
+    pub swa_kv_heads: u64,
+    /// Sum of `n_head_kv` across ALL layers — purely for display.
+    /// `full_kv_heads + swa_kv_heads`. Kept as a separate field so the
+    /// JS form can show it without recomputing.
     pub kv_heads_total: u64,
+    /// Sliding-window size in tokens. 0 when the model doesn't use SWA.
+    pub sliding_window: u32,
     /// Total bytes across all on-disk shards of this model. Equals the
     /// file size for a single-file GGUF, but sums all sibling shards for
     /// multi-file GGUFs named like `foo.gguf-00001-of-00005.gguf`.
@@ -136,33 +127,52 @@ impl GgufInfo {
         // shapes uniformly and carry forward the correct summed total,
         // not just a single representative.
         let head_stats = read_int_field(&map, &attention_key(&map, "head_count")?)?;
-        let kv_stats = read_int_field(&map, &attention_key(&map, "head_count_kv")?)?;
+        let kv_heads_per_layer =
+            read_int_field_per_layer(&map, &attention_key(&map, "head_count_kv")?, n_layers)?;
 
         // Optional — only some models expose it. When present we use it
         // verbatim as the per-head dim; when absent we fall back to
         // n_embd / n_head (see `n_embd_head`).
-        let key_length = match map.llm_attention_key_length() {
-            Ok(v) => v as u32,
-            Err(GGufMetaError::NotExist) => 0,
-            Err(GGufMetaError::TypeMismatch(Ty::Array)) => 0,
-            Err(e) => return Err(meta_err(e)),
-        };
+        let key_length = read_optional_u32(&map, &attention_key(&map, "key_length")?)?;
+        let key_length_swa = read_optional_u32(&map, &attention_key(&map, "key_length_swa")?)?;
+        let sliding_window = read_optional_u32(&map, &attention_key(&map, "sliding_window")?)?;
+
+        // Which layers use sliding-window attention vs full? Gemma-3/4
+        // publish `<arch>.attention.sliding_window_pattern` as a bool
+        // array with one entry per layer. Other models either set every
+        // layer to the same pattern (empty / absent array) or have no
+        // SWA at all (sliding_window == 0).
+        let swa_pattern =
+            read_bool_array_field(&map, &attention_key(&map, "sliding_window_pattern")?)?;
+
+        let (full_kv_heads, swa_kv_heads) = split_kv_heads(
+            &kv_heads_per_layer,
+            &swa_pattern,
+            sliding_window,
+            n_layers,
+        );
+        let kv_heads_total = full_kv_heads + swa_kv_heads;
+        let n_head_kv_max = kv_heads_per_layer.iter().copied().max().unwrap_or(0) as u32;
 
         Ok(Self {
             max_context,
             n_layers,
             n_embd,
             n_head: head_stats.max,
-            n_head_kv: kv_stats.max,
-            kv_heads_total: kv_stats.total_over_layers(n_layers),
+            n_head_kv: n_head_kv_max,
             key_length,
+            key_length_swa,
+            full_kv_heads,
+            swa_kv_heads,
+            kv_heads_total,
+            sliding_window,
             file_size,
         })
     }
 
-    /// Per-head dimension used by KV-cache math. Prefers the explicit
-    /// `attention.key_length` metadata; falls back to `n_embd / n_head`;
-    /// then to 128 (the default for most modern transformer backbones).
+    /// Per-head dimension for full-context attention layers. Prefers
+    /// the explicit `attention.key_length`; falls back to `n_embd /
+    /// n_head`; then to 128 as a last resort.
     pub fn n_embd_head(&self) -> u64 {
         if self.key_length > 0 {
             self.key_length as u64
@@ -172,24 +182,142 @@ impl GgufInfo {
             128
         }
     }
+
+    /// Per-head dimension for sliding-window attention layers. Gemma
+    /// uses a smaller dim here (256 vs 512 for full) — if the GGUF
+    /// doesn't expose a separate value, we reuse the full-attention
+    /// key length.
+    pub fn n_embd_head_swa(&self) -> u64 {
+        if self.key_length_swa > 0 {
+            self.key_length_swa as u64
+        } else {
+            self.n_embd_head()
+        }
+    }
+
+    /// Bytes the KV cache will occupy at the given runtime `context`,
+    /// honouring sliding-window attention when present. K and V caches
+    /// are accounted for separately because `cache_type_k` and
+    /// `cache_type_v` can be configured independently.
+    ///
+    /// For a non-SWA model this collapses to:
+    /// ```text
+    /// context * kv_heads_total * n_embd_head * (k_bytes + v_bytes)
+    /// ```
+    ///
+    /// For a gemma-style SWA model, the window-bounded layers only
+    /// cache `min(context, sliding_window)` tokens, with a smaller
+    /// per-head dim — so the estimate drops from ~115 GiB to ~5 GiB
+    /// at 131 072 / q8.
+    pub fn kv_cache_bytes(&self, context: u32, kv_bytes: KvPerElement) -> u64 {
+        let ctx = context as u64;
+        let full_elements = ctx * self.full_kv_heads * self.n_embd_head();
+        let swa_elements = if self.sliding_window > 0 {
+            let eff = ctx.min(self.sliding_window as u64);
+            eff * self.swa_kv_heads * self.n_embd_head_swa()
+        } else {
+            0
+        };
+        let elements = full_elements + swa_elements;
+        elements * kv_bytes.k.0 / kv_bytes.k.1 + elements * kv_bytes.v.0 / kv_bytes.v.1
+    }
 }
 
-/// Scalar-or-array stats: whichever shape the GGUF field came in as,
-/// we record the representative (`max`) value and the real sum when
-/// the field was a per-layer array. For pure scalars `sum` is `None`
-/// and callers synthesize it as `max * n_layers`.
+fn read_optional_u32(map: &MetaMap, key: &str) -> Result<u32, EstimateError> {
+    match map.get_usize(key) {
+        Ok(v) => Ok(v as u32),
+        Err(GGufMetaError::NotExist) => Ok(0),
+        Err(GGufMetaError::TypeMismatch(_)) => Ok(0),
+        Err(e) => Err(meta_err(e)),
+    }
+}
+
+/// Read `head_count_kv` as a per-layer `Vec<u32>`. If the GGUF stores
+/// a scalar, broadcast it across `n_layers`. Missing key → empty vec.
+fn read_int_field_per_layer(
+    map: &MetaMap,
+    key: &str,
+    n_layers: u32,
+) -> Result<Vec<u32>, EstimateError> {
+    let (ty, bytes) = match map.get(key) {
+        Some(v) => v,
+        None => return Ok(Vec::new()),
+    };
+    if ty == Ty::Array {
+        let (values, _len) = read_int_array(bytes)?;
+        Ok(values.into_iter().map(|v| v.min(u32::MAX as u64) as u32).collect())
+    } else {
+        let scalar = map.get_usize(key).map_err(meta_err)? as u32;
+        Ok(vec![scalar; n_layers as usize])
+    }
+}
+
+/// Read a bool array. Missing / unsupported-typed fields yield an empty
+/// vec (caller treats this as "no SWA pattern").
+fn read_bool_array_field(map: &MetaMap, key: &str) -> Result<Vec<bool>, EstimateError> {
+    let (ty, bytes) = match map.get(key) {
+        Some(v) => v,
+        None => return Ok(Vec::new()),
+    };
+    if ty != Ty::Array {
+        return Ok(Vec::new());
+    }
+    let mut r = GGufReader::new(bytes);
+    let (elem_ty, len) = r.read_arr_header().map_err(read_err)?;
+    if elem_ty != Ty::Bool {
+        return Ok(Vec::new());
+    }
+    let arr = GGufMetaValueArray::<bool>::new(r, len);
+    Ok(arr.filter_map(Result::ok).collect())
+}
+
+/// Partition the per-layer KV-head counts into (full-context sum,
+/// sliding-window sum) using the layer pattern from the GGUF.
+///
+/// - If the model publishes no `sliding_window` size, every layer is
+///   full-context (swa sum is 0).
+/// - If the model has SWA but publishes no per-layer pattern,
+///   conservatively treat every layer as full-context — safer to
+///   overestimate than under-estimate VRAM.
+/// - If the pattern length doesn't match `n_layers`, same conservative
+///   fallback.
+///
+/// The pattern convention matches llama.cpp: `true` at index `i` means
+/// layer `i` uses sliding-window attention.
+fn split_kv_heads(
+    kv_per_layer: &[u32],
+    swa_pattern: &[bool],
+    sliding_window: u32,
+    n_layers: u32,
+) -> (u64, u64) {
+    let total: u64 = kv_per_layer.iter().map(|&v| v as u64).sum();
+    if sliding_window == 0 {
+        return (total, 0);
+    }
+    if swa_pattern.len() != n_layers as usize || kv_per_layer.len() != n_layers as usize {
+        // Without a reliable per-layer breakdown, overestimate rather
+        // than silently halve the KV cache — treat all layers as full.
+        return (total, 0);
+    }
+    let mut full = 0u64;
+    let mut swa = 0u64;
+    for (heads, is_swa) in kv_per_layer.iter().zip(swa_pattern.iter()) {
+        if *is_swa {
+            swa += *heads as u64;
+        } else {
+            full += *heads as u64;
+        }
+    }
+    (full, swa)
+}
+
+/// Representative stats for an integer-shaped metadata field. Only
+/// `max` is used these days — it's what the form UI displays. The
+/// per-layer sum is computed by `read_int_field_per_layer` where
+/// needed.
 #[derive(Debug, Clone, Copy)]
 struct IntFieldStats {
     max: u32,
-    sum: Option<u64>,
-}
-
-impl IntFieldStats {
-    /// The KV-math-correct total. If the field was a per-layer array,
-    /// use the sum directly; if a scalar, expand it across all layers.
-    fn total_over_layers(&self, n_layers: u32) -> u64 {
-        self.sum.unwrap_or_else(|| self.max as u64 * n_layers as u64)
-    }
 }
 
 /// Resolve `<general.architecture>.attention.<suffix>` into a full key.
@@ -199,24 +327,20 @@ fn attention_key(map: &MetaMap, suffix: &str) -> Result<String, EstimateError> {
 }
 
 /// Read an integer-shaped metadata field that may be a scalar (any int
-/// type) or an array of any int type. Missing key → zeros.
+/// type) or an array of any int type. Missing key → zero max.
 fn read_int_field(map: &MetaMap, key: &str) -> Result<IntFieldStats, EstimateError> {
     let (ty, bytes) = match map.get(key) {
         Some(v) => v,
-        None => return Ok(IntFieldStats { max: 0, sum: None }),
+        None => return Ok(IntFieldStats { max: 0 }),
     };
     if ty == Ty::Array {
         let (values, _len) = read_int_array(bytes)?;
         let max = values.iter().copied().max().unwrap_or(0);
-        let sum: u64 = values.iter().copied().sum();
-        // Clamp to u32 for the display field. Sums larger than u32::MAX
-        // would mean billions of KV heads — impossible in practice.
-        let max_u32 = max.min(u32::MAX as u64) as u32;
-        Ok(IntFieldStats { max: max_u32, sum: Some(sum) })
+        Ok(IntFieldStats { max: max.min(u32::MAX as u64) as u32 })
     } else {
         // Scalar: let ggus's get_usize handle sign extension / width.
         let v = map.get_usize(key).map_err(meta_err)?;
-        Ok(IntFieldStats { max: v as u32, sum: None })
+        Ok(IntFieldStats { max: v as u32 })
     }
 }
 
@@ -336,112 +460,232 @@ mod tests {
 
     // Canonical llama-7b-ish params used for arithmetic checks.
     const FILE_SIZE: u64 = 6_442_450_944; // ~6 GiB
-    const N_LAYERS: u64 = 32;
-    const N_EMBD_HEAD: u64 = 128; // 4096 / 32
-    const N_HEAD_KV: u64 = 32;
+
+    /// Build a uniform (non-SWA) GgufInfo: every layer full-context
+    /// with `n_head_kv` KV heads and head_dim = `key_length`.
+    fn uniform_info(n_layers: u32, n_head_kv: u32, key_length: u32, file_size: u64) -> GgufInfo {
+        GgufInfo {
+            max_context: 0,
+            n_layers,
+            n_embd: 0,
+            n_head: n_head_kv,
+            n_head_kv,
+            key_length,
+            key_length_swa: 0,
+            full_kv_heads: n_layers as u64 * n_head_kv as u64,
+            swa_kv_heads: 0,
+            kv_heads_total: n_layers as u64 * n_head_kv as u64,
+            sliding_window: 0,
+            file_size,
+        }
+    }
 
     #[test]
     fn kv_cache_scales_linearly_with_context() {
-        let kv_heads_total = N_LAYERS * N_HEAD_KV;
-        let a = VramEstimate::compute(FILE_SIZE, 4096, N_EMBD_HEAD, kv_heads_total, KvPerElement::FP16_BOTH);
-        let b = VramEstimate::compute(FILE_SIZE, 16384, N_EMBD_HEAD, kv_heads_total, KvPerElement::FP16_BOTH);
-        let ratio = b.kv_cache_vram as f64 / a.kv_cache_vram as f64;
+        let info = uniform_info(32, 32, 128, FILE_SIZE);
+        let a = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
+        let b = info.kv_cache_bytes(16384, KvPerElement::FP16_BOTH);
+        let ratio = b as f64 / a as f64;
         assert!((3.9..=4.1).contains(&ratio), "ratio={ratio}");
     }
 
     #[test]
     fn gqa_shrinks_kv_cache_proportionally() {
-        let mha = VramEstimate::compute(FILE_SIZE, 4096, N_EMBD_HEAD, N_LAYERS * 32, KvPerElement::FP16_BOTH);
-        let gqa = VramEstimate::compute(FILE_SIZE, 4096, N_EMBD_HEAD, N_LAYERS * 4, KvPerElement::FP16_BOTH);
-        let ratio = mha.kv_cache_vram as f64 / gqa.kv_cache_vram as f64;
+        let mha = uniform_info(32, 32, 128, 0).kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
+        let gqa = uniform_info(32, 4, 128, 0).kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
+        let ratio = mha as f64 / gqa as f64;
         assert!((7.9..=8.1).contains(&ratio), "ratio={ratio}");
     }
 
     #[test]
     fn zero_context_yields_no_kv_cache() {
-        let e = VramEstimate::compute(FILE_SIZE, 0, N_EMBD_HEAD, N_LAYERS * N_HEAD_KV, KvPerElement::FP16_BOTH);
-        assert_eq!(e.kv_cache_vram, 0);
+        let info = uniform_info(32, 32, 128, FILE_SIZE);
+        let kv = info.kv_cache_bytes(0, KvPerElement::FP16_BOTH);
+        assert_eq!(kv, 0);
+        let e = VramEstimate::compute(FILE_SIZE, kv);
         assert_eq!(e.total_vram, (FILE_SIZE * 11) / 10);
     }
 
     #[test]
     fn overhead_is_ten_percent() {
-        let e = VramEstimate::compute(FILE_SIZE, 4096, N_EMBD_HEAD, N_LAYERS * N_HEAD_KV, KvPerElement::FP16_BOTH);
-        let base = FILE_SIZE + e.kv_cache_vram;
-        assert_eq!(e.total_vram, base * 11 / 10);
+        let info = uniform_info(32, 32, 128, FILE_SIZE);
+        let kv = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
+        let e = VramEstimate::compute(FILE_SIZE, kv);
+        assert_eq!(e.total_vram, (FILE_SIZE + kv) * 11 / 10);
     }
 
     #[test]
     fn q8_kv_quantization_halves_kv_cache_vs_fp16() {
-        let fp16 = VramEstimate::compute(0, 4096, N_EMBD_HEAD, N_LAYERS * N_HEAD_KV, KvPerElement::FP16_BOTH);
-        let q8 = VramEstimate::compute(
-            0, 4096, N_EMBD_HEAD, N_LAYERS * N_HEAD_KV,
+        let info = uniform_info(32, 32, 128, 0);
+        let fp16 = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
+        let q8 = info.kv_cache_bytes(
+            4096,
             KvPerElement::from_types(CacheType::Q8_0, CacheType::Q8_0),
         );
-        assert_eq!(q8.kv_cache_vram * 2, fp16.kv_cache_vram);
+        assert_eq!(q8 * 2, fp16);
     }
 
     #[test]
     fn q4_kv_quantization_quarters_kv_cache_vs_fp16() {
-        let fp16 = VramEstimate::compute(0, 4096, N_EMBD_HEAD, N_LAYERS * N_HEAD_KV, KvPerElement::FP16_BOTH);
-        let q4 = VramEstimate::compute(
-            0, 4096, N_EMBD_HEAD, N_LAYERS * N_HEAD_KV,
+        let info = uniform_info(32, 32, 128, 0);
+        let fp16 = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
+        let q4 = info.kv_cache_bytes(
+            4096,
             KvPerElement::from_types(CacheType::Q4_0, CacheType::Q4_0),
         );
-        assert_eq!(q4.kv_cache_vram * 4, fp16.kv_cache_vram);
+        assert_eq!(q4 * 4, fp16);
     }
 
     #[test]
     fn mixed_kv_quantization_sums_k_and_v_independently() {
-        let mixed = VramEstimate::compute(
-            0, 4096, N_EMBD_HEAD, N_LAYERS * N_HEAD_KV,
+        let info = uniform_info(32, 32, 128, 0);
+        let mixed = info.kv_cache_bytes(
+            4096,
             KvPerElement::from_types(CacheType::Q4_0, CacheType::F16),
         );
-        // K at 0.5 bytes/elem + V at 2.0 bytes/elem = 2.5 bytes/elem,
-        // versus 4.0 for f16 both. Ratio 2.5/4 = 5/8.
-        let fp16 = VramEstimate::compute(
-            0, 4096, N_EMBD_HEAD, N_LAYERS * N_HEAD_KV,
-            KvPerElement::FP16_BOTH,
-        );
-        assert_eq!(mixed.kv_cache_vram * 8, fp16.kv_cache_vram * 5);
+        // K at 0.5 bytes/elem + V at 2.0 bytes/elem = 2.5 bytes/elem
+        // vs. 4.0 for f16 both → 5/8 ratio.
+        let fp16 = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
+        assert_eq!(mixed * 8, fp16 * 5);
     }
 
-    fn info_with(n_embd: u32, n_head: u32, n_head_kv: u32, key_length: u32) -> GgufInfo {
+    fn info_head_dim(n_embd: u32, n_head: u32, n_head_kv: u32, key_length: u32) -> GgufInfo {
         GgufInfo {
             max_context: 0, n_layers: 0, n_embd, n_head, n_head_kv,
-            key_length, kv_heads_total: 0, file_size: 0,
+            key_length, key_length_swa: 0,
+            full_kv_heads: 0, swa_kv_heads: 0, kv_heads_total: 0,
+            sliding_window: 0, file_size: 0,
         }
     }
 
     #[test]
     fn n_embd_head_prefers_key_length_when_present() {
         // 128 wins even though n_embd / n_head = 42.
-        assert_eq!(info_with(4096, 96, 8, 128).n_embd_head(), 128);
+        assert_eq!(info_head_dim(4096, 96, 8, 128).n_embd_head(), 128);
     }
 
     #[test]
     fn n_embd_head_falls_back_to_n_embd_over_n_head() {
-        assert_eq!(info_with(4096, 32, 8, 0).n_embd_head(), 128);
+        assert_eq!(info_head_dim(4096, 32, 8, 0).n_embd_head(), 128);
     }
 
     #[test]
     fn n_embd_head_defaults_to_128_when_head_count_unknown() {
-        assert_eq!(info_with(4096, 0, 0, 0).n_embd_head(), 128);
+        assert_eq!(info_head_dim(4096, 0, 0, 0).n_embd_head(), 128);
     }
 
     #[test]
-    fn int_field_stats_scalar_expands_across_layers() {
-        let stats = IntFieldStats { max: 8, sum: None };
-        assert_eq!(stats.total_over_layers(45), 8 * 45);
+    fn n_embd_head_swa_falls_back_to_full_head_dim_when_absent() {
+        let mut info = info_head_dim(4096, 32, 8, 128);
+        info.key_length_swa = 0;
+        assert_eq!(info.n_embd_head_swa(), 128);
     }
 
     #[test]
-    fn int_field_stats_array_uses_summed_total() {
-        // Hybrid model: 45 layers with n_head_kv = [8, 0, 8, 0, ...].
-        // Total = sum directly, NOT max * n_layers.
-        let stats = IntFieldStats { max: 8, sum: Some(8 * 23) };
-        // Even if the caller wrongly passes a layer count, sum wins.
-        assert_eq!(stats.total_over_layers(45), 8 * 23);
+    fn n_embd_head_swa_uses_its_own_key_length_when_set() {
+        let mut info = info_head_dim(4096, 32, 8, 512);
+        info.key_length_swa = 256;
+        assert_eq!(info.n_embd_head_swa(), 256);
+    }
+
+    // ---- Sliding-window / hybrid attention ----
+
+    /// A gemma-4-style info. 10 global layers with 4 KV heads each,
+    /// 50 sliding-window layers with 16 KV heads each. Global head_dim
+    /// 512, SWA head_dim 256, window 1024.
+    fn gemma_like_info() -> GgufInfo {
+        GgufInfo {
+            max_context: 262_144,
+            n_layers: 60,
+            n_embd: 5376,
+            n_head: 32,
+            n_head_kv: 16,
+            key_length: 512,
+            key_length_swa: 256,
+            full_kv_heads: 40,    // 10 layers × 4 heads
+            swa_kv_heads: 800,    // 50 layers × 16 heads
+            kv_heads_total: 840,
+            sliding_window: 1024,
+            file_size: 0,
+        }
+    }
+
+    #[test]
+    fn swa_layers_cap_at_sliding_window_size() {
+        // Run at a very large context. SWA contribution should NOT
+        // scale with context once context exceeds the window.
+        let info = gemma_like_info();
+        let small_ctx = info.kv_cache_bytes(1024, KvPerElement::FP16_BOTH);
+        let huge_ctx = info.kv_cache_bytes(262_144, KvPerElement::FP16_BOTH);
+
+        // At 1024 ctx: full = 1024*40*512*4 ; swa = 1024*800*256*4
+        // At 262144 ctx: full = 262144*40*512*4 ; swa = 1024*800*256*4
+        // (SWA unchanged.) So the delta is purely the full-context
+        // contribution, and the ratio of SWA bytes to full bytes at
+        // 262144 ctx is 256*800 / (40*512*262144/1024) which is way
+        // smaller than 1 — sanity-check it's < 10%.
+        let full_only = 4 * 262_144u64 * 40 * 512;
+        let total_elements = full_only + (4 * 1024 * 800 * 256);
+        assert_eq!(huge_ctx, total_elements);
+        assert!(small_ctx < huge_ctx);
+        // SWA contribution at small ctx is the same as at huge ctx.
+        let small_full = 4 * 1024u64 * 40 * 512;
+        let small_swa = 4 * 1024u64 * 800 * 256;
+        assert_eq!(small_ctx, small_full + small_swa);
+    }
+
+    #[test]
+    fn gemma_like_estimate_is_dominated_by_the_10_full_layers() {
+        // At 131072 ctx / q8 KV, gemma-4-31b should be nowhere near
+        // 100+ GiB of KV cache — that was the bug this path fixes.
+        let info = gemma_like_info();
+        let kv = info.kv_cache_bytes(
+            131_072,
+            KvPerElement::from_types(CacheType::Q8_0, CacheType::Q8_0),
+        );
+        let gib = kv as f64 / 1_073_741_824.0;
+        // Expected ~5.4 GiB; give a generous window.
+        assert!((4.0..=7.0).contains(&gib), "got {gib} GiB, expected ~5 GiB");
+    }
+
+    #[test]
+    fn non_swa_model_ignores_sliding_window_fields() {
+        // A plain full-attention model with sliding_window = 0.
+        // swa_kv_heads = 0, so no SWA contribution.
+        let info = uniform_info(32, 32, 128, 0);
+        let kv = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
+        // 32 layers * 32 heads * 128 dim * 4096 ctx * 4 bytes = reference.
+        let ref_bytes = 32u64 * 32 * 128 * 4096 * 4;
+        assert_eq!(kv, ref_bytes);
+    }
+
+    // ---- split_kv_heads ----
+
+    #[test]
+    fn split_kv_heads_no_sliding_window_folds_all_into_full() {
+        let (full, swa) = split_kv_heads(&[16, 16, 16], &[true, true, false], 0, 3);
+        assert_eq!(full, 48);
+        assert_eq!(swa, 0);
+    }
+
+    #[test]
+    fn split_kv_heads_zips_pattern_with_per_layer_counts() {
+        // Typical gemma shape: a few global layers sprinkled among
+        // many SWA ones, each with different KV-head counts.
+        let kv = vec![4, 16, 16, 16, 16, 16]; // 1 global + 5 SWA
+        let pat = vec![false, true, true, true, true, true];
+        let (full, swa) = split_kv_heads(&kv, &pat, 1024, 6);
+        assert_eq!(full, 4);
+        assert_eq!(swa, 16 * 5);
+    }
+
+    #[test]
+    fn split_kv_heads_falls_back_to_all_full_on_mismatched_lengths() {
+        // n_layers = 4 but we only got 3 entries — conservatively
+        // treat the whole model as full-context.
+        let (full, swa) = split_kv_heads(&[8, 8, 8], &[true, false, true], 1024, 4);
+        assert_eq!(full, 24);
+        assert_eq!(swa, 0);
     }
 
     // ---- Array reader: all supported integer element types ----

@@ -796,22 +796,32 @@ async function deleteModel(id, name) {
 
     function recompute(ctx) {
         if (!info) return;
-        // Prefer <arch>.attention.key_length (exact head dim, published
-        // by modern GGUFs). Fall back to n_embd / n_head, and finally to
-        // 128 when head count is unknown (Step-3.5's per-layer n_head
-        // array is an example).
-        const nEmbdHead = info.key_length > 0
+        // Full-context head dim. Prefer <arch>.attention.key_length
+        // (exact, published by modern GGUFs); fall back to n_embd /
+        // n_head; finally to 128 when head count is unknown.
+        const fullHeadDim = info.key_length > 0
             ? info.key_length
             : (info.n_head > 0 ? Math.floor(info.n_embd / info.n_head) : 128);
-        // `kv_heads_total` is already summed over layers (scalar *
-        // n_layers for uniform models, actual sum for per-layer arrays).
-        // For hybrid models like kimi-linear, linear-attention layers
-        // contribute 0 KV heads and are naturally excluded.
-        const kvHeads = info.kv_heads_total
-            || (info.n_layers * Math.max(info.n_head_kv || 0, 1));
+        // SWA head dim: some models (e.g. gemma-4: 256 vs 512 full)
+        // publish a distinct `key_length_swa`; otherwise reuse full.
+        const swaHeadDim = info.key_length_swa > 0 ? info.key_length_swa : fullHeadDim;
+
         const perK = cacheBytes('cache_type_k');
         const perV = cacheBytes('cache_type_v');
-        const kv = ctx * kvHeads * nEmbdHead * (perK + perV);
+
+        // Full-context layers cache every one of `ctx` tokens.
+        // Sliding-window layers cap at `sliding_window`. For gemma-4
+        // that turns the 131k-ctx run from ~110 GiB of KV into ~5 GiB.
+        const fullHeads = info.full_kv_heads != null ? info.full_kv_heads
+            : (info.kv_heads_total || info.n_layers * Math.max(info.n_head_kv || 0, 1));
+        const swaHeads = info.swa_kv_heads || 0;
+        const window = info.sliding_window || 0;
+
+        const fullKv = ctx * fullHeads * fullHeadDim * (perK + perV);
+        const swaKv = window > 0
+            ? Math.min(ctx, window) * swaHeads * swaHeadDim * (perK + perV)
+            : 0;
+        const kv = fullKv + swaKv;
         const total = Math.floor((info.file_size + kv) * 11 / 10);
         readout.textContent =
             `Weights ${gib(info.file_size)} GiB  +  KV ${gib(kv)} GiB  =  ${gib(total)} GiB total`;

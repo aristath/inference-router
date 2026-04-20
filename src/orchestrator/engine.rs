@@ -377,13 +377,8 @@ impl Orchestrator {
                 );
                 match GgufInfo::read(&model.model_path) {
                     Ok(info) => {
-                        let est = VramEstimate::compute(
-                            info.file_size,
-                            model.context,
-                            info.n_embd_head(),
-                            info.kv_heads_total,
-                            kv_bytes,
-                        );
+                        let kv = info.kv_cache_bytes(model.context, kv_bytes);
+                        let est = VramEstimate::compute(info.file_size, kv);
                         model.estimated_vram = est.total_vram;
                     }
                     Err(e) => warn!(model = id, error = %e, "gguf parse failed; loading without estimate"),
