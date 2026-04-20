@@ -82,10 +82,28 @@ impl GgufInfo {
         let max_context = map.llm_context_length().map_err(meta_err)? as u32;
         let n_layers = map.llm_block_count().map_err(meta_err)? as u32;
         let n_embd = map.llm_embedding_length().map_err(meta_err)? as u32;
-        let n_head = map.llm_attention_head_count().map_err(meta_err)? as u32;
-        let n_head_kv = map.llm_attention_head_count_kv().map_err(meta_err)? as u32;
+        // Some MoE / hybrid architectures (e.g. Step-3.5, which has 64
+        // heads on every 5th layer and 96 on the rest) store a per-layer
+        // u32 Array under `*.attention.head_count` instead of a single
+        // scalar. We don't use n_head for anything precise — just for the
+        // n_embd_head fallback in the KV cache formula — so on Array we
+        // yield 0, which triggers the n_embd_head = 128 default path in
+        // `VramEstimate::compute` and in the form's JS preview.
+        let n_head = tolerate_array(map.llm_attention_head_count())? as u32;
+        let n_head_kv = tolerate_array(map.llm_attention_head_count_kv())? as u32;
 
         Ok(Self { max_context, n_layers, n_embd, n_head, n_head_kv, file_size })
+    }
+}
+
+/// Returns the scalar value if the field parses as one; returns 0 if the
+/// field is actually an array (signalling "unknown, use default"); and
+/// propagates any other error unchanged.
+fn tolerate_array(res: Result<usize, GGufMetaError>) -> Result<usize, EstimateError> {
+    match res {
+        Ok(v) => Ok(v),
+        Err(GGufMetaError::TypeMismatch(Ty::Array)) => Ok(0),
+        Err(e) => Err(meta_err(e)),
     }
 }
 
@@ -187,5 +205,35 @@ mod tests {
         std::fs::write(tmp.path(), b"not a gguf file at all, just some bytes").unwrap();
         let err = VramEstimate::from_gguf(tmp.path(), 4096).unwrap_err();
         assert!(matches!(err, EstimateError::Gguf(_)));
+    }
+
+    #[test]
+    fn tolerate_array_passes_scalars_through() {
+        assert_eq!(tolerate_array(Ok(42)).unwrap(), 42);
+    }
+
+    #[test]
+    fn tolerate_array_collapses_array_to_zero() {
+        // Models with per-layer head counts (Step-3.5 is the motivating
+        // case) store `*.attention.head_count` as a u32 Array. Treat that
+        // as "unknown" by returning 0 — compute()'s n_embd_head fallback
+        // kicks in, and the form's JS preview already defaults to 128.
+        let err = Err(GGufMetaError::TypeMismatch(Ty::Array));
+        assert_eq!(tolerate_array(err).unwrap(), 0);
+    }
+
+    #[test]
+    fn tolerate_array_propagates_other_type_mismatches() {
+        // A String where we expected a number is a real problem.
+        let err = Err(GGufMetaError::TypeMismatch(Ty::String));
+        assert!(matches!(tolerate_array(err), Err(EstimateError::Gguf(_))));
+    }
+
+    #[test]
+    fn tolerate_array_propagates_missing_key() {
+        assert!(matches!(
+            tolerate_array(Err(GGufMetaError::NotExist)),
+            Err(EstimateError::Gguf(_)),
+        ));
     }
 }
