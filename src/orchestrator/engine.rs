@@ -366,8 +366,26 @@ impl Orchestrator {
             };
 
             if model.weights_format == WeightsFormat::Gguf {
-                match VramEstimate::from_gguf(&model.model_path, model.context) {
-                    Ok(est) => model.estimated_vram = est.total_vram,
+                // Honour the model's configured cache_type_{k,v} so the
+                // KV-cache portion of the estimate matches what the
+                // backend will actually allocate at run time.
+                use crate::config::CacheType;
+                use crate::vram::estimator::{GgufInfo, KvPerElement};
+                let kv_bytes = KvPerElement::from_types(
+                    model.cache_type_k.unwrap_or(CacheType::F16),
+                    model.cache_type_v.unwrap_or(CacheType::F16),
+                );
+                match GgufInfo::read(&model.model_path) {
+                    Ok(info) => {
+                        let est = VramEstimate::compute(
+                            info.file_size,
+                            model.context,
+                            info.n_embd_head(),
+                            info.kv_heads_total,
+                            kv_bytes,
+                        );
+                        model.estimated_vram = est.total_vram;
+                    }
                     Err(e) => warn!(model = id, error = %e, "gguf parse failed; loading without estimate"),
                 }
                 let mut data = self.data.lock().await;

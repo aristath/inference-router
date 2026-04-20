@@ -1,6 +1,6 @@
 use askama::Template;
 
-use crate::config::{ModelConfig, ModelState, WeightsFormat};
+use crate::config::{CacheType, ModelConfig, ModelState, WeightsFormat};
 use crate::system::stats::SystemStats;
 use crate::vram::tracker::GpuInfo;
 
@@ -155,44 +155,63 @@ fn gib_or_dash(bytes: u64) -> String {
 /// Compute on-disk weights size and estimated required VRAM (weights + KV
 /// cache at `m.context` + 10% overhead). Best-effort — returns `0` when the
 /// file is missing or the GGUF header is unreadable.
+///
+/// For GGUF models we go through `GgufInfo::read`, which sums sibling
+/// shards for multi-file models (`foo.gguf-00001-of-00005.gguf`) so the
+/// displayed size reflects the whole model rather than only the file
+/// the config points at.
 fn compute_sizes(m: &ModelConfig) -> (u64, u64) {
-    use crate::vram::estimator::VramEstimate;
+    use crate::vram::estimator::{GgufInfo, KvPerElement, VramEstimate};
 
-    let file_size = size_of_path(&m.model_path);
-
-    let required = match m.weights_format {
-        WeightsFormat::Gguf => VramEstimate::from_gguf(&m.model_path, m.context)
-            .map(|e| e.total_vram)
-            .unwrap_or(0),
-        // Estimating vLLM's memory without instantiating the model is too
-        // tangled for a quick server-side stat; leave blank.
-        WeightsFormat::Safetensors => 0,
-    };
-
-    (file_size, required)
+    match m.weights_format {
+        WeightsFormat::Gguf => match GgufInfo::read(&m.model_path) {
+            Ok(info) => {
+                // Honour the model's configured KV cache quantization so
+                // q8_0/q4_0 shrink the Required VRAM column, matching
+                // what llama-server actually allocates at run time.
+                // Unset falls back to f16, which is also llama.cpp's
+                // default.
+                let kv_bytes = KvPerElement::from_types(
+                    m.cache_type_k.unwrap_or(CacheType::F16),
+                    m.cache_type_v.unwrap_or(CacheType::F16),
+                );
+                let estimate = VramEstimate::compute(
+                    info.file_size,
+                    m.context,
+                    info.n_embd_head(),
+                    info.kv_heads_total,
+                    kv_bytes,
+                );
+                (info.file_size, estimate.total_vram)
+            }
+            // Header unreadable (missing file, non-GGUF, etc.) — show a
+            // dash (the gib_or_dash formatter handles 0).
+            Err(_) => (0, 0),
+        },
+        // Safetensors: sum the directory's regular files for size, and
+        // leave required VRAM blank — estimating vLLM's memory without
+        // instantiating the model is too tangled for a quick stat.
+        WeightsFormat::Safetensors => (safetensors_dir_size(&m.model_path), 0),
+    }
 }
 
-/// For a GGUF model: plain file stat.
-/// For a Safetensors directory: sum of contained regular files.
-fn size_of_path(path: &std::path::Path) -> u64 {
+/// Sum of regular files inside a safetensors model directory. Returns 0
+/// for missing or non-directory paths so the UI shows a dash.
+fn safetensors_dir_size(path: &std::path::Path) -> u64 {
     let Ok(meta) = std::fs::metadata(path) else { return 0 };
-    if meta.is_file() {
-        return meta.len();
+    if !meta.is_dir() {
+        return 0;
     }
-    if meta.is_dir() {
-        let mut total = 0u64;
-        if let Ok(rd) = std::fs::read_dir(path) {
-            for entry in rd.flatten() {
-                if let Ok(em) = entry.metadata() {
-                    if em.is_file() {
-                        total = total.saturating_add(em.len());
-                    }
-                }
+    let Ok(rd) = std::fs::read_dir(path) else { return 0 };
+    let mut total = 0u64;
+    for entry in rd.flatten() {
+        if let Ok(em) = entry.metadata() {
+            if em.is_file() {
+                total = total.saturating_add(em.len());
             }
         }
-        return total;
     }
-    0
+    total
 }
 
 #[derive(Template)]

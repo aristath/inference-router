@@ -107,6 +107,22 @@ impl CacheType {
             Self::Q4_0 => "q4_0",
         }
     }
+
+    /// Bytes held per KV-cache element (per head × per token × per K or
+    /// V separately), expressed as a rational `(numerator, denominator)`
+    /// pair so q4 — which really is half a byte — stays in integer
+    /// arithmetic downstream.
+    ///
+    /// - `f16` → `(2, 1)` = 2 bytes per element
+    /// - `q8_0` → `(1, 1)` = 1 byte per element
+    /// - `q4_0` → `(1, 2)` = half a byte per element
+    pub fn bytes_per_element(&self) -> (u64, u64) {
+        match self {
+            Self::F16 => (2, 1),
+            Self::Q8_0 => (1, 1),
+            Self::Q4_0 => (1, 2),
+        }
+    }
 }
 
 /// Self-contained per-model configuration. No external framework entity.
