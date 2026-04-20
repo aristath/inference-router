@@ -60,7 +60,7 @@ pub async fn proxy_handler(
     };
 
     // Auto-load on miss. Concurrent calls for the same model coalesce.
-    let port = match state.ensure_loaded(&model_id).await {
+    let port = match state.clone().ensure_loaded(&model_id).await {
         Ok(p) => p,
         Err(e) => {
             warn!(model = model_id, error = %e, "ensure_loaded failed");

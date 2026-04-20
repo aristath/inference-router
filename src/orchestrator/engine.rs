@@ -249,8 +249,15 @@ impl Orchestrator {
 
     /// Ensures a model is `Running` and returns its port. Concurrent callers
     /// for the same model coalesce — first one does the work, the rest wait.
-    pub async fn ensure_loaded(&self, id: &str) -> Result<u16, LoadError> {
-        // Per-model serialization. Grab (or create) the guard, then lock it.
+    ///
+    /// The load is driven by a detached `tokio::spawn`, so if the caller's
+    /// HTTP handler future is cancelled (client disconnect, browser tab
+    /// reload, proxy timeout), the state transition to `Running` or
+    /// `Error` still happens in the background. Without this, a cancelled
+    /// caller would leave the model stuck in `Loading` forever.
+    pub async fn ensure_loaded(self: Arc<Self>, id: &str) -> Result<u16, LoadError> {
+        // Per-model serialization. The guard is acquired *inside* the
+        // spawned task so task cancellation can't leak the lock.
         let guard = {
             let mut guards = self.load_guards.lock().await;
             guards
@@ -258,35 +265,65 @@ impl Orchestrator {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _lock = guard.lock().await;
 
-        // Fast path: already running.
-        {
-            let data = self.data.lock().await;
-            let m = data.models.get(id).ok_or_else(|| LoadError::ModelNotFound(id.into()))?;
-            if m.state == ModelState::Running {
-                return Ok(m.port);
+        let id_owned = id.to_string();
+        let me = self.clone();
+        let handle = tokio::spawn(async move {
+            let _lock = guard.lock().await;
+
+            // Fast path: already running.
+            {
+                let data = me.data.lock().await;
+                let m = data
+                    .models
+                    .get(&id_owned)
+                    .ok_or_else(|| LoadError::ModelNotFound(id_owned.clone()))?;
+                if m.state == ModelState::Running {
+                    return Ok(m.port);
+                }
             }
-        }
 
-        // Claim the spawn.
-        {
-            let mut data = self.data.lock().await;
-            if let Some(m) = data.models.get_mut(id) {
-                m.state = ModelState::Loading;
+            // Claim the spawn.
+            {
+                let mut data = me.data.lock().await;
+                if let Some(m) = data.models.get_mut(&id_owned) {
+                    m.state = ModelState::Loading;
+                }
             }
-        }
 
-        match self.do_load(id).await {
-            Ok(port) => Ok(port),
-            Err(e) => {
-                let mut data = self.data.lock().await;
-                if let Some(m) = data.models.get_mut(id) {
-                    m.state = ModelState::Error(e.to_string());
-                    m.pid = None;
+            match me.do_load(&id_owned).await {
+                Ok(port) => Ok(port),
+                Err(e) => {
+                    let mut data = me.data.lock().await;
+                    if let Some(m) = data.models.get_mut(&id_owned) {
+                        m.state = ModelState::Error(e.to_string());
+                        m.pid = None;
+                    }
+                    me.dirty.store(true, Ordering::Relaxed);
+                    Err(e)
+                }
+            }
+        });
+
+        match handle.await {
+            Ok(result) => result,
+            Err(join_err) => {
+                // The detached task panicked. Very unlikely, but clean up
+                // so the model doesn't sit in Loading forever.
+                let msg = format!("load task panicked: {join_err}");
+                {
+                    let mut data = self.data.lock().await;
+                    if let Some(m) = data.models.get_mut(id) {
+                        m.state = ModelState::Error(msg.clone());
+                        m.pid = None;
+                    }
                 }
                 self.dirty.store(true, Ordering::Relaxed);
-                Err(e)
+                Err(LoadError::SpawnFailed(
+                    crate::process::manager::SpawnError::HealthCheckFailed(
+                        crate::process::manager::HealthCheckError::ChildExited(None, msg),
+                    ),
+                ))
             }
         }
     }
@@ -657,6 +694,41 @@ mod tests {
         o.remove_model("a").await.unwrap();
         assert!(!o.load_guards.lock().await.contains_key("a"),
             "load_guards must drop entries for removed models so the map doesn't grow forever");
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_state_transition_survives_caller_cancellation() {
+        // Regression: when the HTTP handler's future is cancelled
+        // mid-load (client disconnect, tab reload, etc.), the model
+        // must still transition out of `Loading` — either to `Running`
+        // or to `Error` — so users don't see a forever-loading row.
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("a", 9001)).await.unwrap();
+
+        // Start the load in a spawned task we can abort below.
+        // /bin/true exits immediately, so `wait_for_health_or_exit`
+        // observes ChildExited and the detached task sets Error.
+        let ensure = {
+            let o = o.clone();
+            tokio::spawn(async move { o.ensure_loaded("a").await })
+        };
+        // Give the task a moment to hit `tokio::spawn(...)` inside
+        // ensure_loaded, then simulate the caller going away.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        ensure.abort();
+
+        // Wait up to ~3s for the detached load task to finish and
+        // write the final state.
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let state = o.get_model("a").await.unwrap().state;
+            if matches!(state, ModelState::Error(_)) || state == ModelState::Idle {
+                return;
+            }
+        }
+        let final_state = o.get_model("a").await.unwrap().state;
+        panic!("state never left Loading after caller cancellation: {final_state:?}");
     }
 
     #[tokio::test]
