@@ -22,6 +22,10 @@ struct RunningChild {
 #[derive(Default)]
 pub struct ProcessManager {
     running: HashMap<i32, RunningChild>,
+    /// model_id → port, populated on `register`, cleared on `stop`/`forget`.
+    /// The only in-memory source of truth for which port a live process
+    /// is listening on — ModelConfig no longer carries a port field.
+    running_ports: HashMap<String, u16>,
 }
 
 /// A freshly spawned but not-yet-healthy child. Returned by `spawn_child`
@@ -53,11 +57,12 @@ impl ProcessManager {
         model: &ModelConfig,
         draft: Option<&ModelConfig>,
     ) -> Result<PendingChild, SpawnError> {
-        let args = build_command_args(model, draft);
+        let port = find_free_port().ok_or(SpawnError::NoFreePort)?;
+        let args = build_command_args(model, draft, port);
 
         info!(
             model = model.id,
-            port = model.port,
+            port,
             binary = ?model.binary,
             ?args,
             "spawning inference server",
@@ -95,12 +100,13 @@ impl ProcessManager {
             let _ = kv_tx.send(total_kv_bytes);
         });
 
-        Ok(PendingChild { pid, port: model.port, model_id: model.id.clone(), child, kv_bytes_rx: kv_rx })
+        Ok(PendingChild { pid, port, model_id: model.id.clone(), child, kv_bytes_rx: kv_rx })
     }
 
     /// Install a healthy child into the running table so its `kill_on_drop`
     /// survives until explicit `stop`/`forget` or orchestrator shutdown.
     pub fn register(&mut self, pending: PendingChild) {
+        self.running_ports.insert(pending.model_id.clone(), pending.port);
         self.running.insert(
             pending.pid,
             RunningChild {
@@ -109,6 +115,18 @@ impl ProcessManager {
                 child: pending.child,
             },
         );
+    }
+
+    /// Returns the port the live process for `model_id` is listening on,
+    /// or `None` if the model is not currently running.
+    pub fn port_for_model(&self, model_id: &str) -> Option<u16> {
+        self.running_ports.get(model_id).copied()
+    }
+
+    /// Directly records a port for a model without spawning a process.
+    /// Used in integration tests to synthesize a Running model.
+    pub fn register_port(&mut self, model_id: &str, port: u16) {
+        self.running_ports.insert(model_id.into(), port);
     }
 
     /// SIGTERM, wait briefly, SIGKILL if still alive, then drop our Child
@@ -128,6 +146,7 @@ impl ProcessManager {
             let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGKILL);
         }
 
+        self.running_ports.remove(&rc.model_id);
         info!(pid, port = rc.port, model = rc.model_id, "inference server stopped");
         // rc.child drops here; kill_on_drop is a no-op on an already-
         // terminated process but the drop drives tokio's reaper.
@@ -141,7 +160,9 @@ impl ProcessManager {
     /// when delete fails to stop cleanly). Dropping the `RunningChild` lets
     /// tokio reap it and fires `kill_on_drop` as a safety net.
     pub fn forget(&mut self, pid: i32) {
-        self.running.remove(&pid);
+        if let Some(rc) = self.running.remove(&pid) {
+            self.running_ports.remove(&rc.model_id);
+        }
     }
 }
 
@@ -178,7 +199,7 @@ impl PendingChild {
 /// no spec-decode flags are emitted — even if the target has them set —
 /// so the argv stays runnable in test code without needing a draft
 /// lookup.
-pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>) -> Vec<String> {
+pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port: u16) -> Vec<String> {
     let mut args = Vec::new();
     match model.weights_format {
         WeightsFormat::Gguf => {
@@ -187,7 +208,7 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>) -> V
             args.push("-c".into());
             args.push(model.context.to_string());
             args.push("--port".into());
-            args.push(model.port.to_string());
+            args.push(port.to_string());
             args.push("--temp".into());
             args.push(model.temperature.to_string());
             args.push("--top-p".into());
@@ -329,7 +350,7 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>) -> V
             args.push("--model".into());
             args.push(model.model_path.to_string_lossy().into_owned());
             args.push("--port".into());
-            args.push(model.port.to_string());
+            args.push(port.to_string());
             args.push("--max-model-len".into());
             args.push(model.context.to_string());
         }
@@ -385,6 +406,17 @@ async fn wait_for_health_or_exit(
     }
 }
 
+/// Binds to `127.0.0.1:0` and lets the OS assign a free ephemeral port.
+/// The listener is dropped immediately; there is a brief window where
+/// another process could grab the same port, but in practice this is
+/// fine for localhost-only inference servers.
+fn find_free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+}
+
 /// Parses the MiB value from llama.cpp's KV/RS cache summary log lines:
 ///
 ///   `llama_kv_cache_init: size = 1234.56 MiB ( 32768 cells, 64 layers, …)`
@@ -415,6 +447,9 @@ pub enum SpawnError {
 
     #[error("health check failed: {}", .0)]
     HealthCheckFailed(HealthCheckError),
+
+    #[error("no free port available on 127.0.0.1")]
+    NoFreePort,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -487,14 +522,13 @@ mod tests {
             name: "M".into(),
             binary: PathBuf::from("/usr/local/bin/llama-server"),
             model_path: PathBuf::from("/models/m.gguf"),
-            port: 9001,
             ..ModelConfig::default()
         }
     }
 
     #[test]
     fn gguf_argv_shape() {
-        let args = build_command_args(&gguf_model(), None);
+        let args = build_command_args(&gguf_model(), None, 9001);
         assert_eq!(
             args,
             vec![
@@ -515,13 +549,13 @@ mod tests {
     fn gguf_argv_includes_min_p_when_positive() {
         let mut m = gguf_model();
         m.min_p = 0.05;
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         assert!(args.windows(2).any(|w| w == ["--min-p", "0.05"]));
     }
 
     #[test]
     fn gguf_argv_omits_min_p_when_zero() {
-        let args = build_command_args(&gguf_model(), None);
+        let args = build_command_args(&gguf_model(), None, 9001);
         assert!(!args.iter().any(|a| a == "--min-p"));
     }
 
@@ -530,7 +564,7 @@ mod tests {
         let mut m = gguf_model();
         m.weights_format = WeightsFormat::Safetensors;
         m.model_path = PathBuf::from("/models/m-safetensors");
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         assert_eq!(
             args,
             vec![
@@ -545,7 +579,7 @@ mod tests {
     fn extra_args_appended_last_for_gguf() {
         let mut m = gguf_model();
         m.extra_args = vec!["--flash-attn".into(), "-ngl".into(), "99".into()];
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         assert_eq!(
             &args[args.len() - 3..],
             &["--flash-attn", "-ngl", "99"],
@@ -562,7 +596,7 @@ mod tests {
         m.parallel_slots = Some(4);
         m.cache_type_k = Some(CacheType::Q8_0);
         m.cache_type_v = Some(CacheType::Q8_0);
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         let joined = args.join(" ");
         assert!(joined.contains("--flash-attn on"), "{joined}");
         assert!(joined.contains("-ngl 99"), "{joined}");
@@ -575,7 +609,7 @@ mod tests {
 
     #[test]
     fn gguf_argv_emits_flash_attn_off_when_disabled() {
-        let args = build_command_args(&gguf_model(), None);
+        let args = build_command_args(&gguf_model(), None, 9001);
         // --flash-attn is always emitted as `off` by default — it used to be
         // a bare flag; modern llama-server requires a value.
         assert_eq!(
@@ -586,7 +620,7 @@ mod tests {
 
     #[test]
     fn gguf_argv_omits_other_structured_flags_when_unset() {
-        let args = build_command_args(&gguf_model(), None);
+        let args = build_command_args(&gguf_model(), None, 9001);
         let joined = args.join(" ");
         assert!(!joined.contains("-ngl"));
         assert!(!joined.contains("--mlock"));
@@ -604,7 +638,7 @@ mod tests {
         let mut m = gguf_model();
         m.presence_penalty = 1.5;
         m.repeat_penalty = 1.1;
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         let joined = args.join(" ");
         assert!(joined.contains("--presence-penalty 1.5"), "{joined}");
         assert!(joined.contains("--repeat-penalty 1.1"), "{joined}");
@@ -618,7 +652,7 @@ mod tests {
         m.reasoning_format = Some(ReasoningFormat::Deepseek);
         m.reasoning_budget = Some(0);
         m.chat_template_kwargs = Some(r#"{"enable_thinking":false}"#.into());
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         let joined = args.join(" ");
         assert!(joined.contains("--threads 16"), "{joined}");
         assert!(joined.contains("--cache-ram 0"), "{joined}");
@@ -629,7 +663,7 @@ mod tests {
 
     #[test]
     fn gguf_argv_omits_new_flags_when_unset() {
-        let args = build_command_args(&gguf_model(), None);
+        let args = build_command_args(&gguf_model(), None, 9001);
         let joined = args.join(" ");
         assert!(!joined.contains("--threads"));
         assert!(!joined.contains("--cache-ram"));
@@ -642,7 +676,7 @@ mod tests {
     fn gguf_argv_reasoning_format_kebab_for_deepseek_legacy() {
         let mut m = gguf_model();
         m.reasoning_format = Some(ReasoningFormat::DeepseekLegacy);
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         let joined = args.join(" ");
         assert!(joined.contains("--reasoning-format deepseek-legacy"), "{joined}");
     }
@@ -653,7 +687,7 @@ mod tests {
         m.split_mode = Some(SplitMode::Row);
         m.main_gpu = Some(2);
         m.tensor_split = Some("0.5,0.5,0".into());
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         let j = args.join(" ");
         assert!(j.contains("--split-mode row"), "{j}");
         assert!(j.contains("--main-gpu 2"), "{j}");
@@ -665,7 +699,7 @@ mod tests {
         let mut m = gguf_model();
         m.n_gpu_layers = Some(50);
         m.extra_args = vec!["-ngl".into(), "99".into()];
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         // Both present, extra_args version is last → wins on llama.cpp.
         let idx_first = args.iter().position(|a| a == "-ngl").unwrap();
         let idx_last = args.iter().rposition(|a| a == "-ngl").unwrap();
@@ -679,7 +713,7 @@ mod tests {
         let mut m = gguf_model();
         m.weights_format = WeightsFormat::Safetensors;
         m.extra_args = vec!["--tensor-parallel-size".into(), "2".into()];
-        let args = build_command_args(&m, None);
+        let args = build_command_args(&m, None, 9001);
         assert_eq!(
             &args[args.len() - 2..],
             &["--tensor-parallel-size", "2"],
@@ -720,7 +754,7 @@ mod tests {
         t.ctx_checkpoints = Some(4);
         t.checkpoint_every_n_tokens = Some(-1);
         let d = draft_model();
-        let args = build_command_args(&t, Some(&d));
+        let args = build_command_args(&t, Some(&d), 9001);
 
         assert_eq!(find_flag(&args, "-md"), Some("/models/draft.gguf"));
         assert_eq!(find_flag(&args, "-ngld"), Some("99"));
@@ -746,7 +780,7 @@ mod tests {
         t.draft_model_id = Some("missing".into());
         t.draft_max = Some(16);
         t.ctx_checkpoints = Some(4);
-        let args = build_command_args(&t, None);
+        let args = build_command_args(&t, None, 9001);
         let joined = args.join(" ");
         assert!(!joined.contains("-md"), "{joined}");
         assert!(!joined.contains("--draft-max"), "{joined}");
@@ -761,7 +795,7 @@ mod tests {
         let mut t = gguf_model();
         t.draft_model_id = Some("draft".into());
         t.draft_max = Some(8);
-        let args = build_command_args(&t, Some(&draft_model()));
+        let args = build_command_args(&t, Some(&draft_model()), 9001);
         assert_eq!(find_flag(&args, "--draft-max"), Some("8"));
         let joined = args.join(" ");
         assert!(!joined.contains("--draft-min"), "{joined}");
@@ -777,7 +811,7 @@ mod tests {
         // target's ctx makes draft KV explode at large target ctx.
         let mut t = gguf_model();
         t.draft_model_id = Some("draft".into());
-        let args = build_command_args(&t, Some(&draft_model()));
+        let args = build_command_args(&t, Some(&draft_model()), 9001);
         assert_eq!(find_flag(&args, "-cd"), Some("16384"));
     }
 
@@ -790,7 +824,7 @@ mod tests {
         d.device = None;
         let mut t = gguf_model();
         t.draft_model_id = Some("draft".into());
-        let args = build_command_args(&t, Some(&d));
+        let args = build_command_args(&t, Some(&d), 9001);
         let joined = args.join(" ");
         assert!(!joined.contains("-devd"), "{joined}");
     }

@@ -92,7 +92,6 @@ mod tests {
             name: id.into(),
             binary: PathBuf::from("/b"),
             model_path: PathBuf::from("/m"),
-            port: 9000,
             state: ModelState::Running,
             pid: Some(1),
             estimated_vram: vram,

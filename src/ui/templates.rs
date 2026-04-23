@@ -102,7 +102,6 @@ pub struct ModelDisplay {
     pub id: String,
     pub name: String,
     pub format_str: String,
-    pub port: u16,
     pub context: u32,
     /// Raw bytes for client-side numeric sort (via `data-sort` attribute).
     pub file_size_bytes: u64,
@@ -132,7 +131,6 @@ impl ModelDisplay {
             id: m.id.clone(),
             name: m.name.clone(),
             format_str,
-            port: m.port,
             context: m.context,
             file_size_bytes,
             file_size_gib_str: gib_or_dash(file_size_bytes),

@@ -102,7 +102,6 @@
                     <tr>
                         <th class="sortable" data-col="name"    data-type="text">Name</th>
                         <th class="sortable" data-col="format"  data-type="text">Format</th>
-                        <th class="sortable" data-col="port"    data-type="num">Port</th>
                         <th class="sortable" data-col="context" data-type="num">Context</th>
                         <th class="sortable" data-col="size"    data-type="num">Size (GB)</th>
                         <th class="sortable" data-col="reqvram" data-type="num">Required VRAM</th>
@@ -115,7 +114,6 @@
                     <tr id="model-row-{{ model.id }}" data-name="{{ model.name }}">
                         <td data-sort="{{ model.name }}">{{ model.name }}</td>
                         <td data-sort="{{ model.format_str }}">{{ model.format_str }}</td>
-                        <td data-sort="{{ model.port }}">{{ model.port }}</td>
                         <td data-sort="{{ model.context }}">{{ model.context }}</td>
                         <td data-sort="{{ model.file_size_bytes }}">{{ model.file_size_gib_str }} GiB</td>
                         <td data-sort="{{ model.required_vram_bytes }}">{{ model.required_vram_gib_str }} GiB</td>
@@ -216,12 +214,6 @@
                     <label for="model_path">Model path</label>
                     <input type="text" id="model_path" name="model_path" data-path-field required placeholder="/models/qwen3-30b.gguf">
                     <small class="field-help">For GGUF, the absolute path to the <code>.gguf</code> file. For Safetensors, the directory that contains the model files.</small>
-                </div>
-
-                <div class="form-group" id="group-port">
-                    <label for="port">Port</label>
-                    <input type="number" id="port" name="port" min="1" max="65535" required style="max-width: 12rem;">
-                    <small class="field-help">Local port the inference server will listen on. Each loaded model needs its own; the proxy routes incoming OpenAI requests to the right port. Pick something free in 9000–9999 if unsure.</small>
                 </div>
 
                 <div class="form-group" id="group-device">
@@ -591,7 +583,7 @@ const MODEL_DEFAULTS = {
     role: 'target',
     weights_format: 'gguf',
     binary: '', model_path: '',
-    port: 9001, context: 4096,
+    context: 4096,
     temperature: 0.6, top_p: 0.95, top_k: 40, min_p: 0.0,
     presence_penalty: 0.0, repeat_penalty: 1.0,
     flash_attn: false, n_gpu_layers: null, mlock: false, no_mmap: false,
@@ -609,9 +601,8 @@ const MODEL_DEFAULTS = {
 
 // Field IDs that are target-only. Drafts hide these because they're
 // either nonsensical (sampling — the target samples, not the draft) or
-// inactive (no port, no standalone binary, no split-mode).
+// inactive (no standalone binary, no split-mode).
 const TARGET_ONLY_FIELD_IDS = [
-    'group-port',
     'spec-decode-section',
 ];
 // Draft-only field groups (hidden when role=target).
@@ -766,7 +757,6 @@ function populateModelForm(m, mode) {
     f.binary.value = m.binary || '';
     applyPresetSelection();
     f.model_path.value = m.model_path || '';
-    f.port.value = m.port ?? 9001;
     f.context.value = m.context ?? 4096;
 
     // sampling
@@ -1285,9 +1275,6 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         binary_preset: presetChoice === '__custom__' ? null : presetChoice,
         binary: presetChoice === '__custom__' ? f.binary.value.trim() : '',
         model_path: f.model_path.value.trim(),
-        // Drafts don't bind a port. Send 0 so the server-side validator
-        // sees a harmless value (targets still require a real port).
-        port: role === 'draft' ? 0 : parseInt(f.port.value, 10),
         context: parseInt(f.context.value, 10),
         temperature: parseFloat(f.temperature.value),
         top_p: parseFloat(f.top_p.value),

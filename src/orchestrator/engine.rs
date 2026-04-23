@@ -180,17 +180,6 @@ impl Orchestrator {
         if data.models.contains_key(&model.id) {
             return Err(MutationError::Conflict(model.id));
         }
-        // Ports collide only between targets that actually bind one.
-        // Drafts never bind a port, so exclude them from the check.
-        if model.role == ModelRole::Target {
-            if let Some(other) = data
-                .models
-                .values()
-                .find(|m| m.role == ModelRole::Target && m.port == model.port)
-            {
-                return Err(MutationError::PortConflict(model.port, other.id.clone()));
-            }
-        }
         if let Some(ref did) = model.draft_model_id {
             validate_draft_reference(&data.models, &model.id, did)?;
         }
@@ -202,13 +191,6 @@ impl Orchestrator {
     pub async fn update_model(&self, new: ModelConfig) -> Result<(), MutationError> {
         new.validate_for_role().map_err(MutationError::from)?;
         let mut data = self.data.lock().await;
-        if new.role == ModelRole::Target {
-            if let Some(other) = data.models.values().find(|m| {
-                m.role == ModelRole::Target && m.port == new.port && m.id != new.id
-            }) {
-                return Err(MutationError::PortConflict(new.port, other.id.clone()));
-            }
-        }
         if let Some(ref did) = new.draft_model_id {
             validate_draft_reference(&data.models, &new.id, did)?;
         }
@@ -311,7 +293,8 @@ impl Orchestrator {
         let handle = tokio::spawn(async move {
             let _lock = guard.lock().await;
 
-            // Fast path: already running.
+            // Fast path: already running — read port from ProcessManager,
+            // not ModelConfig (port is now purely a runtime property).
             {
                 let data = me.data.lock().await;
                 let m = data
@@ -319,7 +302,11 @@ impl Orchestrator {
                     .get(&id_owned)
                     .ok_or_else(|| LoadError::ModelNotFound(id_owned.clone()))?;
                 if m.state == ModelState::Running {
-                    return Ok(m.port);
+                    if let Some(port) = me.process_manager.lock().await.port_for_model(&id_owned) {
+                        return Ok(port);
+                    }
+                    // Running state with no tracked port means the process
+                    // died between reconcile ticks — fall through to reload.
                 }
             }
 
@@ -705,9 +692,6 @@ pub enum MutationError {
     #[error("model '{0}' already exists")]
     Conflict(String),
 
-    #[error("port {0} is already in use by model '{1}'")]
-    PortConflict(u16, String),
-
     #[error("invalid config: {0}")]
     InvalidConfig(#[from] ConfigError),
 
@@ -757,13 +741,12 @@ mod tests {
         Arc::new(Orchestrator::new(store, presets, 8080))
     }
 
-    fn model(id: &str, port: u16) -> ModelConfig {
+    fn model(id: &str) -> ModelConfig {
         ModelConfig {
             id: id.into(),
             name: id.into(),
             binary: PathBuf::from("/bin/true"),
             model_path: PathBuf::from("/tmp/m.gguf"),
-            port,
             ..ModelConfig::default()
         }
     }
@@ -772,7 +755,7 @@ mod tests {
     async fn add_list_remove_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(model("a", 9001)).await.unwrap();
+        o.add_model(model("a")).await.unwrap();
         assert_eq!(o.list_models().await.len(), 1);
         o.remove_model("a").await.unwrap();
         assert_eq!(o.list_models().await.len(), 0);
@@ -782,56 +765,16 @@ mod tests {
     async fn add_model_duplicate_id_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(model("a", 9001)).await.unwrap();
-        let err = o.add_model(model("a", 9002)).await.unwrap_err();
+        o.add_model(model("a")).await.unwrap();
+        let err = o.add_model(model("a")).await.unwrap_err();
         assert!(matches!(err, MutationError::Conflict(_)));
-    }
-
-    #[tokio::test]
-    async fn add_model_duplicate_port_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("a", 9001)).await.unwrap();
-        let err = o.add_model(model("b", 9001)).await.unwrap_err();
-        match err {
-            MutationError::PortConflict(port, holder) => {
-                assert_eq!(port, 9001);
-                assert_eq!(holder, "a");
-            }
-            other => panic!("expected PortConflict, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn update_model_rejects_colliding_port_from_another_model() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("a", 9001)).await.unwrap();
-        o.add_model(model("b", 9002)).await.unwrap();
-        // Try to point `b` at `a`'s port.
-        let mut b_on_a_port = model("b", 9001);
-        b_on_a_port.name = "b-renamed".into();
-        let err = o.update_model(b_on_a_port).await.unwrap_err();
-        assert!(matches!(err, MutationError::PortConflict(9001, ref h) if h == "a"));
-    }
-
-    #[tokio::test]
-    async fn update_model_allows_reusing_its_own_port() {
-        // Self-port isn't a collision — `update` may touch any field while
-        // leaving the port alone.
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("a", 9001)).await.unwrap();
-        let mut a = model("a", 9001);
-        a.name = "renamed".into();
-        assert!(o.update_model(a).await.is_ok());
     }
 
     #[tokio::test]
     async fn mark_used_updates_last_used_and_marks_dirty() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(model("a", 9001)).await.unwrap();
+        o.add_model(model("a")).await.unwrap();
         // last_used starts as None.
         assert!(o.get_model("a").await.unwrap().last_used.is_none());
 
@@ -854,7 +797,7 @@ mod tests {
     async fn remove_model_clears_per_model_load_guard() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(model("a", 9001)).await.unwrap();
+        o.add_model(model("a")).await.unwrap();
 
         // Prime the load-guard entry (ensure_loaded would insert one).
         o.load_guards.lock().await
@@ -875,7 +818,7 @@ mod tests {
         // or to `Error` — so users don't see a forever-loading row.
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(model("a", 9001)).await.unwrap();
+        o.add_model(model("a")).await.unwrap();
 
         // Start the load in a spawned task we can abort below.
         // /bin/true exits immediately, so `wait_for_health_or_exit`
@@ -906,9 +849,9 @@ mod tests {
     async fn list_models_returns_sorted_by_id() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(model("charlie", 9001)).await.unwrap();
-        o.add_model(model("alpha", 9002)).await.unwrap();
-        o.add_model(model("bravo", 9003)).await.unwrap();
+        o.add_model(model("charlie")).await.unwrap();
+        o.add_model(model("alpha")).await.unwrap();
+        o.add_model(model("bravo")).await.unwrap();
         let ids: Vec<String> = o.list_models().await.into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["alpha", "bravo", "charlie"]);
     }
@@ -917,7 +860,7 @@ mod tests {
     async fn update_model_clears_estimate_when_path_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        let mut m = model("a", 9001);
+        let mut m = model("a");
         m.estimated_vram = 7_000_000_000;
         o.add_model(m.clone()).await.unwrap();
         // set vram directly to simulate a load
@@ -938,7 +881,7 @@ mod tests {
         // alive across restarts).
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("models.json");
-        let mut m = model("a", 9001);
+        let mut m = model("a");
         m.state = ModelState::Running;
         m.pid = Some(12345);
         std::fs::write(&path, serde_json::to_string(&vec![m]).unwrap()).unwrap();
@@ -955,7 +898,7 @@ mod tests {
     async fn reconcile_marks_dead_process_as_error() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        let mut m = model("a", 9001);
+        let mut m = model("a");
         m.state = ModelState::Running;
         m.pid = Some(1); // pid 1 (init) exists but we haven't registered it in ProcessManager
         o.add_model(m).await.unwrap();
@@ -993,7 +936,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
         o.add_model(draft("d")).await.unwrap();
-        let mut t = model("t", 9001);
+        let mut t = model("t");
         t.draft_model_id = Some("d".into());
         t.draft_max = Some(16);
         t.ctx_checkpoints = Some(4);
@@ -1005,7 +948,7 @@ mod tests {
     async fn add_target_referencing_nonexistent_draft_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        let mut t = model("t", 9001);
+        let mut t = model("t");
         t.draft_model_id = Some("missing".into());
         let err = o.add_model(t).await.unwrap_err();
         assert!(matches!(
@@ -1018,8 +961,8 @@ mod tests {
     async fn add_target_referencing_another_target_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(model("other", 9002)).await.unwrap();
-        let mut t = model("t", 9001);
+        o.add_model(model("other")).await.unwrap();
+        let mut t = model("t");
         t.draft_model_id = Some("other".into());
         let err = o.add_model(t).await.unwrap_err();
         assert!(matches!(
@@ -1032,7 +975,7 @@ mod tests {
     async fn target_cannot_reference_itself_as_draft() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        let mut t = model("t", 9001);
+        let mut t = model("t");
         t.draft_model_id = Some("t".into());
         let err = o.add_model(t).await.unwrap_err();
         assert!(matches!(
@@ -1046,9 +989,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
         o.add_model(draft("d")).await.unwrap();
-        let mut t1 = model("t1", 9001);
+        let mut t1 = model("t1");
         t1.draft_model_id = Some("d".into());
-        let mut t2 = model("t2", 9002);
+        let mut t2 = model("t2");
         t2.draft_model_id = Some("d".into());
         o.add_model(t1).await.unwrap();
         o.add_model(t2).await.unwrap();
@@ -1069,7 +1012,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
         o.add_model(draft("d")).await.unwrap();
-        let mut t = model("t", 9001);
+        let mut t = model("t");
         t.draft_model_id = Some("d".into());
         o.add_model(t.clone()).await.unwrap();
 
@@ -1077,18 +1020,6 @@ mod tests {
         t.draft_model_id = None;
         o.update_model(t).await.unwrap();
         assert!(o.remove_model("d").await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn two_drafts_do_not_collide_on_port_zero() {
-        // Drafts don't bind a port, so their `port` field is a
-        // serialized zero. The collision check used to flag every new
-        // draft as clashing with every existing one; now it excludes
-        // non-targets.
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(draft("d1")).await.unwrap();
-        assert!(o.add_model(draft("d2")).await.is_ok());
     }
 
     #[tokio::test]
@@ -1113,7 +1044,7 @@ mod tests {
         assert!(!path.exists());
 
         // Add a model → dirty → reconcile writes the file.
-        o.add_model(model("a", 9001)).await.unwrap();
+        o.add_model(model("a")).await.unwrap();
         o.reconcile().await;
         assert!(path.exists());
         let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();

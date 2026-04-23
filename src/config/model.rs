@@ -162,7 +162,6 @@ pub struct ModelConfig {
     pub binary_preset: Option<String>,
     pub binary: PathBuf,
     pub model_path: PathBuf,
-    pub port: u16,
     #[serde(default)]
     pub extra_args: Vec<String>,
 
@@ -292,7 +291,6 @@ impl Default for ModelConfig {
             binary_preset: None,
             binary: PathBuf::new(),
             model_path: PathBuf::new(),
-            port: 0,
             extra_args: Vec::new(),
             context: 4096,
             temperature: default_temperature(),
@@ -548,7 +546,6 @@ mod tests {
             binary_preset: Some("llama-vulkan".into()),
             binary: PathBuf::from("/home/u/llama.cpp/build-vulkan/bin/llama-server"),
             model_path: PathBuf::from("/models/qwen3-30b.gguf"),
-            port: 9001,
             extra_args: vec!["--override-kv".into(), "something=1".into()],
             context: 32768,
             flash_attn: true,
@@ -664,7 +661,6 @@ mod tests {
             name: "M".into(),
             binary: PathBuf::from("/bin/llama"),
             model_path: PathBuf::from("/m.gguf"),
-            port: 9001,
             ..ModelConfig::default()
         }
     }
@@ -810,7 +806,6 @@ mod tests {
             name: "T".into(),
             binary: PathBuf::from("/bin/llama"),
             model_path: PathBuf::from("/m.gguf"),
-            port: 9001,
             ..ModelConfig::default()
         }
     }

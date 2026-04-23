@@ -76,7 +76,6 @@ async fn build_proxy_app(upstream_port: u16) -> axum::Router {
             name: "fake".into(),
             binary: std::path::PathBuf::from("/bin/true"),
             model_path: std::path::PathBuf::from("/dev/null"),
-            port: upstream_port,
             ..ModelConfig::default()
         })
         .await
@@ -89,6 +88,11 @@ async fn build_proxy_app(upstream_port: u16) -> axum::Router {
         m.state = ModelState::Running;
         m.pid = Some(1);
     }
+    orchestrator
+        .process_manager
+        .lock()
+        .await
+        .register_port("fake", upstream_port);
 
     let state: AppState = orchestrator;
     axum::Router::new()

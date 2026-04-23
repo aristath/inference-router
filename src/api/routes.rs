@@ -27,13 +27,6 @@ fn mutation_response(e: MutationError) -> axum::response::Response {
             Json(serde_json::json!({"error": format!("'{id}' already exists")})),
         )
             .into_response(),
-        MutationError::PortConflict(port, holder) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("port {port} is already in use by model '{holder}'"),
-            })),
-        )
-            .into_response(),
         MutationError::InvalidConfig(err) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": err.to_string()})),
