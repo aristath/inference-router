@@ -25,6 +25,7 @@ urlencoding = "2"
 shellexpand = "3"
 anyhow = "1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
 ggus = "0.5.1"
 memmap2 = "0.9.10"
 

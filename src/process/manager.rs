@@ -1,57 +1,62 @@
 use crate::config::{ModelConfig, ModelRole, SplitMode, WeightsFormat};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// A live inference-server process owned by the orchestrator.
-///
-/// The `Child` is retained for the process's lifetime so that
-/// `kill_on_drop(true)` actually fires when the orchestrator shuts down —
-/// ensuring llama-server processes die with us instead of orphaning.
 struct RunningChild {
     port: u16,
     model_id: String,
-    // Kept alive purely so tokio's `kill_on_drop(true)` applies on shutdown:
-    // reading the field itself is not meaningful, dropping it is.
     #[allow(dead_code)]
     child: tokio::process::Child,
+}
+
+/// Per-instance runtime metadata for a live inference-server process.
+pub struct InstanceInfo {
+    pub pid: i32,
+    pub port: u16,
+    /// Number of in-flight requests currently routed to this instance.
+    pub active: Arc<AtomicUsize>,
+}
+
+/// RAII handle returned by `ensure_loaded`. Holds the port to forward to
+/// and keeps the instance's active counter incremented for the duration of
+/// the request. Dropped when the response body is fully consumed or the
+/// connection closes.
+#[derive(Debug)]
+pub struct RequestGuard {
+    pub port: u16,
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Owns running inference-server processes. Single instance per `Orchestrator`.
 #[derive(Default)]
 pub struct ProcessManager {
+    /// pid → child handle (kept for kill_on_drop).
     running: HashMap<i32, RunningChild>,
-    /// model_id → port, populated on `register`, cleared on `stop`/`forget`.
-    /// The only in-memory source of truth for which port a live process
-    /// is listening on — ModelConfig no longer carries a port field.
-    running_ports: HashMap<String, u16>,
+    /// model_id → pool of live instances.
+    instances: HashMap<String, Vec<InstanceInfo>>,
 }
 
-/// A freshly spawned but not-yet-healthy child. Returned by `spawn_child`
-/// so the caller can await readiness WITHOUT holding the ProcessManager
-/// mutex across the 180s health check.
+/// A freshly spawned but not-yet-healthy child.
 pub struct PendingChild {
     pub pid: i32,
     pub port: u16,
     model_id: String,
     child: tokio::process::Child,
-    /// Receives the sum of all measured KV/RS cache bytes parsed from
-    /// the child's stderr during startup. Zero if the lines were never
-    /// seen (Safetensors servers, crash before init, etc.).
     kv_bytes_rx: tokio::sync::oneshot::Receiver<u64>,
 }
 
 impl ProcessManager {
-    /// Fork + exec the inference server. Returns immediately — the caller
-    /// must drive health via `wait_for_health` and then `register` the PID
-    /// back into this manager on success (or drop the `PendingChild` on
-    /// failure, which SIGKILLs via `kill_on_drop`).
-    ///
-    /// `draft` is the resolved draft model config when the target has
-    /// `draft_model_id` set; `None` otherwise. Keeping it an explicit
-    /// argument (rather than a store reference) keeps the spawn path
-    /// testable and makes argument resolution the orchestrator's job.
     pub fn spawn_child(
         &self,
         model: &ModelConfig,
@@ -68,10 +73,6 @@ impl ProcessManager {
             "spawning inference server",
         );
 
-        // `kill_on_drop(true)` is the safety net for orchestrator shutdown.
-        // stderr is piped so we can parse the KV-cache size from llama.cpp's
-        // startup output; a background task drains it and forwards each line
-        // to stderr so the user experience is unchanged.
         let mut child = tokio::process::Command::new(&model.binary)
             .args(&args)
             .process_group(0)
@@ -83,8 +84,6 @@ impl ProcessManager {
 
         let pid = child.id().expect("spawned child has no PID") as i32;
 
-        // Drain stderr: forward every line to our stderr (preserving the
-        // existing log experience), and sum up all KV/RS cache size lines.
         let stderr = child.stderr.take().expect("stderr was piped");
         let (kv_tx, kv_rx) = tokio::sync::oneshot::channel::<u64>();
         tokio::spawn(async move {
@@ -103,41 +102,91 @@ impl ProcessManager {
         Ok(PendingChild { pid, port, model_id: model.id.clone(), child, kv_bytes_rx: kv_rx })
     }
 
-    /// Install a healthy child into the running table so its `kill_on_drop`
-    /// survives until explicit `stop`/`forget` or orchestrator shutdown.
-    pub fn register(&mut self, pending: PendingChild) {
-        self.running_ports.insert(pending.model_id.clone(), pending.port);
-        self.running.insert(
-            pending.pid,
-            RunningChild {
-                port: pending.port,
-                model_id: pending.model_id,
-                child: pending.child,
-            },
-        );
+    /// Install a healthy child into the running table. Returns a `RequestGuard`
+    /// for the caller's in-flight request (active starts at 1).
+    pub fn register(&mut self, pending: PendingChild) -> RequestGuard {
+        let active = Arc::new(AtomicUsize::new(1));
+        let port = pending.port;
+        self.instances.entry(pending.model_id.clone()).or_default().push(InstanceInfo {
+            pid: pending.pid,
+            port,
+            active: active.clone(),
+        });
+        self.running.insert(pending.pid, RunningChild {
+            port,
+            model_id: pending.model_id,
+            child: pending.child,
+        });
+        RequestGuard { port, active }
     }
 
-    /// Returns the port the live process for `model_id` is listening on,
-    /// or `None` if the model is not currently running.
-    pub fn port_for_model(&self, model_id: &str) -> Option<u16> {
-        self.running_ports.get(model_id).copied()
+    /// Find an idle instance (active == 0), increment its counter, and return
+    /// a guard. Returns `None` if no instances exist or all are busy.
+    pub fn acquire_idle_instance(&self, model_id: &str) -> Option<RequestGuard> {
+        for inst in self.instances.get(model_id)?.iter() {
+            if inst.active.load(Ordering::Relaxed) == 0 {
+                inst.active.fetch_add(1, Ordering::Relaxed);
+                return Some(RequestGuard { port: inst.port, active: inst.active.clone() });
+            }
+        }
+        None
     }
 
-    /// Directly records a port for a model without spawning a process.
-    /// Used in integration tests to synthesize a Running model.
-    pub fn register_port(&mut self, model_id: &str, port: u16) {
-        self.running_ports.insert(model_id.into(), port);
+    /// Find any instance — idle first, then any busy one. Returns `None` only
+    /// if there are no instances at all.
+    pub fn acquire_any_instance(&self, model_id: &str) -> Option<RequestGuard> {
+        if let Some(g) = self.acquire_idle_instance(model_id) {
+            return Some(g);
+        }
+        let inst = self.instances.get(model_id)?.first()?;
+        inst.active.fetch_add(1, Ordering::Relaxed);
+        Some(RequestGuard { port: inst.port, active: inst.active.clone() })
     }
 
-    /// SIGTERM, wait briefly, SIGKILL if still alive, then drop our Child
-    /// handle so tokio reaps it. Only signals when the PID is tracked —
-    /// callers asking us to stop an untracked PID get a warning but no
-    /// signal (defends against PID reuse after a crashed/forgotten child).
+    /// Number of live instances for a model.
+    pub fn instance_count(&self, model_id: &str) -> usize {
+        self.instances.get(model_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// True when every instance for the model has active > 0 (or none exist).
+    pub fn all_busy(&self, model_id: &str) -> bool {
+        match self.instances.get(model_id) {
+            None => true,
+            Some(v) if v.is_empty() => true,
+            Some(v) => v.iter().all(|i| i.active.load(Ordering::Relaxed) > 0),
+        }
+    }
+
+    /// Returns (model_id, pid) for every instance whose process has died.
+    pub fn dead_instances(&self) -> Vec<(String, i32)> {
+        let mut dead = Vec::new();
+        for (model_id, insts) in &self.instances {
+            for inst in insts {
+                if !is_process_alive(inst.pid) {
+                    dead.push((model_id.clone(), inst.pid));
+                }
+            }
+        }
+        dead
+    }
+
+    /// Returns all pids for instances of `model_id` (used by stop_model_inner).
+    pub fn pids_for_model(&self, model_id: &str) -> Vec<i32> {
+        self.instances.get(model_id)
+            .map(|v| v.iter().map(|i| i.pid).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn is_alive(&self, pid: i32) -> bool {
+        is_process_alive(pid)
+    }
+
     pub async fn stop(&mut self, pid: i32) {
         let Some(rc) = self.running.remove(&pid) else {
             warn!(pid, "stopping process not in running table; skipping signal");
             return;
         };
+        self.remove_instance(&rc.model_id, pid);
 
         let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGTERM);
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -145,37 +194,52 @@ impl ProcessManager {
             warn!(pid, "process didn't exit after SIGTERM, sending SIGKILL");
             let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGKILL);
         }
-
-        self.running_ports.remove(&rc.model_id);
         info!(pid, port = rc.port, model = rc.model_id, "inference server stopped");
-        // rc.child drops here; kill_on_drop is a no-op on an already-
-        // terminated process but the drop drives tokio's reaper.
     }
 
-    pub fn is_alive(&self, pid: i32) -> bool {
-        is_process_alive(pid)
-    }
-
-    /// Forget a pid (used when reconcile observes the process has died, or
-    /// when delete fails to stop cleanly). Dropping the `RunningChild` lets
-    /// tokio reap it and fires `kill_on_drop` as a safety net.
     pub fn forget(&mut self, pid: i32) {
-        if let Some(rc) = self.running.remove(&pid) {
-            self.running_ports.remove(&rc.model_id);
+        let model_id = self.running.remove(&pid).map(|rc| rc.model_id).or_else(|| {
+            // Not in running (e.g. test instances or already-reaped processes):
+            // search the instances map by pid so we can still clean up.
+            self.instances.iter()
+                .find(|(_, insts)| insts.iter().any(|i| i.pid == pid))
+                .map(|(id, _)| id.clone())
+        });
+        if let Some(model_id) = model_id {
+            self.remove_instance(&model_id, pid);
         }
+    }
+
+    fn remove_instance(&mut self, model_id: &str, pid: i32) {
+        if let Some(v) = self.instances.get_mut(model_id) {
+            v.retain(|i| i.pid != pid);
+            if v.is_empty() {
+                self.instances.remove(model_id);
+            }
+        }
+    }
+
+    /// Directly registers an instance without a real process.
+    /// Used in tests to synthesize a Running model (integration tests use
+    /// pid=-1; unit tests can pass a specific pid to test dead-process detection).
+    pub fn register_test_instance(&mut self, model_id: &str, pid: i32, port: u16) {
+        let active = Arc::new(AtomicUsize::new(0));
+        self.instances.entry(model_id.into()).or_default().push(InstanceInfo {
+            pid,
+            port,
+            active,
+        });
+    }
+
+    /// Convenience wrapper for integration tests (pid is irrelevant there).
+    pub fn register_port(&mut self, model_id: &str, port: u16) {
+        self.register_test_instance(model_id, -1, port);
     }
 }
 
 impl PendingChild {
-    /// Waits until `/health` returns 200 on the child's port, or until the
-    /// child exits, whichever comes first. Returns the total KV+RS cache
-    /// bytes parsed from llama.cpp's startup logs (0 if not seen — e.g.
-    /// Safetensors backends or a crash before context init).
     pub async fn wait_for_health(&mut self, timeout: Duration) -> Result<u64, HealthCheckError> {
         wait_for_health_or_exit(&mut self.child, self.port, timeout).await?;
-        // The KV size lines appear during context init, well before the
-        // health endpoint becomes available. Give the stderr reader a brief
-        // window to flush any remaining buffered lines before we read.
         let kv_bytes = tokio::time::timeout(
             Duration::from_millis(200),
             &mut self.kv_bytes_rx,
@@ -188,17 +252,6 @@ impl PendingChild {
     }
 }
 
-/// Builds the argv (excluding the binary itself) for a model.
-///
-/// `draft` is the caller-resolved `ModelConfig` the target's
-/// `draft_model_id` points at. When `Some`, the builder emits the
-/// speculative-decoding flags (`-md`, `-ngld`, `-devd`, `-cd`, `-ctkd`,
-/// `-ctvd`) from the draft's own fields, followed by the policy flags
-/// (`--draft-max`, `--draft-min`, `--draft-p-min`, `--ctx-checkpoints`,
-/// `--checkpoint-every-n-tokens`) from the target's fields. When `None`,
-/// no spec-decode flags are emitted — even if the target has them set —
-/// so the argv stays runnable in test code without needing a draft
-/// lookup.
 pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port: u16) -> Vec<String> {
     let mut args = Vec::new();
     match model.weights_format {
@@ -224,12 +277,6 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
             args.push("--repeat-penalty".into());
             args.push(model.repeat_penalty.to_string());
 
-            // llama.cpp structured flags. User-typed `extra_args` appends
-            // after these so it can override via last-wins.
-            //
-            // Modern llama-server's `--flash-attn` expects a value (`on|off|
-            // auto`); a bare `--flash-attn` consumes the next argv token,
-            // which breaks everything. Always emit the value.
             args.push("--flash-attn".into());
             args.push(if model.flash_attn { "on".into() } else { "off".into() });
             if let Some(n) = model.n_gpu_layers {
@@ -292,10 +339,6 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
                 args.push(kw.clone());
             }
 
-            // Speculative decoding. Only emitted when the target has a
-            // resolved draft — a lone `draft_model_id` without a
-            // matching entry is an orchestrator bug, not something to
-            // silently degrade from.
             if let (Some(d), ModelRole::Target) = (draft, model.role) {
                 args.push("-md".into());
                 args.push(d.model_path.to_string_lossy().into_owned());
@@ -307,9 +350,6 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
                     args.push("-devd".into());
                     args.push(dev.clone());
                 }
-                // Always pin the draft's context — defaulting to the
-                // target's ctx is wasteful (bench showed 8-30 GB of
-                // draft KV at 256k) and surprising.
                 args.push("-cd".into());
                 args.push(d.context.to_string());
                 if let Some(k) = d.cache_type_k {
@@ -320,10 +360,6 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
                     args.push("-ctvd".into());
                     args.push(v.as_arg().into());
                 }
-
-                // Target-side spec-decode policy knobs. Target owns
-                // these because they're about *how hard* the target
-                // drives the draft, not about the draft model itself.
                 if let Some(n) = model.draft_max {
                     args.push("--draft-max".into());
                     args.push(n.to_string());
@@ -359,9 +395,6 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
     args
 }
 
-/// Polls `/health` on `port` until success, OR returns an error as soon as
-/// the child process exits (so bad argv / OOM / missing model manifest as
-/// a concrete error instead of a timeout).
 async fn wait_for_health_or_exit(
     child: &mut tokio::process::Child,
     port: u16,
@@ -375,12 +408,11 @@ async fn wait_for_health_or_exit(
     let start = std::time::Instant::now();
 
     loop {
-        // Fast-fail on early child exit.
         match child.try_wait() {
             Ok(Some(status)) => {
                 return Err(HealthCheckError::ChildExited(status.code(), status.to_string()));
             }
-            Ok(None) => {} // still running
+            Ok(None) => {}
             Err(e) => {
                 return Err(HealthCheckError::ChildExited(None, format!("try_wait: {e}")));
             }
@@ -406,10 +438,6 @@ async fn wait_for_health_or_exit(
     }
 }
 
-/// Binds to `127.0.0.1:0` and lets the OS assign a free ephemeral port.
-/// The listener is dropped immediately; there is a brief window where
-/// another process could grab the same port, but in practice this is
-/// fine for localhost-only inference servers.
 fn find_free_port() -> Option<u16> {
     std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
@@ -417,14 +445,6 @@ fn find_free_port() -> Option<u16> {
         .map(|a| a.port())
 }
 
-/// Parses the MiB value from llama.cpp's KV/RS cache summary log lines:
-///
-///   `llama_kv_cache_init: size = 1234.56 MiB ( 32768 cells, 64 layers, …)`
-///   `llama_memory_recurrent_init: size =   56.78 MiB (  8192 cells, …)`
-///
-/// Returns `None` for unrelated lines. The `cells,` guard prevents false
-/// matches on quantisation progress lines which also contain "size = X MiB"
-/// but never have "cells,".
 fn parse_kv_size_mib(line: &str) -> Option<f64> {
     let after = line.split("size =").nth(1)?.trim_start();
     let mib_pos = after.find(" MiB")?;
@@ -469,11 +489,8 @@ mod tests {
     use super::*;
     use crate::config::{CacheType, ReasoningFormat};
 
-    // ----- parse_kv_size_mib -----
-
     #[test]
     fn parses_standard_kv_cache_line() {
-        // Typical output from llama_kv_cache_init for a non-SWA model.
         let line = "llama_kv_cache_init: size = 1024.00 MiB ( 32768 cells, 64 layers, 2/2 seqs), K (q8_0): 512.00 MiB, V (q8_0): 512.00 MiB";
         let mib = parse_kv_size_mib(line).unwrap();
         assert!((mib - 1024.0).abs() < 0.01, "got {mib}");
@@ -481,8 +498,6 @@ mod tests {
 
     #[test]
     fn parses_recurrent_state_line() {
-        // llama_memory_recurrent_init uses "RS buffer size" and the same
-        // summary format — should be picked up and summed with KV cache.
         let line = "llama_memory_recurrent_init: size =   56.25 MiB (  8192 cells, 28 layers, 2 seqs), R (f16):   28.12 MiB, S (f16):   28.12 MiB";
         let mib = parse_kv_size_mib(line).unwrap();
         assert!((mib - 56.25).abs() < 0.01, "got {mib}");
@@ -490,16 +505,12 @@ mod tests {
 
     #[test]
     fn parses_swa_kv_cache_line() {
-        // Hybrid models (e.g. Qwen3.6) emit separate lines for the
-        // full-attention and sliding-window KV caches. Both must match.
         let line = "llama_kv_cache_init: size =  128.50 MiB (  4096 cells, 32 layers, 2/2 seqs), K (q8_0):  64.25 MiB, V (q8_0):  64.25 MiB";
         assert!(parse_kv_size_mib(line).is_some());
     }
 
     #[test]
     fn ignores_quant_progress_lines() {
-        // llama-quantize logs "size = X MiB -> Y MiB" with no "cells," —
-        // must not be mistaken for a KV cache line.
         let line = "[ 100/ 291]          blk.0.attn_k.weight - [ 4096,  4096,    1,    1], type =    q8_0, size =   16.00 MiB";
         assert!(parse_kv_size_mib(line).is_none());
     }
@@ -580,10 +591,7 @@ mod tests {
         let mut m = gguf_model();
         m.extra_args = vec!["--flash-attn".into(), "-ngl".into(), "99".into()];
         let args = build_command_args(&m, None, 9001);
-        assert_eq!(
-            &args[args.len() - 3..],
-            &["--flash-attn", "-ngl", "99"],
-        );
+        assert_eq!(&args[args.len() - 3..], &["--flash-attn", "-ngl", "99"]);
     }
 
     #[test]
@@ -610,8 +618,6 @@ mod tests {
     #[test]
     fn gguf_argv_emits_flash_attn_off_when_disabled() {
         let args = build_command_args(&gguf_model(), None, 9001);
-        // --flash-attn is always emitted as `off` by default — it used to be
-        // a bare flag; modern llama-server requires a value.
         assert_eq!(
             args.windows(2).find(|w| w[0] == "--flash-attn").map(|w| w[1].as_str()),
             Some("off"),
@@ -700,7 +706,6 @@ mod tests {
         m.n_gpu_layers = Some(50);
         m.extra_args = vec!["-ngl".into(), "99".into()];
         let args = build_command_args(&m, None, 9001);
-        // Both present, extra_args version is last → wins on llama.cpp.
         let idx_first = args.iter().position(|a| a == "-ngl").unwrap();
         let idx_last = args.iter().rposition(|a| a == "-ngl").unwrap();
         assert_ne!(idx_first, idx_last);
@@ -714,13 +719,8 @@ mod tests {
         m.weights_format = WeightsFormat::Safetensors;
         m.extra_args = vec!["--tensor-parallel-size".into(), "2".into()];
         let args = build_command_args(&m, None, 9001);
-        assert_eq!(
-            &args[args.len() - 2..],
-            &["--tensor-parallel-size", "2"],
-        );
+        assert_eq!(&args[args.len() - 2..], &["--tensor-parallel-size", "2"]);
     }
-
-    // ----- Speculative decoding -----
 
     fn draft_model() -> ModelConfig {
         use crate::config::ModelRole;
@@ -739,9 +739,7 @@ mod tests {
     }
 
     fn find_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-        args.windows(2)
-            .find(|w| w[0] == flag)
-            .map(|w| w[1].as_str())
+        args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
     }
 
     #[test]
@@ -755,7 +753,6 @@ mod tests {
         t.checkpoint_every_n_tokens = Some(-1);
         let d = draft_model();
         let args = build_command_args(&t, Some(&d), 9001);
-
         assert_eq!(find_flag(&args, "-md"), Some("/models/draft.gguf"));
         assert_eq!(find_flag(&args, "-ngld"), Some("99"));
         assert_eq!(find_flag(&args, "-devd"), Some("Vulkan1"));
@@ -771,11 +768,6 @@ mod tests {
 
     #[test]
     fn spec_decode_argv_omitted_when_no_draft_resolved() {
-        // Target has draft_model_id + policy fields set, but the caller
-        // passed draft=None (e.g. draft entry was deleted out from under
-        // the config). Don't emit any spec flags — the orchestrator
-        // should have failed the spawn upstream, but argv must remain
-        // sane.
         let mut t = gguf_model();
         t.draft_model_id = Some("missing".into());
         t.draft_max = Some(16);
@@ -789,9 +781,6 @@ mod tests {
 
     #[test]
     fn spec_decode_argv_omits_unset_policy_flags() {
-        // Only draft_max set; --draft-min/--draft-p-min/--ctx-checkpoints
-        // stay off. Lets users opt into individual policy knobs without
-        // being forced to set all five.
         let mut t = gguf_model();
         t.draft_model_id = Some("draft".into());
         t.draft_max = Some(8);
@@ -806,9 +795,6 @@ mod tests {
 
     #[test]
     fn spec_decode_argv_always_pins_draft_context() {
-        // `-cd` is emitted even when `context` on the draft equals the
-        // target's, because letting llama-server default it to the
-        // target's ctx makes draft KV explode at large target ctx.
         let mut t = gguf_model();
         t.draft_model_id = Some("draft".into());
         let args = build_command_args(&t, Some(&draft_model()), 9001);
@@ -817,9 +803,6 @@ mod tests {
 
     #[test]
     fn spec_decode_argv_skips_draft_device_flag_when_unset() {
-        // Draft without a device: orchestrator can still spawn (the
-        // draft would land on whatever GPU llama.cpp picks) but we
-        // don't emit `-devd ""`.
         let mut d = draft_model();
         d.device = None;
         let mut t = gguf_model();

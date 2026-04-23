@@ -3,7 +3,7 @@ use crate::config::{
 };
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
-use crate::process::manager::{ProcessManager, SpawnError};
+use crate::process::manager::{ProcessManager, RequestGuard, SpawnError};
 use crate::system::stats::{SystemStats, SystemTracker};
 use crate::vram::estimator::VramEstimate;
 use crate::vram::tracker::{GpuInfo, VRAMTracker};
@@ -226,7 +226,7 @@ impl Orchestrator {
     }
 
     pub async fn remove_model(&self, id: &str) -> Result<(), MutationError> {
-        let pid = {
+        {
             let data = self.data.lock().await;
             let m = data.models.get(id).ok_or_else(|| MutationError::NotFound(id.into()))?;
             // Refuse to delete a draft that any target references —
@@ -246,18 +246,18 @@ impl Orchestrator {
                     });
                 }
             }
-            m.pid
         };
         // Try a graceful stop first so the child dies cleanly.
         if let Err(e) = self.stop_model_inner(id).await {
             warn!(model = id, error = %e, "failed to stop model during delete");
         }
-        // Belt-and-braces: if the graceful stop left a tracked pid behind
-        // (e.g. signal failed, reconcile hasn't noticed), drop the handle
-        // so `kill_on_drop` fires when the ProcessManager Child is dropped
-        // on orchestrator shutdown — no orphan llama-server lingering on.
-        if let Some(pid) = pid {
-            self.process_manager.lock().await.forget(pid);
+        // Belt-and-braces: forget any pids still tracked (e.g. signal failed)
+        // so kill_on_drop fires on orchestrator shutdown — no orphan processes.
+        {
+            let mut pm = self.process_manager.lock().await;
+            for pid in pm.pids_for_model(id) {
+                pm.forget(pid);
+            }
         }
         self.data.lock().await.models.remove(id);
         // Drop the per-model load guard so the HashMap doesn't slowly grow
@@ -269,48 +269,72 @@ impl Orchestrator {
 
     // ----- load / stop -----
 
-    /// Ensures a model is `Running` and returns its port. Concurrent callers
-    /// for the same model coalesce — first one does the work, the rest wait.
+    /// Ensures a model has a running instance and returns a `RequestGuard`
+    /// that tracks the in-flight request.
     ///
-    /// The load is driven by a detached `tokio::spawn`, so if the caller's
-    /// HTTP handler future is cancelled (client disconnect, browser tab
-    /// reload, proxy timeout), the state transition to `Running` or
-    /// `Error` still happens in the background. Without this, a cancelled
-    /// caller would leave the model stuck in `Loading` forever.
-    pub async fn ensure_loaded(self: Arc<Self>, id: &str) -> Result<u16, LoadError> {
-        // Per-model serialization. The guard is acquired *inside* the
-        // spawned task so task cancellation can't leak the lock.
-        let guard = {
+    /// Fast path: if an idle instance already exists, returns immediately.
+    /// Scale-up path: if all instances are busy and VRAM permits, a new
+    /// instance is spawned in the background; the current request is served
+    /// by an existing (busy) instance — no cold-start penalty.
+    /// First-spawn path: serialized via a per-model load_guard so concurrent
+    /// callers collapse into one spawn. The work runs in a detached task so
+    /// caller cancellation (client disconnect) can't leave the model stuck
+    /// in Loading forever.
+    pub async fn ensure_loaded(self: Arc<Self>, id: &str) -> Result<RequestGuard, LoadError> {
+        // Fast path: idle instance available — no serialization needed.
+        if let Some(guard) = self.process_manager.lock().await.acquire_idle_instance(id) {
+            return Ok(guard);
+        }
+
+        // All instances busy (or none). Check if instances exist at all.
+        let instance_count = self.process_manager.lock().await.instance_count(id);
+        if instance_count > 0 {
+            let (estimated_vram, free_vram, model_exists) = {
+                let data = self.data.lock().await;
+                let m = data.models.get(id);
+                let est = m.map(|m| m.estimated_vram).unwrap_or(0);
+                let free: u64 = data.gpus.iter().map(|g| g.free_vram()).sum();
+                (est, free, m.is_some())
+            };
+            if !model_exists {
+                return Err(LoadError::ModelNotFound(id.into()));
+            }
+            if estimated_vram > 0 && free_vram >= estimated_vram {
+                // Kick off a background spawn; serve this request on an existing instance.
+                let me = self.clone();
+                let id_owned = id.to_string();
+                tokio::spawn(async move { me.spawn_additional_instance(&id_owned).await });
+            }
+            if let Some(guard) = self.process_manager.lock().await.acquire_any_instance(id) {
+                return Ok(guard);
+            }
+            // Instance pool drained between our checks (all died) — fall through to spawn.
+        }
+
+        // No instances: serialize the first spawn via a per-model load_guard.
+        let load_guard = {
             let mut guards = self.load_guards.lock().await;
-            guards
-                .entry(id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+            guards.entry(id.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
         };
 
         let id_owned = id.to_string();
         let me = self.clone();
         let handle = tokio::spawn(async move {
-            let _lock = guard.lock().await;
+            let _lock = load_guard.lock().await;
 
-            // Fast path: already running — read port from ProcessManager,
-            // not ModelConfig (port is now purely a runtime property).
+            // Re-check after acquiring the lock — another task may have spawned already.
+            if let Some(g) = me.process_manager.lock().await.acquire_idle_instance(&id_owned) {
+                return Ok(g);
+            }
+
             {
                 let data = me.data.lock().await;
-                let m = data
-                    .models
-                    .get(&id_owned)
-                    .ok_or_else(|| LoadError::ModelNotFound(id_owned.clone()))?;
-                if m.state == ModelState::Running {
-                    if let Some(port) = me.process_manager.lock().await.port_for_model(&id_owned) {
-                        return Ok(port);
-                    }
-                    // Running state with no tracked port means the process
-                    // died between reconcile ticks — fall through to reload.
+                if !data.models.contains_key(&id_owned) {
+                    return Err(LoadError::ModelNotFound(id_owned.clone()));
                 }
             }
 
-            // Claim the spawn.
+            // Claim Loading state.
             {
                 let mut data = me.data.lock().await;
                 if let Some(m) = data.models.get_mut(&id_owned) {
@@ -319,7 +343,7 @@ impl Orchestrator {
             }
 
             match me.do_load(&id_owned).await {
-                Ok(port) => Ok(port),
+                Ok(guard) => Ok(guard),
                 Err(e) => {
                     let mut data = me.data.lock().await;
                     if let Some(m) = data.models.get_mut(&id_owned) {
@@ -335,8 +359,6 @@ impl Orchestrator {
         match handle.await {
             Ok(result) => result,
             Err(join_err) => {
-                // The detached task panicked. Very unlikely, but clean up
-                // so the model doesn't sit in Loading forever.
                 let msg = format!("load task panicked: {join_err}");
                 {
                     let mut data = self.data.lock().await;
@@ -362,7 +384,7 @@ impl Orchestrator {
     /// VRAM budget. We drop admission before waiting for health; that way
     /// a 180-second health poll can't block a second model from starting
     /// on a different GPU.
-    async fn do_load(&self, id: &str) -> Result<u16, LoadError> {
+    async fn do_load(&self, id: &str) -> Result<RequestGuard, LoadError> {
         // Accumulated weight file sizes (target + draft if present). Set
         // inside the admission block during GGUF reads; used after the health
         // check to recompute estimated_vram from the measured KV bytes.
@@ -524,36 +546,111 @@ impl Orchestrator {
 
         match pending.wait_for_health(std::time::Duration::from_secs(180)).await {
             Ok(kv_bytes) => {
-                self.process_manager.lock().await.register(pending);
-                let mut data = self.data.lock().await;
-                if let Some(m) = data.models.get_mut(id) {
-                    m.state = ModelState::Running;
-                    m.pid = Some(pid);
-                    m.last_used = Some(unix_now());
-                    // Replace the pre-spawn formula estimate with the value
-                    // measured directly from llama.cpp's startup logs. This
-                    // accounts for SWA layers, recurrent state, and any other
-                    // architecture-specific allocation our formula can't see.
-                    if kv_bytes > 0 && weight_file_size > 0 {
-                        m.estimated_vram =
-                            ((weight_file_size + kv_bytes) as f64 * 1.1) as u64;
-                        info!(
-                            model = id,
-                            kv_mib = kv_bytes / 1024 / 1024,
-                            total_mib = m.estimated_vram / 1024 / 1024,
-                            "updated VRAM estimate from llama.cpp startup logs",
-                        );
+                // register() returns the guard for this request (active starts at 1).
+                let guard = self.process_manager.lock().await.register(pending);
+                // pm lock dropped before acquiring data lock.
+                {
+                    let mut data = self.data.lock().await;
+                    if let Some(m) = data.models.get_mut(id) {
+                        m.state = ModelState::Running;
+                        m.pid = Some(pid);
+                        m.last_used = Some(unix_now());
+                        if kv_bytes > 0 && weight_file_size > 0 {
+                            m.estimated_vram =
+                                ((weight_file_size + kv_bytes) as f64 * 1.1) as u64;
+                            info!(
+                                model = id,
+                                kv_mib = kv_bytes / 1024 / 1024,
+                                total_mib = m.estimated_vram / 1024 / 1024,
+                                "updated VRAM estimate from llama.cpp startup logs",
+                            );
+                        }
                     }
                 }
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "inference server ready");
-                Ok(port)
+                Ok(guard)
             }
             Err(e) => {
-                // `pending` is dropped here; `kill_on_drop(true)` on the
-                // Child fires and the process is SIGKILLed.
                 error!(pid, port, error = %e, "health check failed; spawn cancelled");
                 Err(LoadError::SpawnFailed(crate::process::manager::SpawnError::HealthCheckFailed(e)))
+            }
+        }
+    }
+
+    /// Spawn an additional instance of `id` in the background. Called when all
+    /// existing instances are busy and VRAM headroom permits a new one.
+    /// Serialized via the admission lock; aborts silently if an idle instance
+    /// appears by the time admission is acquired (another spawn beat us to it).
+    async fn spawn_additional_instance(&self, id: &str) {
+        let (mut pending, pid, port) = {
+            let _admit = self.admission.lock().await;
+
+            // Re-check: did an idle instance appear while we waited?
+            if !self.process_manager.lock().await.all_busy(id) {
+                return;
+            }
+
+            let gpus = self.vram_tracker.refresh();
+            { self.data.lock().await.gpus = gpus.clone(); }
+
+            let (mut model, draft) = {
+                let data = self.data.lock().await;
+                let m = match data.models.get(id) {
+                    Some(m) if m.role != ModelRole::Draft => m.clone(),
+                    _ => return,
+                };
+                let mut model = m;
+                if let Some(ref preset_id) = model.binary_preset {
+                    match data.presets.get(preset_id) {
+                        Some(p) => model.binary = p.binary.clone(),
+                        None => {
+                            warn!(model = id, preset = preset_id, "preset not found for extra instance");
+                            return;
+                        }
+                    }
+                }
+                let draft = model.draft_model_id.as_ref()
+                    .and_then(|did| data.models.get(did).cloned());
+                (model, draft)
+            };
+
+            let free: u64 = gpus.iter().map(|g| g.free_vram()).sum();
+            if model.estimated_vram == 0 || free < model.estimated_vram {
+                return;
+            }
+
+            if model.weights_format == WeightsFormat::Gguf && model.tensor_split.is_none() {
+                let snapshot = self.data.lock().await.gpus.clone();
+                if snapshot.len() > 1 && model.estimated_vram > 0 {
+                    if let Some(split) = plan_tensor_split(&snapshot, model.estimated_vram) {
+                        model.tensor_split = Some(split);
+                    }
+                }
+            }
+
+            let pending = match self.process_manager.lock().await.spawn_child(&model, draft.as_ref()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(model = id, error = %e, "failed to spawn extra instance");
+                    return;
+                }
+            };
+            let pid = pending.pid;
+            let port = pending.port;
+            (pending, pid, port)
+        };
+        // Admission lock dropped; health check runs without blocking other spawns.
+
+        match pending.wait_for_health(std::time::Duration::from_secs(180)).await {
+            Ok(_) => {
+                // Drop the guard immediately — no user request is attached.
+                drop(self.process_manager.lock().await.register(pending));
+                self.dirty.store(true, Ordering::Relaxed);
+                info!(pid, port, model = id, "extra instance ready");
+            }
+            Err(e) => {
+                warn!(pid, port, model = id, error = %e, "extra instance health check failed");
             }
         }
     }
@@ -562,15 +659,15 @@ impl Orchestrator {
         self.stop_model_inner(id).await
     }
 
-    /// Stop helper that does not acquire the admission lock. Safe to call
-    /// from inside `do_load` during eviction.
+    /// Stop all instances of `id`. Safe to call from inside `do_load` during
+    /// eviction (does not acquire the admission lock).
     async fn stop_model_inner(&self, id: &str) -> Result<(), StopError> {
-        let pid = {
+        {
             let data = self.data.lock().await;
-            let m = data.models.get(id).ok_or_else(|| StopError::ModelNotFound(id.into()))?;
-            m.pid
-        };
-        if let Some(pid) = pid {
+            data.models.get(id).ok_or_else(|| StopError::ModelNotFound(id.into()))?;
+        }
+        let pids = self.process_manager.lock().await.pids_for_model(id);
+        for pid in pids {
             self.process_manager.lock().await.stop(pid).await;
         }
         {
@@ -590,37 +687,24 @@ impl Orchestrator {
     /// Called on a 5s timer by `lifecycle::run`.
     pub async fn reconcile(&self) {
         let gpus = self.vram_tracker.refresh();
+        { self.data.lock().await.gpus = gpus; }
 
-        let dead: Vec<(String, i32)> = {
-            let mut data = self.data.lock().await;
-            data.gpus = gpus;
-
-            let pm = self.process_manager.lock().await;
-            data.models
-                .iter()
-                .filter_map(|(id, m)| {
-                    if m.state == ModelState::Running {
-                        if let Some(pid) = m.pid {
-                            if !pm.is_alive(pid) {
-                                return Some((id.clone(), pid));
-                            }
-                        }
-                    }
-                    None
-                })
-                .collect()
-        };
+        // Ask ProcessManager which instances have died since the last tick.
+        let dead = self.process_manager.lock().await.dead_instances();
 
         if !dead.is_empty() {
             let mut data = self.data.lock().await;
             let mut pm = self.process_manager.lock().await;
-            for (id, pid) in &dead {
-                warn!(model = id, pid, "process died");
-                if let Some(m) = data.models.get_mut(id) {
-                    m.state = ModelState::Error(format!("process {} died", pid));
-                    m.pid = None;
-                }
+            for (model_id, pid) in &dead {
+                warn!(model = model_id, pid, "process died");
                 pm.forget(*pid);
+                // Only mark the model Error/Idle when its last instance is gone.
+                if pm.instance_count(model_id) == 0 {
+                    if let Some(m) = data.models.get_mut(model_id) {
+                        m.state = ModelState::Error(format!("process {} died", pid));
+                        m.pid = None;
+                    }
+                }
             }
             self.dirty.store(true, Ordering::Relaxed);
         }
@@ -900,14 +984,12 @@ mod tests {
         let o = orch(&tmp);
         let mut m = model("a");
         m.state = ModelState::Running;
-        m.pid = Some(1); // pid 1 (init) exists but we haven't registered it in ProcessManager
+        m.pid = Some(999_999);
         o.add_model(m).await.unwrap();
 
-        // Set a definitely-dead pid directly.
-        {
-            let mut d = o.data.lock().await;
-            d.models.get_mut("a").unwrap().pid = Some(999_999);
-        }
+        // Register a synthetic instance with a definitely-dead pid.
+        o.process_manager.lock().await.register_test_instance("a", 999_999, 9000);
+
         o.reconcile().await;
         let after = o.get_model("a").await.unwrap();
         match after.state {

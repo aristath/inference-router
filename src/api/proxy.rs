@@ -3,11 +3,15 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::Stream;
 use serde_json::json;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tracing::{error, warn};
 
 use crate::api::body_peek;
 use crate::orchestrator::AppState;
+use crate::process::manager::RequestGuard;
 
 /// Hop-by-hop headers per RFC 7230 §6.1. Must be stripped when proxying.
 const HOP_BY_HOP: &[&str] = &[
@@ -20,6 +24,21 @@ const HOP_BY_HOP: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+
+/// Wraps a byte stream and keeps a `RequestGuard` alive until the stream
+/// is exhausted or dropped. This ensures the instance's active counter
+/// stays incremented for the full duration of a streaming response.
+struct GuardedStream<S> {
+    inner: S,
+    _guard: RequestGuard,
+}
+
+impl<S: Stream + Unpin> Stream for GuardedStream<S> {
+    type Item = <S as Stream>::Item;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<<S as Stream>::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
 
 /// Byte-level passthrough handler for `/v1/*`. Peeks `model` from the JSON
 /// body, calls `ensure_loaded`, then proxies request/response unchanged.
@@ -59,9 +78,8 @@ pub async fn proxy_handler(
         }
     };
 
-    // Auto-load on miss. Concurrent calls for the same model coalesce.
-    let port = match state.clone().ensure_loaded(&model_id).await {
-        Ok(p) => p,
+    let guard = match state.clone().ensure_loaded(&model_id).await {
+        Ok(g) => g,
         Err(e) => {
             warn!(model = model_id, error = %e, "ensure_loaded failed");
             return (
@@ -72,8 +90,8 @@ pub async fn proxy_handler(
         }
     };
 
-    // Bump `last_used` on every request so the eviction heuristic sees real
-    // activity instead of just the original load timestamp.
+    let port = guard.port;
+
     state.mark_used(&model_id).await;
 
     let path_and_query = parts
@@ -127,7 +145,9 @@ pub async fn proxy_handler(
         }
     }
 
-    let stream = upstream.bytes_stream();
+    // Wrap the byte stream so the guard stays alive until the body is fully
+    // consumed or the connection is dropped.
+    let stream = GuardedStream { inner: upstream.bytes_stream(), _guard: guard };
     match resp_builder.body(Body::from_stream(stream)) {
         Ok(r) => r,
         Err(e) => {
@@ -139,10 +159,8 @@ pub async fn proxy_handler(
 
 /// Synthesized OpenAI-style model list from the current config.
 ///
-/// Drafts are filtered out: they have no port, no standalone process,
-/// and shouldn't appear as selectable models to OpenAI clients. A client
-/// that wants to test a draft's GGUF standalone should create a separate
-/// `role=Target` entry for it.
+/// Drafts are filtered out: they have no standalone process and shouldn't
+/// appear as selectable models to OpenAI clients.
 pub async fn list_v1_models(State(state): State<AppState>) -> impl IntoResponse {
     use crate::config::ModelRole;
     let models = state.list_models().await;

@@ -91,9 +91,9 @@ pub async fn load_model(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.clone().ensure_loaded(&id).await {
-        Ok(port) => (
+        Ok(guard) => (
             StatusCode::OK,
-            Json(serde_json::json!({"ok": true, "port": port})),
+            Json(serde_json::json!({"ok": true, "port": guard.port})),
         )
             .into_response(),
         Err(LoadError::ModelNotFound(id)) => (
