@@ -34,6 +34,22 @@ fn mutation_response(e: MutationError) -> axum::response::Response {
             })),
         )
             .into_response(),
+        MutationError::InvalidConfig(err) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+        MutationError::DraftInUse { id, targets } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "cannot delete draft '{id}': still referenced by {}. \
+                     Unset draft_model_id on those targets first.",
+                    targets.join(", "),
+                ),
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -92,7 +108,12 @@ pub async fn load_model(
             Json(serde_json::json!({"error": format!("model '{id}' not found")})),
         )
             .into_response(),
-        Err(e @ LoadError::PresetNotFound(_)) => (
+        Err(
+            e @ (LoadError::PresetNotFound(_)
+            | LoadError::CannotLoadDraft(_)
+            | LoadError::DraftNotFound { .. }
+            | LoadError::DraftRoleMismatch { .. }),
+        ) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": e.to_string()})),
         )

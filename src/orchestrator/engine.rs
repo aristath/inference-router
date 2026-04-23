@@ -1,4 +1,6 @@
-use crate::config::{BinaryPreset, JsonStore, ModelConfig, ModelState, WeightsFormat};
+use crate::config::{
+    BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelRole, ModelState, WeightsFormat,
+};
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
 use crate::process::manager::{ProcessManager, SpawnError};
@@ -173,12 +175,24 @@ impl Orchestrator {
     }
 
     pub async fn add_model(&self, model: ModelConfig) -> Result<(), MutationError> {
+        model.validate_for_role().map_err(MutationError::from)?;
         let mut data = self.data.lock().await;
         if data.models.contains_key(&model.id) {
             return Err(MutationError::Conflict(model.id));
         }
-        if let Some(other) = data.models.values().find(|m| m.port == model.port) {
-            return Err(MutationError::PortConflict(model.port, other.id.clone()));
+        // Ports collide only between targets that actually bind one.
+        // Drafts never bind a port, so exclude them from the check.
+        if model.role == ModelRole::Target {
+            if let Some(other) = data
+                .models
+                .values()
+                .find(|m| m.role == ModelRole::Target && m.port == model.port)
+            {
+                return Err(MutationError::PortConflict(model.port, other.id.clone()));
+            }
+        }
+        if let Some(ref did) = model.draft_model_id {
+            validate_draft_reference(&data.models, &model.id, did)?;
         }
         data.models.insert(model.id.clone(), model);
         self.dirty.store(true, Ordering::Relaxed);
@@ -186,13 +200,17 @@ impl Orchestrator {
     }
 
     pub async fn update_model(&self, new: ModelConfig) -> Result<(), MutationError> {
+        new.validate_for_role().map_err(MutationError::from)?;
         let mut data = self.data.lock().await;
-        if let Some(other) = data
-            .models
-            .values()
-            .find(|m| m.port == new.port && m.id != new.id)
-        {
-            return Err(MutationError::PortConflict(new.port, other.id.clone()));
+        if new.role == ModelRole::Target {
+            if let Some(other) = data.models.values().find(|m| {
+                m.role == ModelRole::Target && m.port == new.port && m.id != new.id
+            }) {
+                return Err(MutationError::PortConflict(new.port, other.id.clone()));
+            }
+        }
+        if let Some(ref did) = new.draft_model_id {
+            validate_draft_reference(&data.models, &new.id, did)?;
         }
         let existing = data.models.get_mut(&new.id)
             .ok_or_else(|| MutationError::NotFound(new.id.clone()))?;
@@ -224,6 +242,23 @@ impl Orchestrator {
         let pid = {
             let data = self.data.lock().await;
             let m = data.models.get(id).ok_or_else(|| MutationError::NotFound(id.into()))?;
+            // Refuse to delete a draft that any target references —
+            // otherwise the target would try to spawn with a stale
+            // draft_model_id pointing at nothing.
+            if m.role == ModelRole::Draft {
+                let referrers: Vec<String> = data
+                    .models
+                    .values()
+                    .filter(|other| other.draft_model_id.as_deref() == Some(id))
+                    .map(|other| other.id.clone())
+                    .collect();
+                if !referrers.is_empty() {
+                    return Err(MutationError::DraftInUse {
+                        id: id.into(),
+                        targets: referrers,
+                    });
+                }
+            }
             m.pid
         };
         // Try a graceful stop first so the child dies cleanly.
@@ -346,14 +381,19 @@ impl Orchestrator {
                 data.gpus = gpus.clone();
             }
 
-            // Snapshot the model + resolve preset → binary path.
-            let mut model = {
+            // Snapshot the model + resolve preset → binary path + draft.
+            let (mut model, draft) = {
                 let data = self.data.lock().await;
                 let mut m = data
                     .models
                     .get(id)
                     .cloned()
                     .ok_or_else(|| LoadError::ModelNotFound(id.into()))?;
+                // Drafts never spawn on their own. Route the caller to
+                // the target that should be loaded instead.
+                if m.role == ModelRole::Draft {
+                    return Err(LoadError::CannotLoadDraft(id.into()));
+                }
                 if let Some(ref preset_id) = m.binary_preset {
                     match data.presets.get(preset_id) {
                         Some(p) => m.binary = p.binary.clone(),
@@ -362,7 +402,27 @@ impl Orchestrator {
                         }
                     }
                 }
-                m
+                // Resolve the draft reference now so any missing/
+                // role-mismatched draft surfaces as a load-time error
+                // rather than a cryptic spawn failure.
+                let draft = if let Some(ref did) = m.draft_model_id {
+                    let d = data.models.get(did).cloned().ok_or_else(|| {
+                        LoadError::DraftNotFound {
+                            id: did.clone(),
+                            target: id.into(),
+                        }
+                    })?;
+                    if d.role != ModelRole::Draft {
+                        return Err(LoadError::DraftRoleMismatch {
+                            id: did.clone(),
+                            target: id.into(),
+                        });
+                    }
+                    Some(d)
+                } else {
+                    None
+                };
+                (m, draft)
             };
 
             if model.weights_format == WeightsFormat::Gguf {
@@ -382,6 +442,31 @@ impl Orchestrator {
                         model.estimated_vram = est.total_vram;
                     }
                     Err(e) => warn!(model = id, error = %e, "gguf parse failed; loading without estimate"),
+                }
+                // Fold the draft's VRAM (weights + KV cache at its own
+                // context, with its own KV quant) into the target's
+                // estimate. Admission, eviction, and allocation all key
+                // off this single number — without the fold, a 256k
+                // target + a 2B draft would slip through admission
+                // based on target-only VRAM and then OOM at spawn.
+                if let Some(ref d) = draft {
+                    let d_kv = KvPerElement::from_types(
+                        d.cache_type_k.unwrap_or(CacheType::F16),
+                        d.cache_type_v.unwrap_or(CacheType::F16),
+                    );
+                    match GgufInfo::read(&d.model_path) {
+                        Ok(info) => {
+                            let kv = info.kv_cache_bytes(d.context, d_kv);
+                            let est = VramEstimate::compute(info.file_size, kv);
+                            model.estimated_vram = model.estimated_vram
+                                .saturating_add(est.total_vram);
+                        }
+                        Err(e) => warn!(
+                            target = id, draft = d.id,
+                            error = %e,
+                            "draft gguf parse failed; loading without draft VRAM estimate",
+                        ),
+                    }
                 }
                 let mut data = self.data.lock().await;
                 if let Some(m) = data.models.get_mut(id) {
@@ -429,7 +514,7 @@ impl Orchestrator {
                 .process_manager
                 .lock()
                 .await
-                .spawn_child(&model)
+                .spawn_child(&model, draft.as_ref())
                 .map_err(LoadError::SpawnFailed)?;
             let pid = pending.pid;
             let port = pending.port;
@@ -565,6 +650,18 @@ pub enum LoadError {
     #[error("binary preset '{0}' not found — edit the model and pick an existing preset or a custom path")]
     PresetNotFound(String),
 
+    #[error(
+        "'{0}' is a draft model — drafts don't spawn their own process. \
+         Load the target that references this draft instead."
+    )]
+    CannotLoadDraft(String),
+
+    #[error("target '{target}' references draft '{id}', but no model with that id exists")]
+    DraftNotFound { id: String, target: String },
+
+    #[error("target '{target}' references '{id}' as a draft, but that model's role is not 'draft'")]
+    DraftRoleMismatch { id: String, target: String },
+
     #[error("spawn failed: {0}")]
     SpawnFailed(SpawnError),
 }
@@ -585,6 +682,42 @@ pub enum MutationError {
 
     #[error("port {0} is already in use by model '{1}'")]
     PortConflict(u16, String),
+
+    #[error("invalid config: {0}")]
+    InvalidConfig(#[from] ConfigError),
+
+    #[error("cannot delete draft '{id}': referenced by {}", targets.join(", "))]
+    DraftInUse { id: String, targets: Vec<String> },
+}
+
+/// Validate a target's `draft_model_id` against the current model table.
+///
+/// Checked conditions:
+/// - The referenced id exists in the table.
+/// - That model has `role = Draft`.
+/// - A target isn't referencing itself.
+fn validate_draft_reference(
+    models: &HashMap<String, ModelConfig>,
+    self_id: &str,
+    draft_id: &str,
+) -> Result<(), MutationError> {
+    if draft_id == self_id {
+        return Err(MutationError::InvalidConfig(ConfigError::DraftSelfReference));
+    }
+    let Some(referenced) = models.get(draft_id) else {
+        return Err(MutationError::InvalidConfig(ConfigError::DraftNotFound {
+            id: draft_id.to_string(),
+        }));
+    };
+    if referenced.role != ModelRole::Draft {
+        return Err(MutationError::InvalidConfig(
+            ConfigError::ReferencedModelNotADraft {
+                id: draft_id.to_string(),
+                role: "target",
+            },
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -814,6 +947,132 @@ mod tests {
             other => panic!("expected Error, got {:?}", other),
         }
         assert_eq!(after.pid, None);
+    }
+
+    // ----- Speculative decoding -----
+
+    fn draft(id: &str) -> ModelConfig {
+        ModelConfig {
+            id: id.into(),
+            name: id.into(),
+            role: ModelRole::Draft,
+            model_path: PathBuf::from("/tmp/draft.gguf"),
+            context: 16384,
+            device: Some("Vulkan1".into()),
+            ..ModelConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn add_draft_and_target_referencing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(draft("d")).await.unwrap();
+        let mut t = model("t", 9001);
+        t.draft_model_id = Some("d".into());
+        t.draft_max = Some(16);
+        t.ctx_checkpoints = Some(4);
+        o.add_model(t).await.unwrap();
+        assert_eq!(o.list_models().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn add_target_referencing_nonexistent_draft_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        let mut t = model("t", 9001);
+        t.draft_model_id = Some("missing".into());
+        let err = o.add_model(t).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MutationError::InvalidConfig(ConfigError::DraftNotFound { .. }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_target_referencing_another_target_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("other", 9002)).await.unwrap();
+        let mut t = model("t", 9001);
+        t.draft_model_id = Some("other".into());
+        let err = o.add_model(t).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MutationError::InvalidConfig(ConfigError::ReferencedModelNotADraft { .. }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn target_cannot_reference_itself_as_draft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        let mut t = model("t", 9001);
+        t.draft_model_id = Some("t".into());
+        let err = o.add_model(t).await.unwrap_err();
+        assert!(matches!(
+            err,
+            MutationError::InvalidConfig(ConfigError::DraftSelfReference),
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_draft_in_use_errors_with_referrers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(draft("d")).await.unwrap();
+        let mut t1 = model("t1", 9001);
+        t1.draft_model_id = Some("d".into());
+        let mut t2 = model("t2", 9002);
+        t2.draft_model_id = Some("d".into());
+        o.add_model(t1).await.unwrap();
+        o.add_model(t2).await.unwrap();
+
+        let err = o.remove_model("d").await.unwrap_err();
+        match err {
+            MutationError::DraftInUse { id, mut targets } => {
+                assert_eq!(id, "d");
+                targets.sort();
+                assert_eq!(targets, vec!["t1".to_string(), "t2".to_string()]);
+            }
+            other => panic!("expected DraftInUse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_draft_after_unreferencing_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(draft("d")).await.unwrap();
+        let mut t = model("t", 9001);
+        t.draft_model_id = Some("d".into());
+        o.add_model(t.clone()).await.unwrap();
+
+        // Clear the reference, then delete.
+        t.draft_model_id = None;
+        o.update_model(t).await.unwrap();
+        assert!(o.remove_model("d").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn two_drafts_do_not_collide_on_port_zero() {
+        // Drafts don't bind a port, so their `port` field is a
+        // serialized zero. The collision check used to flag every new
+        // draft as clashing with every existing one; now it excludes
+        // non-targets.
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(draft("d1")).await.unwrap();
+        assert!(o.add_model(draft("d2")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_rejects_draft_with_helpful_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(draft("d")).await.unwrap();
+        let err = o.clone().ensure_loaded("d").await.unwrap_err();
+        assert!(matches!(err, LoadError::CannotLoadDraft(_)));
     }
 
     #[tokio::test]

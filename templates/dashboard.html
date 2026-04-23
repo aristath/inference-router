@@ -169,6 +169,21 @@
                 </div>
 
                 <div class="form-group">
+                    <label>Role</label>
+                    <div style="display: flex; gap: 1.5rem;">
+                        <label style="display: flex; align-items: center; gap: 0.5rem; font-weight: normal;">
+                            <input type="radio" name="role" value="target" checked>
+                            Target — a normal model that serves requests
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 0.5rem; font-weight: normal;">
+                            <input type="radio" name="role" value="draft">
+                            Draft — used only as a speculative-decoding draft for a target
+                        </label>
+                    </div>
+                    <small class="field-help">Drafts never spawn their own process, never expose a port, and never appear in <code>/v1/models</code>. A target can reference one draft via the dropdown at the bottom of this form.</small>
+                </div>
+
+                <div class="form-group">
                     <label>Weights format</label>
                     <div style="display: flex; gap: 1.5rem;">
                         <label style="display: flex; align-items: center; gap: 0.5rem; font-weight: normal;">
@@ -203,10 +218,16 @@
                     <small class="field-help">For GGUF, the absolute path to the <code>.gguf</code> file. For Safetensors, the directory that contains the model files.</small>
                 </div>
 
-                <div class="form-group">
+                <div class="form-group" id="group-port">
                     <label for="port">Port</label>
                     <input type="number" id="port" name="port" min="1" max="65535" required style="max-width: 12rem;">
                     <small class="field-help">Local port the inference server will listen on. Each loaded model needs its own; the proxy routes incoming OpenAI requests to the right port. Pick something free in 9000–9999 if unsure.</small>
+                </div>
+
+                <div class="form-group" id="group-device">
+                    <label for="device">Draft device (<code>-devd</code>)</label>
+                    <input type="text" id="device" name="device" placeholder="e.g. Vulkan1 or Vulkan0,Vulkan2">
+                    <small class="field-help">Which GPU(s) the draft model runs on. Passed verbatim as <code>-devd</code>. For single-target + draft on 3× R9700, isolating the draft to a dedicated GPU (e.g. <code>Vulkan1</code>) avoids VRAM contention with the target's layer-split. Leave blank to let llama.cpp pick.</small>
                 </div>
 
                 <div class="form-group">
@@ -422,6 +443,52 @@
                     </div>
                 </div>
 
+                <div id="spec-decode-section" class="card" style="padding: 1rem; margin-bottom: 0;">
+                    <h2 style="margin-bottom: 0.25rem;">Speculative decoding</h2>
+                    <small class="field-help" style="margin-bottom: 0.75rem;">Pick a <strong>draft</strong>-role model to run alongside this target. The draft's own config (GGUF path, context, cache quant, GPU placement) comes from its model entry; the knobs below tune <em>how hard</em> this target drives it.</small>
+
+                    <div class="form-group" style="margin-top: 0.75rem;">
+                        <label for="draft_model_id">Draft model</label>
+                        <select id="draft_model_id" name="draft_model_id">
+                            <option value="">none (standard decoding)</option>
+                            <!-- Populated by refreshDraftSelect() at modal open. -->
+                        </select>
+                        <small class="field-help">Only models with role=Draft appear here. Same-family drafts (e.g. Qwen3.5-2B for Qwen3.5-27B) get high acceptance rates; cross-family drafts don't.</small>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="draft_max">Draft max (<code>--draft-max</code>)</label>
+                            <input type="number" id="draft_max" name="draft_max" min="0" placeholder="16 (default)">
+                            <small class="field-help">How many tokens the draft generates per speculative step. Higher = bigger potential speedup, but more wasted work on rejection. llama.cpp default <strong>16</strong>. Leave blank for default.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="draft_min">Draft min (<code>--draft-min</code>)</label>
+                            <input type="number" id="draft_min" name="draft_min" min="0" placeholder="0 (default)">
+                            <small class="field-help">Minimum draft length before submitting to the target — short drafts are submitted immediately when low. Leave blank for default.</small>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="draft_p_min">Draft p-min (<code>--draft-p-min</code>)</label>
+                            <input type="number" id="draft_p_min" name="draft_p_min" min="0" max="1" step="0.01" placeholder="0.75 (default)">
+                            <small class="field-help">Probability floor for the draft's greedy sampling. Drafts below this confidence are truncated. Higher = safer drafts, lower speedup.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="ctx_checkpoints">Context checkpoints (<code>--ctx-checkpoints</code>)</label>
+                            <input type="number" id="ctx_checkpoints" name="ctx_checkpoints" min="0" placeholder="0 (off)">
+                            <small class="field-help">Number of snapshot slots for rollback on partial draft rejection. <strong>Required &gt; 0 for hybrid-recurrent targets</strong> (Qwen3.5 dense) so partial-accept rollback uses snapshot/restore instead of <code>seq_rm</code>. Typical <strong>4</strong>.</small>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="checkpoint_every_n_tokens">Checkpoint cadence (<code>--checkpoint-every-n-tokens</code>)</label>
+                        <input type="number" id="checkpoint_every_n_tokens" name="checkpoint_every_n_tokens" min="-1" placeholder="-1 (default)">
+                        <small class="field-help">How often to checkpoint during prefill. <strong>-1</strong> for default, <strong>0</strong> disables. Leave blank for default.</small>
+                    </div>
+                </div>
+
                 <div class="form-group">
                     <label for="extra_args">Extra arguments (one per line)</label>
                     <textarea id="extra_args" name="extra_args" rows="5" placeholder="--flash-attn&#10;-ngl&#10;99"></textarea>
@@ -521,6 +588,7 @@
 // Defaults for the "Add model" state.
 const MODEL_DEFAULTS = {
     id: '', name: '',
+    role: 'target',
     weights_format: 'gguf',
     binary: '', model_path: '',
     port: 9001, context: 4096,
@@ -532,14 +600,74 @@ const MODEL_DEFAULTS = {
     threads: null, cache_ram_mib: null,
     reasoning_format: null, reasoning_budget: null,
     chat_template_kwargs: null,
+    device: null,
+    draft_model_id: null,
+    draft_max: null, draft_min: null, draft_p_min: null,
+    ctx_checkpoints: null, checkpoint_every_n_tokens: null,
     extra_args: [],
 };
 
+// Field IDs that are target-only. Drafts hide these because they're
+// either nonsensical (sampling — the target samples, not the draft) or
+// inactive (no port, no standalone binary, no split-mode).
+const TARGET_ONLY_FIELD_IDS = [
+    'group-port',
+    'spec-decode-section',
+];
+// Draft-only field groups (hidden when role=target).
+const DRAFT_ONLY_FIELD_IDS = [
+    'group-device',
+];
+
 async function openAddModelModal() {
     await refreshPresetSelect();
+    await refreshDraftSelect();
     populateModelForm(MODEL_DEFAULTS, 'add');
     openModal('model-modal');
     setTimeout(() => document.getElementById('id').focus(), 50);
+}
+
+// Pull the current list of role=Draft models and rebuild the target
+// form's draft dropdown. Called on modal open so the user always sees
+// the latest.
+async function refreshDraftSelect() {
+    const sel = document.getElementById('draft_model_id');
+    if (!sel) return;
+    try {
+        const r = await fetch('/api/models');
+        const list = r.ok ? await r.json() : [];
+        const current = sel.value;
+        sel.innerHTML = '';
+        const none = document.createElement('option');
+        none.value = '';
+        none.textContent = 'none (standard decoding)';
+        sel.appendChild(none);
+        list
+            .filter(m => (m.role || 'target') === 'draft')
+            .forEach(m => {
+                const o = document.createElement('option');
+                o.value = m.id;
+                o.textContent = m.name ? `${m.name} (${m.id})` : m.id;
+                sel.appendChild(o);
+            });
+        if ([...sel.options].some(o => o.value === current)) sel.value = current;
+    } catch {}
+}
+
+// Toggle visibility of role-scoped form groups. Runs when role changes
+// and once after populateModelForm so edit-mode reflects the model's
+// actual role.
+function applyRoleVisibility() {
+    const r = document.querySelector('input[name="role"]:checked');
+    const role = r ? r.value : 'target';
+    TARGET_ONLY_FIELD_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = role === 'target' ? '' : 'none';
+    });
+    DRAFT_ONLY_FIELD_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = role === 'draft' ? '' : 'none';
+    });
 }
 
 // Fetch the current presets and rebuild the select in the model form.
@@ -590,11 +718,24 @@ function applyPresetSelection() {
 async function editModel(id) {
     try {
         await refreshPresetSelect();
+        await refreshDraftSelect();
         const r = await fetch('/api/models');
         if (!r.ok) throw new Error(r.statusText);
         const models = await r.json();
         const m = models.find(x => x.id === id);
         if (!m) { alert(`Model ${id} not found.`); return; }
+        // If the target's currently-selected draft_model_id no longer
+        // exists in the list (e.g. the draft was deleted), keep the
+        // stored value visible as a disabled option so the user sees
+        // what needs fixing instead of silently losing it.
+        const sel = document.getElementById('draft_model_id');
+        if (sel && m.draft_model_id && !models.some(x => x.id === m.draft_model_id && x.role === 'draft')) {
+            const o = document.createElement('option');
+            o.value = m.draft_model_id;
+            o.textContent = `${m.draft_model_id} (missing!)`;
+            o.disabled = false;
+            sel.appendChild(o);
+        }
         populateModelForm(m, 'edit');
         openModal('model-modal');
     } catch (e) {
@@ -613,6 +754,7 @@ function populateModelForm(m, mode) {
     f.weights_format.value = m.weights_format || 'gguf';
     // radio groups need per-input checking
     [...f.querySelectorAll('input[name="weights_format"]')].forEach(r => r.checked = (r.value === (m.weights_format || 'gguf')));
+    [...f.querySelectorAll('input[name="role"]')].forEach(r => r.checked = (r.value === (m.role || 'target')));
     // Preset selection: pick the matching option if the model references a
     // preset that still exists; otherwise fall back to Custom path.
     const presetSel = document.getElementById('binary_preset');
@@ -652,6 +794,17 @@ function populateModelForm(m, mode) {
     f.reasoning_budget.value = m.reasoning_budget == null ? '' : String(m.reasoning_budget);
     f.chat_template_kwargs.value = m.chat_template_kwargs ?? '';
 
+    // Spec-decode + draft role fields.
+    f.device.value = m.device ?? '';
+    f.draft_model_id.value = m.draft_model_id ?? '';
+    f.draft_max.value = m.draft_max == null ? '' : String(m.draft_max);
+    f.draft_min.value = m.draft_min == null ? '' : String(m.draft_min);
+    f.draft_p_min.value = m.draft_p_min == null ? '' : String(m.draft_p_min);
+    f.ctx_checkpoints.value = m.ctx_checkpoints == null ? '' : String(m.ctx_checkpoints);
+    f.checkpoint_every_n_tokens.value =
+        m.checkpoint_every_n_tokens == null ? '' : String(m.checkpoint_every_n_tokens);
+
+    applyRoleVisibility();
     f.extra_args.value = (m.extra_args || []).join('\n');
 
     // Reset context slider state — the GGUF info fetch will reapply if it
@@ -771,6 +924,16 @@ async function deleteModel(id, name) {
     }
     radios.forEach(r => r.addEventListener('change', apply));
     apply();
+})();
+
+// ----- Role toggle -----
+// Changing role flips which form sections apply. Run once at load so the
+// initial state matches the default-checked radio (target).
+(function bindRoleToggle() {
+    document.querySelectorAll('input[name="role"]').forEach(r => {
+        r.addEventListener('change', applyRoleVisibility);
+    });
+    applyRoleVisibility();
 })();
 
 // ----- Live GGUF metadata + VRAM preview -----
@@ -1105,16 +1268,26 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         const s = (v || '').toString().trim();
         return s ? s : null;
     };
+    const toOptFloat = (v) => {
+        const s = (v || '').toString().trim();
+        if (!s) return null;
+        const n = parseFloat(s);
+        return Number.isNaN(n) ? null : n;
+    };
+    const role = (document.querySelector('input[name="role"]:checked') || {}).value || 'target';
     const presetSel = document.getElementById('binary_preset');
     const presetChoice = presetSel ? presetSel.value : '__custom__';
     const body = {
         id: f.id.value.trim(),
         name: f.name.value.trim(),
+        role,
         weights_format: f.weights_format.value,
         binary_preset: presetChoice === '__custom__' ? null : presetChoice,
         binary: presetChoice === '__custom__' ? f.binary.value.trim() : '',
         model_path: f.model_path.value.trim(),
-        port: parseInt(f.port.value, 10),
+        // Drafts don't bind a port. Send 0 so the server-side validator
+        // sees a harmless value (targets still require a real port).
+        port: role === 'draft' ? 0 : parseInt(f.port.value, 10),
         context: parseInt(f.context.value, 10),
         temperature: parseFloat(f.temperature.value),
         top_p: parseFloat(f.top_p.value),
@@ -1126,17 +1299,35 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         n_gpu_layers: toOptInt(f.n_gpu_layers.value),
         mlock: f.mlock.checked,
         no_mmap: f.no_mmap.checked,
-        parallel_slots: toOptInt(f.parallel_slots.value),
+        // `parallel_slots` controls concurrent-request slots on the
+        // target's server. Drafts don't serve, so the validator
+        // rejects it — scrub when submitting a draft.
+        parallel_slots: role === 'draft' ? null : toOptInt(f.parallel_slots.value),
         cache_type_k: toOptStr(f.cache_type_k.value),
         cache_type_v: toOptStr(f.cache_type_v.value),
-        split_mode: toOptStr(f.split_mode.value),
-        main_gpu: toOptInt(f.main_gpu.value),
-        tensor_split: toOptStr(f.tensor_split.value),
+        // Target-only structured fields: drop when saving a draft so
+        // the server-side validator doesn't reject them. The UI already
+        // hid these inputs, but they still carry values from populate().
+        split_mode: role === 'draft' ? null : toOptStr(f.split_mode.value),
+        main_gpu: role === 'draft' ? null : toOptInt(f.main_gpu.value),
+        tensor_split: role === 'draft' ? null : toOptStr(f.tensor_split.value),
         threads: toOptInt(f.threads.value),
         cache_ram_mib: toOptInt(f.cache_ram_mib.value),
-        reasoning_format: toOptStr(f.reasoning_format.value),
-        reasoning_budget: toOptInt(f.reasoning_budget.value),
-        chat_template_kwargs: toOptStr(f.chat_template_kwargs.value),
+        reasoning_format: role === 'draft' ? null : toOptStr(f.reasoning_format.value),
+        reasoning_budget: role === 'draft' ? null : toOptInt(f.reasoning_budget.value),
+        chat_template_kwargs: role === 'draft' ? null : toOptStr(f.chat_template_kwargs.value),
+        // Draft-only: -devd device list.
+        device: role === 'draft' ? toOptStr(f.device.value) : null,
+        // Target-only: spec-decode reference + policy knobs. Empty
+        // draft_model_id means spec-decode off (policy fields are
+        // harmless in that case — llama-server ignores them).
+        draft_model_id: role === 'target' ? toOptStr(f.draft_model_id.value) : null,
+        draft_max: role === 'target' ? toOptInt(f.draft_max.value) : null,
+        draft_min: role === 'target' ? toOptInt(f.draft_min.value) : null,
+        draft_p_min: role === 'target' ? toOptFloat(f.draft_p_min.value) : null,
+        ctx_checkpoints: role === 'target' ? toOptInt(f.ctx_checkpoints.value) : null,
+        checkpoint_every_n_tokens:
+            role === 'target' ? toOptInt(f.checkpoint_every_n_tokens.value) : null,
         extra_args: extra,
     };
     // Validate chat_template_kwargs is parseable JSON if supplied.
