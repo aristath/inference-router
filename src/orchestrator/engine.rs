@@ -371,6 +371,10 @@ impl Orchestrator {
     /// a 180-second health poll can't block a second model from starting
     /// on a different GPU.
     async fn do_load(&self, id: &str) -> Result<u16, LoadError> {
+        // Accumulated weight file sizes (target + draft if present). Set
+        // inside the admission block during GGUF reads; used after the health
+        // check to recompute estimated_vram from the measured KV bytes.
+        let mut weight_file_size: u64 = 0;
         let (mut pending, pid, port) = {
             let _admit = self.admission.lock().await;
 
@@ -437,6 +441,7 @@ impl Orchestrator {
                 );
                 match GgufInfo::read(&model.model_path) {
                     Ok(info) => {
+                        weight_file_size = info.file_size;
                         let kv = info.kv_cache_bytes(model.context, kv_bytes);
                         let est = VramEstimate::compute(info.file_size, kv);
                         model.estimated_vram = est.total_vram;
@@ -456,6 +461,7 @@ impl Orchestrator {
                     );
                     match GgufInfo::read(&d.model_path) {
                         Ok(info) => {
+                            weight_file_size += info.file_size;
                             let kv = info.kv_cache_bytes(d.context, d_kv);
                             let est = VramEstimate::compute(info.file_size, kv);
                             model.estimated_vram = model.estimated_vram
@@ -525,13 +531,27 @@ impl Orchestrator {
         // to report healthy (up to 180 seconds).
 
         match pending.wait_for_health(std::time::Duration::from_secs(180)).await {
-            Ok(()) => {
+            Ok(kv_bytes) => {
                 self.process_manager.lock().await.register(pending);
                 let mut data = self.data.lock().await;
                 if let Some(m) = data.models.get_mut(id) {
                     m.state = ModelState::Running;
                     m.pid = Some(pid);
                     m.last_used = Some(unix_now());
+                    // Replace the pre-spawn formula estimate with the value
+                    // measured directly from llama.cpp's startup logs. This
+                    // accounts for SWA layers, recurrent state, and any other
+                    // architecture-specific allocation our formula can't see.
+                    if kv_bytes > 0 && weight_file_size > 0 {
+                        m.estimated_vram =
+                            ((weight_file_size + kv_bytes) as f64 * 1.1) as u64;
+                        info!(
+                            model = id,
+                            kv_mib = kv_bytes / 1024 / 1024,
+                            total_mib = m.estimated_vram / 1024 / 1024,
+                            "updated VRAM estimate from llama.cpp startup logs",
+                        );
+                    }
                 }
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "inference server ready");

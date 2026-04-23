@@ -32,6 +32,10 @@ pub struct PendingChild {
     pub port: u16,
     model_id: String,
     child: tokio::process::Child,
+    /// Receives the sum of all measured KV/RS cache bytes parsed from
+    /// the child's stderr during startup. Zero if the lines were never
+    /// seen (Safetensors servers, crash before init, etc.).
+    kv_bytes_rx: tokio::sync::oneshot::Receiver<u64>,
 }
 
 impl ProcessManager {
@@ -59,21 +63,39 @@ impl ProcessManager {
             "spawning inference server",
         );
 
-        // `kill_on_drop(true)` is the safety net for orchestrator shutdown:
-        // when the Child is dropped (process_manager → running → RunningChild)
-        // tokio sends SIGKILL synchronously. Inherit stdio so llama-server's
-        // own logs (errors on bad args, OOM, missing files) land next to ours.
-        let child = tokio::process::Command::new(&model.binary)
+        // `kill_on_drop(true)` is the safety net for orchestrator shutdown.
+        // stderr is piped so we can parse the KV-cache size from llama.cpp's
+        // startup output; a background task drains it and forwards each line
+        // to stderr so the user experience is unchanged.
+        let mut child = tokio::process::Command::new(&model.binary)
             .args(&args)
             .process_group(0)
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| SpawnError::SpawnFailed(e, model.binary.clone()))?;
 
         let pid = child.id().expect("spawned child has no PID") as i32;
-        Ok(PendingChild { pid, port: model.port, model_id: model.id.clone(), child })
+
+        // Drain stderr: forward every line to our stderr (preserving the
+        // existing log experience), and sum up all KV/RS cache size lines.
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let (kv_tx, kv_rx) = tokio::sync::oneshot::channel::<u64>();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            let mut total_kv_bytes = 0u64;
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(mib) = parse_kv_size_mib(&line) {
+                    total_kv_bytes += (mib * 1024.0 * 1024.0) as u64;
+                }
+                eprintln!("{line}");
+            }
+            let _ = kv_tx.send(total_kv_bytes);
+        });
+
+        Ok(PendingChild { pid, port: model.port, model_id: model.id.clone(), child, kv_bytes_rx: kv_rx })
     }
 
     /// Install a healthy child into the running table so its `kill_on_drop`
@@ -125,10 +147,23 @@ impl ProcessManager {
 
 impl PendingChild {
     /// Waits until `/health` returns 200 on the child's port, or until the
-    /// child exits, whichever comes first. `&mut self` so we can observe
-    /// early exits via `try_wait`.
-    pub async fn wait_for_health(&mut self, timeout: Duration) -> Result<(), HealthCheckError> {
-        wait_for_health_or_exit(&mut self.child, self.port, timeout).await
+    /// child exits, whichever comes first. Returns the total KV+RS cache
+    /// bytes parsed from llama.cpp's startup logs (0 if not seen — e.g.
+    /// Safetensors backends or a crash before context init).
+    pub async fn wait_for_health(&mut self, timeout: Duration) -> Result<u64, HealthCheckError> {
+        wait_for_health_or_exit(&mut self.child, self.port, timeout).await?;
+        // The KV size lines appear during context init, well before the
+        // health endpoint becomes available. Give the stderr reader a brief
+        // window to flush any remaining buffered lines before we read.
+        let kv_bytes = tokio::time::timeout(
+            Duration::from_millis(200),
+            &mut self.kv_bytes_rx,
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or(0);
+        Ok(kv_bytes)
     }
 }
 
@@ -350,6 +385,21 @@ async fn wait_for_health_or_exit(
     }
 }
 
+/// Parses the MiB value from llama.cpp's KV/RS cache summary log lines:
+///
+///   `llama_kv_cache_init: size = 1234.56 MiB ( 32768 cells, 64 layers, …)`
+///   `llama_memory_recurrent_init: size =   56.78 MiB (  8192 cells, …)`
+///
+/// Returns `None` for unrelated lines. The `cells,` guard prevents false
+/// matches on quantisation progress lines which also contain "size = X MiB"
+/// but never have "cells,".
+fn parse_kv_size_mib(line: &str) -> Option<f64> {
+    let after = line.split("size =").nth(1)?.trim_start();
+    let mib_pos = after.find(" MiB")?;
+    let mib: f64 = after[..mib_pos].trim().parse().ok()?;
+    after[mib_pos..].contains("cells,").then_some(mib)
+}
+
 fn is_process_alive(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
@@ -383,6 +433,53 @@ pub enum HealthCheckError {
 mod tests {
     use super::*;
     use crate::config::{CacheType, ReasoningFormat};
+
+    // ----- parse_kv_size_mib -----
+
+    #[test]
+    fn parses_standard_kv_cache_line() {
+        // Typical output from llama_kv_cache_init for a non-SWA model.
+        let line = "llama_kv_cache_init: size = 1024.00 MiB ( 32768 cells, 64 layers, 2/2 seqs), K (q8_0): 512.00 MiB, V (q8_0): 512.00 MiB";
+        let mib = parse_kv_size_mib(line).unwrap();
+        assert!((mib - 1024.0).abs() < 0.01, "got {mib}");
+    }
+
+    #[test]
+    fn parses_recurrent_state_line() {
+        // llama_memory_recurrent_init uses "RS buffer size" and the same
+        // summary format — should be picked up and summed with KV cache.
+        let line = "llama_memory_recurrent_init: size =   56.25 MiB (  8192 cells, 28 layers, 2 seqs), R (f16):   28.12 MiB, S (f16):   28.12 MiB";
+        let mib = parse_kv_size_mib(line).unwrap();
+        assert!((mib - 56.25).abs() < 0.01, "got {mib}");
+    }
+
+    #[test]
+    fn parses_swa_kv_cache_line() {
+        // Hybrid models (e.g. Qwen3.6) emit separate lines for the
+        // full-attention and sliding-window KV caches. Both must match.
+        let line = "llama_kv_cache_init: size =  128.50 MiB (  4096 cells, 32 layers, 2/2 seqs), K (q8_0):  64.25 MiB, V (q8_0):  64.25 MiB";
+        assert!(parse_kv_size_mib(line).is_some());
+    }
+
+    #[test]
+    fn ignores_quant_progress_lines() {
+        // llama-quantize logs "size = X MiB -> Y MiB" with no "cells," —
+        // must not be mistaken for a KV cache line.
+        let line = "[ 100/ 291]          blk.0.attn_k.weight - [ 4096,  4096,    1,    1], type =    q8_0, size =   16.00 MiB";
+        assert!(parse_kv_size_mib(line).is_none());
+    }
+
+    #[test]
+    fn ignores_model_buffer_lines() {
+        let line = "llm_load_tensors:      VULKAN0 model buffer size =  8192.00 MiB";
+        assert!(parse_kv_size_mib(line).is_none());
+    }
+
+    #[test]
+    fn ignores_unrelated_lines() {
+        assert!(parse_kv_size_mib("llama_new_context_with_model: n_ctx = 262144").is_none());
+        assert!(parse_kv_size_mib("srv  log: HTTP server is listening").is_none());
+    }
 
     fn gguf_model() -> ModelConfig {
         ModelConfig {
