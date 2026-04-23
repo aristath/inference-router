@@ -222,9 +222,14 @@ impl Orchestrator {
         let preserved_last_used = existing.last_used;
 
         let mut updated = new;
-        // If a running model's model_path or context changed, drop the estimate;
-        // it'll recompute on next load.
-        if existing.model_path != updated.model_path || existing.context != updated.context {
+        // Drop the estimate whenever anything that affects KV cache size or
+        // weight layout changes — it'll be remeasured on next load.
+        let kv_invalidated = existing.model_path != updated.model_path
+            || existing.context != updated.context
+            || existing.cache_type_k != updated.cache_type_k
+            || existing.cache_type_v != updated.cache_type_v
+            || existing.n_gpu_layers != updated.n_gpu_layers;
+        if kv_invalidated {
             updated.estimated_vram = 0;
         } else {
             updated.estimated_vram = existing.estimated_vram;
