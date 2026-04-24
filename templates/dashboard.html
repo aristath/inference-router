@@ -151,350 +151,353 @@
             <button type="button" class="modal-close" onclick="closeModal('model-modal')">×</button>
         </div>
         <div class="modal-body">
-            <form id="model-form">
-                <input type="hidden" id="form-mode" value="add">
 
+            <!-- STEP 1: File picker (shown only when adding) -->
+            <div id="modal-step1">
+                <p style="color:#94a3b8; margin-bottom:1.25rem; font-size:1rem;">
+                    Select a GGUF file. The router reads its metadata and pre-fills the form.
+                </p>
                 <div class="form-group">
-                    <label for="id">ID</label>
-                    <input type="text" id="id" name="id" required placeholder="e.g. qwen3-30b">
-                    <small class="field-help">A short unique handle. This is the <code>"model"</code> value clients send in API requests (e.g. <code>{"model":"qwen3-30b"}</code>). Can't be changed after the model is created.</small>
+                    <label for="step1-path">GGUF file path</label>
+                    <div style="display:flex; gap:0.5rem;">
+                        <input type="text" id="step1-path" autocomplete="off" spellcheck="false"
+                               placeholder="/models/model-Q4_K_M.gguf" style="flex:1;"
+                               onkeydown="if(event.key==='Enter'){event.preventDefault();step1Continue();}">
+                        <button type="button" class="btn btn-secondary" onclick="step1Browse()">Browse…</button>
+                    </div>
+                    <small id="step1-hint" class="field-help"></small>
                 </div>
-
-                <div class="form-group">
-                    <label for="name">Name</label>
-                    <input type="text" id="name" name="name" required placeholder="e.g. Qwen3 30B">
-                    <small class="field-help">A friendly label shown in the dashboard. Doesn't affect anything else.</small>
+                <div id="step1-browser" style="display:none; border:1px solid #334155; border-radius:6px; max-height:15rem; overflow-y:auto; margin-top:0.5rem; background:#0f172a;">
+                    <div style="padding:0.35rem 0.75rem; background:#1e293b; border-bottom:1px solid #334155; font-size:0.9rem; color:#64748b; display:flex; align-items:center; gap:0.5rem;">
+                        <button type="button" onclick="step1BrowserUp()" style="background:none;border:none;color:#94a3b8;cursor:pointer;padding:0 0.25rem;font-size:1rem;" title="Parent directory">↑</button>
+                        <span id="step1-browser-path" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+                    </div>
+                    <div id="step1-browser-list"></div>
                 </div>
-
-                <div class="form-group">
-                    <label>Role</label>
-                    <div style="display: flex; gap: 1.5rem;">
-                        <label style="display: flex; align-items: center; gap: 0.5rem; font-weight: normal;">
-                            <input type="radio" name="role" value="target" checked>
-                            Target — a normal model that serves requests
-                        </label>
-                        <label style="display: flex; align-items: center; gap: 0.5rem; font-weight: normal;">
-                            <input type="radio" name="role" value="draft">
-                            Draft — used only as a speculative-decoding draft for a target
-                        </label>
-                    </div>
-                    <small class="field-help">Drafts never spawn their own process, never expose a port, and never appear in <code>/v1/models</code>. A target can reference one draft via the dropdown at the bottom of this form.</small>
-                </div>
-
-                <div class="form-group">
-                    <label>Weights format</label>
-                    <div style="display: flex; gap: 1.5rem;">
-                        <label style="display: flex; align-items: center; gap: 0.5rem; font-weight: normal;">
-                            <input type="radio" name="weights_format" value="gguf" checked>
-                            GGUF (llama.cpp)
-                        </label>
-                        <label style="display: flex; align-items: center; gap: 0.5rem; font-weight: normal;">
-                            <input type="radio" name="weights_format" value="safetensors">
-                            Safetensors (vLLM)
-                        </label>
-                    </div>
-                    <small class="field-help">The file layout your model weights are in. GGUF is the single-file quantized format llama.cpp uses; Safetensors is the multi-file format Hugging Face / vLLM use. Pick the one that matches what you downloaded.</small>
-                </div>
-
-                <div class="form-group">
-                    <label for="binary_preset">Binary</label>
-                    <select id="binary_preset" name="binary_preset">
-                        <option value="__custom__">Custom path…</option>
-                        <!-- Preset options injected by JS at modal-open time. -->
-                    </select>
-                    <small class="field-help">Pick a named binary from <strong>Settings → Backends</strong>, or choose <em>Custom path</em> to set a one-off path for this model.</small>
-                </div>
-                <div class="form-group" id="binary-custom-group">
-                    <label for="binary">Binary path</label>
-                    <input type="text" id="binary" name="binary" data-path-field placeholder="/home/you/llama.cpp/build-vulkan/bin/llama-server">
-                    <small class="field-help">Absolute path to the inference server program — your <code>llama-server</code> binary for GGUF, or your <code>vllm</code> binary for Safetensors.</small>
-                </div>
-
-                <div class="form-group">
-                    <label for="model_path">Model path</label>
-                    <input type="text" id="model_path" name="model_path" data-path-field required placeholder="/models/qwen3-30b.gguf">
-                    <small class="field-help">For GGUF, the absolute path to the <code>.gguf</code> file. For Safetensors, the directory that contains the model files.</small>
-                </div>
-
-                <div class="form-group" id="group-device">
-                    <label for="device">Draft device (<code>-devd</code>)</label>
-                    <input type="text" id="device" name="device" placeholder="e.g. Vulkan1 or Vulkan0,Vulkan2">
-                    <small class="field-help">Which GPU(s) the draft model runs on. Passed verbatim as <code>-devd</code>. For single-target + draft on 3× R9700, isolating the draft to a dedicated GPU (e.g. <code>Vulkan1</code>) avoids VRAM contention with the target's layer-split. Leave blank to let llama.cpp pick.</small>
-                </div>
-
-                <div class="form-group">
-                    <label for="context">
-                        Context
-                        <span id="context-model-max" style="color: #94a3b8; font-weight: normal; font-size: 1rem; margin-left: 0.5rem;"></span>
-                    </label>
-                    <input type="number" id="context" name="context" min="0" required>
-                    <input type="range" id="context-slider" min="0" max="131072" step="1024" style="display: none; margin-top: 0.5rem;">
-                    <div id="vram-readout" style="display: none; margin-top: 0.5rem; font-size: 1rem; color: #38bdf8;"></div>
-                    <small id="context-hint" class="field-help">Enter a model path to get a VRAM estimate and slider.</small>
-                    <small class="field-help">How many tokens (prompt + reply combined) the model can keep in mind for a single conversation. Bigger = remembers more, but uses dramatically more VRAM. Roughly 1 token ≈ ¾ of an English word.</small>
-                </div>
-
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="temperature">Temperature</label>
-                        <div class="slider-container">
-                            <input type="range" id="temperature-slider" min="0" max="2" step="0.01">
-                            <input type="number" id="temperature" name="temperature" step="0.01" min="0" max="2" class="slider-number">
-                        </div>
-                        <small class="field-help">How adventurous the model is when picking the next word. <strong>0</strong> = always picks the single most likely word (deterministic, repeatable). <strong>0.7</strong> = balanced. <strong>1.5+</strong> = wild and creative, sometimes incoherent. Use low values for code and facts, higher for brainstorming and fiction.</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="top_p">Top P</label>
-                        <div class="slider-container">
-                            <input type="range" id="top_p-slider" min="0" max="1" step="0.01">
-                            <input type="number" id="top_p" name="top_p" step="0.01" min="0" max="1" class="slider-number">
-                        </div>
-                        <small class="field-help">"Nucleus sampling." Only consider next-word candidates from the smallest group whose probabilities add up to this fraction. <strong>0.95</strong> is the common default — ignore the bottom 5% of unlikely guesses. <strong>1.0</strong> disables the filter.</small>
-                    </div>
-                </div>
-
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="top_k">Top K</label>
-                        <div class="slider-container">
-                            <input type="range" id="top_k-slider" min="0" max="200" step="1">
-                            <input type="number" id="top_k" name="top_k" min="0" class="slider-number">
-                        </div>
-                        <small class="field-help">Only consider the K most likely next words at each step. <strong>40</strong> is a common default — narrow enough to stay on-topic, wide enough to feel natural. Lower (e.g. 20) = more focused; higher (e.g. 100) = more variety. <strong>0</strong> disables the filter.</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="min_p">Min P</label>
-                        <div class="slider-container">
-                            <input type="range" id="min_p-slider" min="0" max="1" step="0.01">
-                            <input type="number" id="min_p" name="min_p" step="0.01" min="0" max="1" class="slider-number">
-                        </div>
-                        <small class="field-help">Drop any candidate word that's less than this fraction as likely as the top candidate. <strong>0.05</strong> is a common quality floor — kills the obviously-wrong guesses. <strong>0</strong> disables the filter.</small>
-                    </div>
-                </div>
-
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="presence_penalty">Presence penalty</label>
-                        <div class="slider-container">
-                            <input type="range" id="presence_penalty-slider" min="-2" max="2" step="0.01">
-                            <input type="number" id="presence_penalty" name="presence_penalty" step="0.01" min="-2" max="2" class="slider-number">
-                        </div>
-                        <small class="field-help">Penalize any token that has already appeared at least once, regardless of how many times. llama.cpp default <strong>0.0</strong> (disabled). Positive values discourage re-use of already-seen words; useful to break repetition loops on some Qwen3 variants (commonly <strong>1.5</strong>).</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="repeat_penalty">Repeat penalty</label>
-                        <div class="slider-container">
-                            <input type="range" id="repeat_penalty-slider" min="0.5" max="2" step="0.01">
-                            <input type="number" id="repeat_penalty" name="repeat_penalty" step="0.01" min="0.5" max="2" class="slider-number">
-                        </div>
-                        <small class="field-help">Multiplicative penalty on repeated token sequences. llama.cpp default <strong>1.0</strong> (disabled). <strong>1.1</strong> is a mild nudge against loops; values &gt;1.2 start hurting quality.</small>
-                    </div>
-                </div>
-
-                <div id="llama-section" class="card" style="padding: 1rem; margin-bottom: 0;">
-                    <h2 style="margin-bottom: 0.25rem;">llama.cpp options</h2>
-                    <small class="field-help" style="margin-bottom: 0.75rem;">Backend flags for <code>llama-server</code>. Applied only when Weights format is GGUF. Extra arguments below override any of these (llama.cpp takes the last value for a repeated flag).</small>
-
-                    <div class="form-row" style="margin-top: 0.75rem;">
-                        <div class="form-group">
-                            <label style="display: flex; align-items: center; gap: 0.5rem;">
-                                <input type="checkbox" id="flash_attn" name="flash_attn">
-                                Flash attention
-                            </label>
-                            <small class="field-help">Faster attention with lower VRAM. Safe to enable on modern builds; a must for longer contexts.</small>
-                        </div>
-                        <div class="form-group">
-                            <label style="display: flex; align-items: center; gap: 0.5rem;">
-                                <input type="checkbox" id="mlock" name="mlock">
-                                Lock in RAM (mlock)
-                            </label>
-                            <small class="field-help">Pin the model in RAM so it can never be swapped out. Use it if your system swaps under pressure and inference stalls.</small>
-                        </div>
-                    </div>
-
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label style="display: flex; align-items: center; gap: 0.5rem;">
-                                <input type="checkbox" id="no_mmap" name="no_mmap">
-                                Disable mmap
-                            </label>
-                            <small class="field-help">Load the full model into RAM up front instead of memory-mapping it from disk. Slower to start; avoids page-cache churn on fast NVMe.</small>
-                        </div>
-                        <div class="form-group">
-                            <label for="parallel_slots">
-                                Parallel slots
-                                <span id="parallel_slots_display" style="color: #38bdf8; font-weight: normal; margin-left: 0.5rem;"></span>
-                            </label>
-                            <div class="slider-container">
-                                <input type="range" id="parallel_slots_slider" min="0" max="16" step="1" value="0">
-                                <input type="hidden" id="parallel_slots" name="parallel_slots" value="">
-                            </div>
-                            <small class="field-help">How many requests this model can handle concurrently. Each slot gets <code>context / N</code> tokens. <strong>0</strong> = leave at llama.cpp's default (usually 1). Useful &gt;1 for multi-agent workflows.</small>
-                        </div>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="n_gpu_layers">
-                            GPU layers (<code>-ngl</code>)
-                            <span id="ngl_display" style="color: #38bdf8; font-weight: normal; margin-left: 0.5rem;"></span>
-                        </label>
-                        <div class="slider-container">
-                            <input type="range" id="n_gpu_layers_slider" min="0" max="128" step="1" value="0">
-                            <input type="hidden" id="n_gpu_layers" name="n_gpu_layers" value="">
-                        </div>
-                        <small class="field-help" id="ngl_help">Number of model layers to offload to the GPU. <strong>0</strong> = leave the flag off (default). The slider's max follows the model's actual layer count once the GGUF metadata loads.</small>
-                    </div>
-
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="split_mode">Split mode</label>
-                            <select id="split_mode" name="split_mode">
-                                <option value="">auto (let llama.cpp pick)</option>
-                                <option value="none">none — single GPU (model must fit)</option>
-                                <option value="layer">layer — pipeline parallelism (split by layer)</option>
-                                <option value="row">row — split each tensor by rows</option>
-                                <option value="tensor">tensor — tensor parallelism (run all GPUs in parallel)</option>
-                            </select>
-                            <small class="field-help">How the model is distributed across GPUs. <strong>layer</strong> is the safe default — each GPU holds a contiguous range of layers, low inter-GPU traffic. <strong>row</strong> splits each tensor row-wise. <strong>tensor</strong> is full tensor parallelism — generally the fastest mode when supported, but bandwidth-sensitive. <strong>none</strong> forces a single GPU. <strong>Note:</strong> the Vulkan backend in practice only supports <code>none</code> and <code>layer</code>; <code>row</code> and <code>tensor</code> work with the ROCm build.</small>
-                        </div>
-                        <div class="form-group">
-                            <label for="tensor_split">Tensor split</label>
-                            <input type="text" id="tensor_split" name="tensor_split" placeholder="leave blank for auto">
-                            <small class="field-help">Comma-separated fractions per GPU (e.g. <code>0.5,0.5,0</code> to use only the first two of three cards). <strong>Leave blank</strong> and the orchestrator picks the smallest GPU subset whose free VRAM fits the model. Filled in manually pins the split exactly.</small>
-                        </div>
-                    </div>
-
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="main_gpu">Main GPU</label>
-                            <input type="number" id="main_gpu" name="main_gpu" min="0" placeholder="auto">
-                            <small class="field-help">Index of the GPU that holds small intermediate tensors (scalars, temp buffers). Usually irrelevant for <strong>layer</strong> split; matters more for <strong>row</strong>. Leave blank for llama.cpp's default.</small>
-                        </div>
-                        <div class="form-group"></div>
-                    </div>
-
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="threads">Threads (<code>--threads</code>)</label>
-                            <input type="number" id="threads" name="threads" min="-1" placeholder="-1 (auto)">
-                            <small class="field-help">CPU threads llama-server uses for generation. llama.cpp default <strong>-1</strong> (auto); set to your physical core count (e.g. <strong>16</strong>) for predictable behavior. Leave blank for the default.</small>
-                        </div>
-                        <div class="form-group">
-                            <label for="cache_ram_mib">Cache RAM / MiB (<code>--cache-ram</code>)</label>
-                            <input type="number" id="cache_ram_mib" name="cache_ram_mib" min="-1" placeholder="8192 (default)">
-                            <small class="field-help">Maximum KV cache held on CPU (MiB). llama.cpp default <strong>8192</strong>; <strong>-1</strong> = no limit, <strong>0</strong> = disable CPU-side caching. Leave blank for the default.</small>
-                        </div>
-                    </div>
-
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="reasoning_format">Reasoning format (<code>--reasoning-format</code>)</label>
-                            <select id="reasoning_format" name="reasoning_format">
-                                <option value="">default (auto)</option>
-                                <option value="none">none — leave thoughts in message.content</option>
-                                <option value="auto">auto — same as deepseek when model emits think tags</option>
-                                <option value="deepseek">deepseek — split into message.reasoning_content</option>
-                                <option value="deepseek-legacy">deepseek-legacy — both inline tags and reasoning_content</option>
-                            </select>
-                            <small class="field-help">Controls how llama-server parses thought tags in the model's output back into the OpenAI response body. These are the only four values llama.cpp accepts.</small>
-                        </div>
-                        <div class="form-group">
-                            <label for="reasoning_budget">Reasoning budget (<code>--reasoning-budget</code>)</label>
-                            <input type="number" id="reasoning_budget" name="reasoning_budget" min="-1" placeholder="-1 (unrestricted)">
-                            <small class="field-help">Token budget for the thinking phase. llama.cpp default <strong>-1</strong> (unrestricted), <strong>0</strong> ends thinking immediately, <strong>N&gt;0</strong> caps thinking at N tokens. Leave blank for the default.</small>
-                        </div>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="chat_template_kwargs">Chat template kwargs (<code>--chat-template-kwargs</code>)</label>
-                        <input type="text" id="chat_template_kwargs" name="chat_template_kwargs" placeholder='{"enable_thinking":false}'>
-                        <small id="chat_template_kwargs_help" class="field-help">JSON object passed into the model's Jinja chat template. Family-specific keys: Qwen3 uses <code>{"enable_thinking":bool}</code>; gpt-oss uses <code>{"reasoning_effort":"low"|"medium"|"high"|"none"}</code>; Qwen3.6 uses <code>{"preserve_thinking":true}</code>. Leave blank to pass nothing.</small>
-                    </div>
-
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="cache_type_k">K cache quantization</label>
-                            <select id="cache_type_k" name="cache_type_k">
-                                <option value="">default (f16)</option>
-                                <option value="f16">f16 (full precision)</option>
-                                <option value="q8_0">q8_0 (½ VRAM, negligible quality loss)</option>
-                                <option value="q4_0">q4_0 (¼ VRAM, some quality loss)</option>
-                            </select>
-                            <small class="field-help">Quantize the KV cache's keys to shrink VRAM. q8_0 is almost free; q4_0 can hurt quality on long contexts.</small>
-                        </div>
-                        <div class="form-group">
-                            <label for="cache_type_v">V cache quantization</label>
-                            <select id="cache_type_v" name="cache_type_v">
-                                <option value="">default (f16)</option>
-                                <option value="f16">f16 (full precision)</option>
-                                <option value="q8_0">q8_0 (½ VRAM, negligible quality loss)</option>
-                                <option value="q4_0">q4_0 (¼ VRAM, some quality loss)</option>
-                            </select>
-                            <small class="field-help">Quantize the KV cache's values. Same tradeoffs as K. Requires flash attention to be enabled if not f16.</small>
-                        </div>
-                    </div>
-                </div>
-
-                <div id="spec-decode-section" class="card" style="padding: 1rem; margin-bottom: 0;">
-                    <h2 style="margin-bottom: 0.25rem;">Speculative decoding</h2>
-                    <small class="field-help" style="margin-bottom: 0.75rem;">Pick a <strong>draft</strong>-role model to run alongside this target. The draft's own config (GGUF path, context, cache quant, GPU placement) comes from its model entry; the knobs below tune <em>how hard</em> this target drives it.</small>
-
-                    <div class="form-group" style="margin-top: 0.75rem;">
-                        <label for="draft_model_id">Draft model</label>
-                        <select id="draft_model_id" name="draft_model_id">
-                            <option value="">none (standard decoding)</option>
-                            <!-- Populated by refreshDraftSelect() at modal open. -->
-                        </select>
-                        <small class="field-help">Only models with role=Draft appear here. Same-family drafts (e.g. Qwen3.5-2B for Qwen3.5-27B) get high acceptance rates; cross-family drafts don't.</small>
-                    </div>
-
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="draft_max">Draft max (<code>--draft-max</code>)</label>
-                            <input type="number" id="draft_max" name="draft_max" min="0" placeholder="16 (default)">
-                            <small class="field-help">How many tokens the draft generates per speculative step. Higher = bigger potential speedup, but more wasted work on rejection. llama.cpp default <strong>16</strong>. Leave blank for default.</small>
-                        </div>
-                        <div class="form-group">
-                            <label for="draft_min">Draft min (<code>--draft-min</code>)</label>
-                            <input type="number" id="draft_min" name="draft_min" min="0" placeholder="0 (default)">
-                            <small class="field-help">Minimum draft length before submitting to the target — short drafts are submitted immediately when low. Leave blank for default.</small>
-                        </div>
-                    </div>
-
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="draft_p_min">Draft p-min (<code>--draft-p-min</code>)</label>
-                            <input type="number" id="draft_p_min" name="draft_p_min" min="0" max="1" step="0.01" placeholder="0.75 (default)">
-                            <small class="field-help">Probability floor for the draft's greedy sampling. Drafts below this confidence are truncated. Higher = safer drafts, lower speedup.</small>
-                        </div>
-                        <div class="form-group">
-                            <label for="ctx_checkpoints">Context checkpoints (<code>--ctx-checkpoints</code>)</label>
-                            <input type="number" id="ctx_checkpoints" name="ctx_checkpoints" min="0" placeholder="0 (off)">
-                            <small class="field-help">Number of snapshot slots for rollback on partial draft rejection. <strong>Required &gt; 0 for hybrid-recurrent targets</strong> (Qwen3.5 dense) so partial-accept rollback uses snapshot/restore instead of <code>seq_rm</code>. Typical <strong>4</strong>.</small>
-                        </div>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="checkpoint_every_n_tokens">Checkpoint cadence (<code>--checkpoint-every-n-tokens</code>)</label>
-                        <input type="number" id="checkpoint_every_n_tokens" name="checkpoint_every_n_tokens" min="-1" placeholder="-1 (default)">
-                        <small class="field-help">How often to checkpoint during prefill. <strong>-1</strong> for default, <strong>0</strong> disables. Leave blank for default.</small>
-                    </div>
-                </div>
-
-                <div class="form-group">
-                    <label for="extra_args">Extra arguments (one per line)</label>
-                    <textarea id="extra_args" name="extra_args" rows="5" placeholder="--flash-attn&#10;-ngl&#10;99"></textarea>
-                    <small class="field-help">Raw flags appended to the inference server's command line — use for anything not represented as a field above. One argument per line.</small>
-                </div>
-
-                <div style="display: flex; gap: 1rem; margin-top: 1rem;">
-                    <button type="submit" class="btn btn-primary">Save</button>
+                <div style="display:flex; gap:0.75rem; margin-top:1.25rem; align-items:center; flex-wrap:wrap;">
+                    <button type="button" class="btn btn-primary" id="step1-continue-btn" onclick="step1Continue()">Continue →</button>
+                    <button type="button" class="btn btn-secondary" onclick="step1Manual()">Add manually</button>
                     <button type="button" class="btn btn-secondary" onclick="closeModal('model-modal')">Cancel</button>
                 </div>
-            </form>
-        </div>
-    </div>
-</div>
+            </div>
+
+            <!-- STEP 2: Tabbed form (after step 1 for add, directly for edit) -->
+            <div id="modal-step2" style="display:none;">
+                <!-- Read-only path bar — always visible when a GGUF path is set -->
+                <div id="model-path-bar" style="background:#1e293b; border:1px solid #334155; border-radius:6px; padding:0.45rem 0.75rem; margin-bottom:0.75rem; font-size:0.95rem; display:none; align-items:center; gap:0.5rem; flex-wrap:wrap;">
+                    <code id="model-path-display-text" style="color:#cbd5e1; word-break:break-all; flex:1;"></code>
+                    <span id="model-path-meta-pill" style="background:#0f172a; border:1px solid #475569; border-radius:4px; padding:0.1rem 0.5rem; font-size:0.85rem; color:#94a3b8; white-space:nowrap;"></span>
+                </div>
+                <input type="hidden" id="form-mode" value="add">
+                <input type="hidden" id="model_path" name="model_path">
+
+                <!-- Tab bar -->
+                <div class="tab-bar">
+                    <button type="button" class="tab-btn active" data-tab="essentials" onclick="switchTab('essentials')">Essentials</button>
+                    <button type="button" class="tab-btn" data-tab="sampling" onclick="switchTab('sampling')">Sampling<span class="tab-badge" id="badge-sampling"></span></button>
+                    <button type="button" class="tab-btn" data-tab="hardware" onclick="switchTab('hardware')">Hardware<span class="tab-badge" id="badge-hardware"></span></button>
+                    <button type="button" class="tab-btn" data-tab="spec" onclick="switchTab('spec')">Spec. Decoding<span class="tab-badge" id="badge-spec"></span></button>
+                    <button type="button" class="tab-btn" data-tab="advanced" onclick="switchTab('advanced')">Advanced<span class="tab-badge" id="badge-advanced"></span></button>
+                </div>
+
+                <form id="model-form">
+
+                    <!-- ── Essentials ── -->
+                    <div class="tab-panel active" id="tab-essentials">
+                        <div class="form-group">
+                            <label for="id">ID</label>
+                            <input type="text" id="id" name="id" required placeholder="e.g. qwen3-30b-q4_k_m">
+                            <small class="field-help">Unique handle; the <code>"model"</code> field clients send in requests. Can't change after creation.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="name">Name</label>
+                            <input type="text" id="name" name="name" required placeholder="e.g. Qwen3 30B Q4_K_M">
+                            <small class="field-help">Friendly label shown in the dashboard.</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Weights format</label>
+                            <div style="display:flex; gap:1.5rem;">
+                                <label style="display:flex; align-items:center; gap:0.5rem; font-weight:normal;">
+                                    <input type="radio" name="weights_format" value="gguf" checked>GGUF (llama.cpp)
+                                </label>
+                                <label style="display:flex; align-items:center; gap:0.5rem; font-weight:normal;">
+                                    <input type="radio" name="weights_format" value="safetensors">Safetensors (vLLM)
+                                </label>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="binary_preset">Binary</label>
+                            <select id="binary_preset" name="binary_preset">
+                                <option value="__custom__">Custom path…</option>
+                            </select>
+                            <small class="field-help">Pick a preset from <strong>Settings → Backends</strong> or choose <em>Custom path</em>.</small>
+                        </div>
+                        <div class="form-group" id="binary-custom-group">
+                            <label for="binary">Binary path</label>
+                            <input type="text" id="binary" name="binary" data-path-field
+                                   placeholder="/home/you/llama.cpp/build-vulkan/bin/llama-server">
+                        </div>
+                        <div class="form-group">
+                            <label for="context">
+                                Context
+                                <span id="context-model-max" style="color:#94a3b8; font-weight:normal; font-size:1rem; margin-left:0.5rem;"></span>
+                            </label>
+                            <input type="number" id="context" name="context" min="0" required>
+                            <input type="range" id="context-slider" min="0" max="131072" step="1024"
+                                   style="display:none; margin-top:0.5rem;">
+                            <div id="vram-readout" style="display:none; margin-top:0.5rem; font-size:1rem; color:#38bdf8;"></div>
+                            <small id="context-hint" class="field-help">Tokens (prompt + reply) the model keeps in mind. Bigger = more VRAM.</small>
+                        </div>
+                    </div><!-- /tab-essentials -->
+
+                    <!-- ── Sampling ── -->
+                    <div class="tab-panel" id="tab-sampling">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="temperature">Temperature</label>
+                                <div class="slider-container">
+                                    <input type="range" id="temperature-slider" min="0" max="2" step="0.01">
+                                    <input type="number" id="temperature" name="temperature" step="0.01" min="0" max="2" class="slider-number">
+                                </div>
+                                <small class="field-help">0 = deterministic; 0.7 = balanced; 1.5+ = creative. Default: 0.6</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="top_p">Top P</label>
+                                <div class="slider-container">
+                                    <input type="range" id="top_p-slider" min="0" max="1" step="0.01">
+                                    <input type="number" id="top_p" name="top_p" step="0.01" min="0" max="1" class="slider-number">
+                                </div>
+                                <small class="field-help">Nucleus sampling. 1.0 = disabled. Default: 0.95</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="top_k">Top K</label>
+                                <div class="slider-container">
+                                    <input type="range" id="top_k-slider" min="0" max="200" step="1">
+                                    <input type="number" id="top_k" name="top_k" min="0" class="slider-number">
+                                </div>
+                                <small class="field-help">Consider only K most likely tokens. 0 = disabled. Default: 40</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="min_p">Min P</label>
+                                <div class="slider-container">
+                                    <input type="range" id="min_p-slider" min="0" max="1" step="0.01">
+                                    <input type="number" id="min_p" name="min_p" step="0.01" min="0" max="1" class="slider-number">
+                                </div>
+                                <small class="field-help">Drop tokens below this fraction of top probability. 0 = disabled. Default: 0</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="presence_penalty">Presence penalty</label>
+                                <div class="slider-container">
+                                    <input type="range" id="presence_penalty-slider" min="-2" max="2" step="0.01">
+                                    <input type="number" id="presence_penalty" name="presence_penalty" step="0.01" min="-2" max="2" class="slider-number">
+                                </div>
+                                <small class="field-help">Penalises seen tokens. 0 = off (default). 1.5 breaks repetition loops on some Qwen3 variants.</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="repeat_penalty">Repeat penalty</label>
+                                <div class="slider-container">
+                                    <input type="range" id="repeat_penalty-slider" min="0.5" max="2" step="0.01">
+                                    <input type="number" id="repeat_penalty" name="repeat_penalty" step="0.01" min="0.5" max="2" class="slider-number">
+                                </div>
+                                <small class="field-help">Multiplicative penalty on repeated sequences. 1.0 = off (default).</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="reasoning_format">Reasoning format (<code>--reasoning-format</code>)</label>
+                                <select id="reasoning_format" name="reasoning_format">
+                                    <option value="">default (auto)</option>
+                                    <option value="none">none</option>
+                                    <option value="auto">auto</option>
+                                    <option value="deepseek">deepseek</option>
+                                    <option value="deepseek-legacy">deepseek-legacy</option>
+                                </select>
+                                <small class="field-help">How thought tags are split in the OpenAI response.</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="reasoning_budget">Reasoning budget (<code>--reasoning-budget</code>)</label>
+                                <input type="number" id="reasoning_budget" name="reasoning_budget" min="-1" placeholder="-1 (unrestricted)">
+                                <small class="field-help">Token budget for thinking. -1 = unrestricted, 0 = off. Blank = default.</small>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="chat_template_kwargs">Chat template kwargs (<code>--chat-template-kwargs</code>)</label>
+                            <input type="text" id="chat_template_kwargs" name="chat_template_kwargs" placeholder='{"enable_thinking":false}'>
+                            <small id="chat_template_kwargs_help" class="field-help">JSON object for the Jinja template. Qwen3: <code>{"enable_thinking":bool}</code>. Blank = nothing passed.</small>
+                        </div>
+                    </div><!-- /tab-sampling -->
+
+                    <!-- ── Hardware ── -->
+                    <div class="tab-panel" id="tab-hardware">
+                        <small class="field-help" style="display:block; margin-bottom:0.75rem;">Backend flags for <code>llama-server</code>. Applied only when Weights format is GGUF.</small>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label style="display:flex; align-items:center; gap:0.5rem;">
+                                    <input type="checkbox" id="flash_attn" name="flash_attn">Flash attention
+                                </label>
+                                <small class="field-help">Lower VRAM, faster attention. Required for KV cache quantization.</small>
+                            </div>
+                            <div class="form-group">
+                                <label style="display:flex; align-items:center; gap:0.5rem;">
+                                    <input type="checkbox" id="mlock" name="mlock">Lock in RAM (mlock)
+                                </label>
+                                <small class="field-help">Pin model in RAM to prevent swap.</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label style="display:flex; align-items:center; gap:0.5rem;">
+                                    <input type="checkbox" id="no_mmap" name="no_mmap">Disable mmap
+                                </label>
+                                <small class="field-help">Load fully into RAM instead of memory-mapping from disk.</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="parallel_slots">
+                                    Parallel slots
+                                    <span id="parallel_slots_display" style="color:#38bdf8; font-weight:normal; margin-left:0.5rem;"></span>
+                                </label>
+                                <div class="slider-container">
+                                    <input type="range" id="parallel_slots_slider" min="0" max="16" step="1" value="0">
+                                    <input type="hidden" id="parallel_slots" name="parallel_slots" value="">
+                                </div>
+                                <small class="field-help">Concurrent request slots. 0 = llama.cpp default.</small>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="n_gpu_layers">
+                                GPU layers (<code>-ngl</code>)
+                                <span id="ngl_display" style="color:#38bdf8; font-weight:normal; margin-left:0.5rem;"></span>
+                            </label>
+                            <div class="slider-container">
+                                <input type="range" id="n_gpu_layers_slider" min="0" max="128" step="1" value="0">
+                                <input type="hidden" id="n_gpu_layers" name="n_gpu_layers" value="">
+                            </div>
+                            <small class="field-help" id="ngl_help">Layers to offload to GPU. 0 = leave flag off (default).</small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="split_mode">Split mode</label>
+                                <select id="split_mode" name="split_mode">
+                                    <option value="">auto</option>
+                                    <option value="none">none — single GPU</option>
+                                    <option value="layer">layer — pipeline parallelism</option>
+                                    <option value="row">row — row-wise split</option>
+                                    <option value="tensor">tensor — tensor parallelism</option>
+                                </select>
+                                <small class="field-help"><strong>layer</strong> = safe multi-GPU default. row/tensor require ROCm build.</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="tensor_split">Tensor split</label>
+                                <input type="text" id="tensor_split" name="tensor_split" placeholder="leave blank for auto">
+                                <small class="field-help">Fractions per GPU (e.g. <code>0.5,0.5,0</code>). Blank = auto-allocate.</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="main_gpu">Main GPU</label>
+                                <input type="number" id="main_gpu" name="main_gpu" min="0" placeholder="auto">
+                            </div>
+                            <div class="form-group">
+                                <label for="device">Draft device (<code>-devd</code>)</label>
+                                <input type="text" id="device" name="device" placeholder="e.g. Vulkan1">
+                                <small class="field-help">GPU(s) when embedded as a spec-decode draft. Blank = auto.</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="cache_type_k">K cache quantization</label>
+                                <select id="cache_type_k" name="cache_type_k">
+                                    <option value="">default (f16)</option>
+                                    <option value="f16">f16</option>
+                                    <option value="q8_0">q8_0 (½ VRAM)</option>
+                                    <option value="q4_0">q4_0 (¼ VRAM)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="cache_type_v">V cache quantization</label>
+                                <select id="cache_type_v" name="cache_type_v">
+                                    <option value="">default (f16)</option>
+                                    <option value="f16">f16</option>
+                                    <option value="q8_0">q8_0 (½ VRAM)</option>
+                                    <option value="q4_0">q4_0 (¼ VRAM)</option>
+                                </select>
+                                <small class="field-help">Requires flash attention if not f16.</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="threads">Threads (<code>--threads</code>)</label>
+                                <input type="number" id="threads" name="threads" min="-1" placeholder="-1 (auto)">
+                            </div>
+                            <div class="form-group">
+                                <label for="cache_ram_mib">Cache RAM / MiB (<code>--cache-ram</code>)</label>
+                                <input type="number" id="cache_ram_mib" name="cache_ram_mib" min="-1" placeholder="8192 (default)">
+                            </div>
+                        </div>
+                    </div><!-- /tab-hardware -->
+
+                    <!-- ── Speculative decoding ── -->
+                    <div class="tab-panel" id="tab-spec">
+                        <p style="color:#94a3b8; margin-bottom:0.75rem; font-size:1rem;">
+                            Pick any model as a speculative-decoding draft. Same-family smaller models get high acceptance rates.
+                        </p>
+                        <div class="form-group">
+                            <label for="draft_model_id">Draft model</label>
+                            <select id="draft_model_id" name="draft_model_id">
+                                <option value="">none (standard decoding)</option>
+                            </select>
+                            <small class="field-help">Any model can serve as a draft. Sorted smallest → largest.</small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="draft_max">Draft max (<code>--draft-max</code>)</label>
+                                <input type="number" id="draft_max" name="draft_max" min="0" placeholder="16 (default)">
+                            </div>
+                            <div class="form-group">
+                                <label for="draft_min">Draft min (<code>--draft-min</code>)</label>
+                                <input type="number" id="draft_min" name="draft_min" min="0" placeholder="0 (default)">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="draft_p_min">Draft p-min (<code>--draft-p-min</code>)</label>
+                                <input type="number" id="draft_p_min" name="draft_p_min" min="0" max="1" step="0.01" placeholder="0.75 (default)">
+                            </div>
+                            <div class="form-group">
+                                <label for="ctx_checkpoints">Context checkpoints (<code>--ctx-checkpoints</code>)</label>
+                                <input type="number" id="ctx_checkpoints" name="ctx_checkpoints" min="0" placeholder="0 (off)">
+                                <small class="field-help"><strong>Required &gt; 0</strong> for hybrid-recurrent targets (e.g. Qwen3.5). Typical: 4.</small>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="checkpoint_every_n_tokens">Checkpoint cadence (<code>--checkpoint-every-n-tokens</code>)</label>
+                            <input type="number" id="checkpoint_every_n_tokens" name="checkpoint_every_n_tokens" min="-1" placeholder="-1 (default)">
+                        </div>
+                    </div><!-- /tab-spec -->
+
+                    <!-- ── Advanced ── -->
+                    <div class="tab-panel" id="tab-advanced">
+                        <div class="form-group">
+                            <label for="extra_args">Extra arguments (one per line)</label>
+                            <textarea id="extra_args" name="extra_args" rows="8"
+                                      placeholder="--flash-attn&#10;-ngl&#10;99"></textarea>
+                            <small class="field-help">Raw flags appended to the command line. Override any structured field above. One argument per line.</small>
+                        </div>
+                    </div><!-- /tab-advanced -->
+
+                    <div style="display:flex; gap:1rem; margin-top:1rem; padding-top:0.75rem; border-top:1px solid #334155;">
+                        <button type="submit" class="btn btn-primary">Save</button>
+                        <button type="button" class="btn btn-secondary" onclick="closeModal('model-modal')">Cancel</button>
+                    </div>
+                </form>
+            </div><!-- /modal-step2 -->
+        </div><!-- /modal-body -->
+    </div><!-- /modal -->
+</div><!-- /modal-overlay -->
 
 <!-- ===== Settings modal ===== -->
 <div class="modal-overlay" id="settings-modal">
@@ -574,13 +577,25 @@
 .slider-number { width: 5.5rem; text-align: right; }
 .field-help { display: block; color: #94a3b8; font-size: 1rem; margin-top: 0.25rem; line-height: 1.5; }
 .field-help code { background: #334155; padding: 0 0.25rem; border-radius: 3px; font-size: 1em; }
+.tab-bar { display:flex; gap:0; border-bottom:2px solid #334155; margin-bottom:0.75rem; overflow-x:auto; }
+.tab-btn { background:none; border:none; border-bottom:3px solid transparent; padding:0.5rem 1rem; color:#94a3b8; cursor:pointer; font-size:1rem; white-space:nowrap; margin-bottom:-2px; transition:color 0.15s,border-color 0.15s; position:relative; }
+.tab-btn:hover { color:#cbd5e1; }
+.tab-btn.active { color:#38bdf8; border-bottom-color:#38bdf8; }
+.tab-panel { display:none; padding-top:0.25rem; }
+.tab-panel.active { display:block; }
+.tab-badge { display:inline-flex; align-items:center; justify-content:center; background:#1d4ed8; color:#fff; font-size:0.7rem; font-weight:700; min-width:1.3em; height:1.3em; border-radius:999px; padding:0 0.3em; margin-left:0.35em; vertical-align:middle; }
+.tab-badge:empty { display:none; }
+.browser-item { display:flex; align-items:center; padding:0.35rem 0.75rem; cursor:pointer; border-bottom:1px solid #1e293b; font-size:0.95rem; user-select:none; }
+.browser-item:hover { background:#1e293b; }
+.browser-item.is-dir { color:#38bdf8; }
+.browser-item.is-file { color:#94a3b8; }
+.browser-item.is-gguf { color:#34d399; }
 </style>
 
 <script>
 // Defaults for the "Add model" state.
 const MODEL_DEFAULTS = {
     id: '', name: '',
-    role: 'target',
     weights_format: 'gguf',
     binary: '', model_path: '',
     context: 4096,
@@ -599,28 +614,214 @@ const MODEL_DEFAULTS = {
     extra_args: [],
 };
 
-// Field IDs that are target-only. Drafts hide these because they're
-// either nonsensical (sampling — the target samples, not the draft) or
-// inactive (no standalone binary, no split-mode).
-const TARGET_ONLY_FIELD_IDS = [
-    'spec-decode-section',
-];
-// Draft-only field groups (hidden when role=target).
-const DRAFT_ONLY_FIELD_IDS = [
-    'group-device',
-];
+// ===== 2-step modal state =====
+let _currentGgufMeta = null;
+let _editingModelGgufMeta = null;
+let _ggufApplyInfo = null;     // set by GGUF preview IIFE once mounted
+let _step1BrowserCwd = null;
 
 async function openAddModelModal() {
+    _currentGgufMeta = null;
     await refreshPresetSelect();
     await refreshDraftSelect();
-    populateModelForm(MODEL_DEFAULTS, 'add');
+    // Reset step 1 UI.
+    const pathEl = document.getElementById('step1-path');
+    if (pathEl) pathEl.value = '';
+    const hint = document.getElementById('step1-hint');
+    if (hint) { hint.textContent = ''; hint.style.color = ''; }
+    const browser = document.getElementById('step1-browser');
+    if (browser) browser.style.display = 'none';
+    document.getElementById('modal-step1').style.display = '';
+    document.getElementById('modal-step2').style.display = 'none';
     openModal('model-modal');
-    setTimeout(() => document.getElementById('id').focus(), 50);
+    setTimeout(() => pathEl && pathEl.focus(), 50);
 }
 
-// Pull the current list of role=Draft models and rebuild the target
-// form's draft dropdown. Called on modal open so the user always sees
-// the latest.
+async function step1Continue() {
+    const pathEl = document.getElementById('step1-path');
+    const hint = document.getElementById('step1-hint');
+    const path = (pathEl ? pathEl.value : '').trim();
+    if (!path) { if (hint) { hint.textContent = 'Enter a GGUF file path first.'; hint.style.color = '#fca5a5'; } return; }
+    if (hint) { hint.textContent = 'Reading GGUF metadata…'; hint.style.color = '#94a3b8'; }
+    try {
+        const r = await fetch(`/api/gguf-info?path=${encodeURIComponent(path)}`);
+        if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            if (hint) { hint.textContent = `Error: ${j.error || r.statusText}`; hint.style.color = '#fca5a5'; }
+            return;
+        }
+        _currentGgufMeta = await r.json();
+    } catch (e) {
+        if (hint) { hint.textContent = `Error: ${e}`; hint.style.color = '#fca5a5'; }
+        return;
+    }
+    if (hint) { hint.textContent = ''; hint.style.color = ''; }
+    // Build a pre-populated model object from metadata.
+    const m = Object.assign({}, MODEL_DEFAULTS, {
+        model_path: path,
+        id: _currentGgufMeta.suggested_id || '',
+        name: _currentGgufMeta.suggested_name || '',
+        context: _currentGgufMeta.max_context || 4096,
+        gguf_meta: _currentGgufMeta,
+    });
+    await _showStep2(m, 'add');
+}
+
+function step1Manual() {
+    _currentGgufMeta = null;
+    const pathEl = document.getElementById('step1-path');
+    const path = (pathEl ? pathEl.value : '').trim();
+    const m = Object.assign({}, MODEL_DEFAULTS, { model_path: path });
+    _showStep2(m, 'add');
+}
+
+async function step1Browse() {
+    const browser = document.getElementById('step1-browser');
+    if (!browser) return;
+    if (browser.style.display !== 'none') { browser.style.display = 'none'; return; }
+    // Seed from the current path field or home.
+    const pathEl = document.getElementById('step1-path');
+    let seed = (pathEl ? pathEl.value.trim() : '') || '~';
+    // If seed looks like a file (has extension or ends without /), go to its parent.
+    try {
+        const r = await fetch(`/api/files?path=${encodeURIComponent(seed)}`);
+        if (!r.ok) seed = '~';
+    } catch { seed = '~'; }
+    browser.style.display = '';
+    await _loadBrowserDir(seed);
+}
+
+async function _loadBrowserDir(dir) {
+    _step1BrowserCwd = dir;
+    const pathEl = document.getElementById('step1-browser-path');
+    const listEl = document.getElementById('step1-browser-list');
+    if (pathEl) pathEl.textContent = dir;
+    if (listEl) listEl.innerHTML = '<div style="color:#94a3b8;padding:0.5rem 0.75rem;">Loading…</div>';
+    try {
+        const r = await fetch(`/api/files?path=${encodeURIComponent(dir)}`);
+        if (!r.ok) {
+            // Maybe it's a file path; try the parent.
+            const parent = dir.replace(/\/[^/]+$/, '') || '/';
+            if (parent !== dir) { await _loadBrowserDir(parent); return; }
+            if (listEl) listEl.innerHTML = '<div style="color:#fca5a5;padding:0.5rem 0.75rem;">Cannot open directory.</div>';
+            return;
+        }
+        const entries = await r.json();
+        if (!listEl) return;
+        listEl.innerHTML = '';
+        if (entries.length === 0) {
+            listEl.innerHTML = '<div style="color:#94a3b8;padding:0.5rem 0.75rem;font-style:italic;">(empty)</div>';
+            return;
+        }
+        entries.forEach(e => {
+            const isGguf = !e.is_dir && e.name.toLowerCase().endsWith('.gguf');
+            const cls = e.is_dir ? 'is-dir' : (isGguf ? 'is-gguf' : 'is-file');
+            const icon = e.is_dir ? '📁 ' : (isGguf ? '⬡ ' : '📄 ');
+            const item = document.createElement('div');
+            item.className = `browser-item ${cls}`;
+            item.textContent = icon + e.name;
+            item.addEventListener('click', () => {
+                if (e.is_dir) {
+                    _loadBrowserDir(e.path);
+                } else if (isGguf) {
+                    const inp = document.getElementById('step1-path');
+                    if (inp) inp.value = e.path;
+                    document.getElementById('step1-browser').style.display = 'none';
+                }
+            });
+            listEl.appendChild(item);
+        });
+    } catch (err) {
+        if (listEl) listEl.innerHTML = `<div style="color:#fca5a5;padding:0.5rem 0.75rem;">Error: ${err}</div>`;
+    }
+}
+
+function step1BrowserUp() {
+    if (!_step1BrowserCwd) return;
+    const parent = _step1BrowserCwd.replace(/\/[^/]+\/?$/, '') || '/';
+    _loadBrowserDir(parent === _step1BrowserCwd ? '/' : parent);
+}
+
+async function _showStep2(m, mode) {
+    await refreshPresetSelect();
+    await refreshDraftSelect();
+    document.getElementById('modal-step1').style.display = 'none';
+    document.getElementById('modal-step2').style.display = '';
+    populateModelForm(m, mode);
+    switchTab('essentials');
+    updateTabBadges();
+}
+
+function switchTab(tabId) {
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === tabId);
+    });
+    document.querySelectorAll('.tab-panel').forEach(panel => {
+        panel.classList.toggle('active', panel.id === `tab-${tabId}`);
+    });
+}
+
+function updateTabBadges() {
+    const f = document.getElementById('model-form');
+    if (!f) return;
+    const v = (name) => (f[name] ? f[name].value : '');
+    const b = (name) => (f[name] ? f[name].checked : false);
+
+    const sampling = [
+        parseFloat(v('temperature')) !== 0.6,
+        parseFloat(v('top_p')) !== 0.95,
+        parseInt(v('top_k'), 10) !== 40,
+        parseFloat(v('min_p')) !== 0.0,
+        parseFloat(v('presence_penalty')) !== 0.0,
+        parseFloat(v('repeat_penalty')) !== 1.0,
+        !!v('reasoning_format'),
+        !!v('reasoning_budget'),
+        !!v('chat_template_kwargs'),
+    ].filter(Boolean).length;
+
+    const hardware = [
+        b('flash_attn'),
+        b('mlock'),
+        b('no_mmap'),
+        !!v('n_gpu_layers'),
+        !!v('parallel_slots'),
+        !!v('split_mode'),
+        !!v('tensor_split'),
+        v('main_gpu') !== '',
+        !!v('device'),
+        !!v('cache_type_k'),
+        !!v('cache_type_v'),
+        !!v('threads'),
+        !!v('cache_ram_mib'),
+    ].filter(Boolean).length;
+
+    const spec = [
+        !!v('draft_model_id'),
+        !!v('draft_max'),
+        !!v('draft_min'),
+        !!v('draft_p_min'),
+        !!v('ctx_checkpoints'),
+        !!v('checkpoint_every_n_tokens'),
+    ].filter(Boolean).length;
+
+    const advanced = [
+        (f.extra_args ? f.extra_args.value.trim() : '') !== '',
+    ].filter(Boolean).length;
+
+    _setBadge('badge-sampling', sampling);
+    _setBadge('badge-hardware', hardware);
+    _setBadge('badge-spec', spec);
+    _setBadge('badge-advanced', advanced);
+}
+
+function _setBadge(id, count) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = count > 0 ? String(count) : '';
+}
+
+// Rebuild the draft dropdown with all models sorted smallest → largest
+// by estimated_vram (unknown/0 at the end). Called on modal open.
 async function refreshDraftSelect() {
     const sel = document.getElementById('draft_model_id');
     if (!sel) return;
@@ -633,32 +834,21 @@ async function refreshDraftSelect() {
         none.value = '';
         none.textContent = 'none (standard decoding)';
         sel.appendChild(none);
-        list
-            .filter(m => (m.role || 'target') === 'draft')
-            .forEach(m => {
-                const o = document.createElement('option');
-                o.value = m.id;
-                o.textContent = m.name ? `${m.name} (${m.id})` : m.id;
-                sel.appendChild(o);
-            });
+        [...list].sort((a, b) => {
+            const av = a.estimated_vram || 0, bv = b.estimated_vram || 0;
+            if (av === 0 && bv === 0) return 0;
+            if (av === 0) return 1;
+            if (bv === 0) return -1;
+            return av - bv;
+        }).forEach(m => {
+            const o = document.createElement('option');
+            o.value = m.id;
+            const size = m.estimated_vram ? ` — ${(m.estimated_vram / 1024**3).toFixed(1)} GiB` : '';
+            o.textContent = (m.name ? `${m.name} (${m.id})` : m.id) + size;
+            sel.appendChild(o);
+        });
         if ([...sel.options].some(o => o.value === current)) sel.value = current;
     } catch {}
-}
-
-// Toggle visibility of role-scoped form groups. Runs when role changes
-// and once after populateModelForm so edit-mode reflects the model's
-// actual role.
-function applyRoleVisibility() {
-    const r = document.querySelector('input[name="role"]:checked');
-    const role = r ? r.value : 'target';
-    TARGET_ONLY_FIELD_IDS.forEach(id => {
-        const el = document.getElementById(id);
-        if (el) el.style.display = role === 'target' ? '' : 'none';
-    });
-    DRAFT_ONLY_FIELD_IDS.forEach(id => {
-        const el = document.getElementById(id);
-        if (el) el.style.display = role === 'draft' ? '' : 'none';
-    });
 }
 
 // Fetch the current presets and rebuild the select in the model form.
@@ -708,27 +898,28 @@ function applyPresetSelection() {
 
 async function editModel(id) {
     try {
-        await refreshPresetSelect();
-        await refreshDraftSelect();
         const r = await fetch('/api/models');
         if (!r.ok) throw new Error(r.statusText);
         const models = await r.json();
         const m = models.find(x => x.id === id);
         if (!m) { alert(`Model ${id} not found.`); return; }
+        _editingModelGgufMeta = m.gguf_meta || null;
         // If the target's currently-selected draft_model_id no longer
         // exists in the list (e.g. the draft was deleted), keep the
         // stored value visible as a disabled option so the user sees
         // what needs fixing instead of silently losing it.
+        await refreshPresetSelect();
+        await refreshDraftSelect();
         const sel = document.getElementById('draft_model_id');
-        if (sel && m.draft_model_id && !models.some(x => x.id === m.draft_model_id && x.role === 'draft')) {
+        if (sel && m.draft_model_id && !models.some(x => x.id === m.draft_model_id)) {
             const o = document.createElement('option');
             o.value = m.draft_model_id;
             o.textContent = `${m.draft_model_id} (missing!)`;
             o.disabled = false;
             sel.appendChild(o);
         }
-        populateModelForm(m, 'edit');
         openModal('model-modal');
+        await _showStep2(m, 'edit');
     } catch (e) {
         alert(`Could not load model: ${e}`);
     }
@@ -745,7 +936,6 @@ function populateModelForm(m, mode) {
     f.weights_format.value = m.weights_format || 'gguf';
     // radio groups need per-input checking
     [...f.querySelectorAll('input[name="weights_format"]')].forEach(r => r.checked = (r.value === (m.weights_format || 'gguf')));
-    [...f.querySelectorAll('input[name="role"]')].forEach(r => r.checked = (r.value === (m.role || 'target')));
     // Preset selection: pick the matching option if the model references a
     // preset that still exists; otherwise fall back to Custom path.
     const presetSel = document.getElementById('binary_preset');
@@ -756,7 +946,25 @@ function populateModelForm(m, mode) {
     }
     f.binary.value = m.binary || '';
     applyPresetSelection();
-    f.model_path.value = m.model_path || '';
+
+    // model_path is a hidden input; display it in the path bar.
+    const hiddenPath = document.getElementById('model_path');
+    if (hiddenPath) hiddenPath.value = m.model_path || '';
+    const pathBar = document.getElementById('model-path-bar');
+    const pathBarText = document.getElementById('model-path-display-text');
+    if (pathBar) {
+        if (m.model_path) {
+            if (pathBarText) pathBarText.textContent = m.model_path;
+            // Update meta pill with quant label if available.
+            const pill = document.getElementById('model-path-meta-pill');
+            const meta = m.gguf_meta || (mode === 'edit' ? _editingModelGgufMeta : _currentGgufMeta);
+            if (pill) pill.textContent = (meta && meta.quant_label) ? meta.quant_label : '';
+            pathBar.style.display = 'flex';
+        } else {
+            pathBar.style.display = 'none';
+        }
+    }
+
     f.context.value = m.context ?? 4096;
 
     // sampling
@@ -784,7 +992,7 @@ function populateModelForm(m, mode) {
     f.reasoning_budget.value = m.reasoning_budget == null ? '' : String(m.reasoning_budget);
     f.chat_template_kwargs.value = m.chat_template_kwargs ?? '';
 
-    // Spec-decode + draft role fields.
+    // Spec-decode fields.
     f.device.value = m.device ?? '';
     f.draft_model_id.value = m.draft_model_id ?? '';
     f.draft_max.value = m.draft_max == null ? '' : String(m.draft_max);
@@ -794,25 +1002,27 @@ function populateModelForm(m, mode) {
     f.checkpoint_every_n_tokens.value =
         m.checkpoint_every_n_tokens == null ? '' : String(m.checkpoint_every_n_tokens);
 
-    applyRoleVisibility();
     f.extra_args.value = (m.extra_args || []).join('\n');
 
-    // Reset context slider state — the GGUF info fetch will reapply if it
-    // resolves a new path.
+    // Reset context slider / VRAM readout.
     const ctxSlider = document.getElementById('context-slider');
     ctxSlider.style.display = 'none';
     document.getElementById('vram-readout').style.display = 'none';
     document.getElementById('context-model-max').textContent = '';
     const ctxHint = document.getElementById('context-hint');
     ctxHint.style.display = '';
-    ctxHint.textContent = 'Enter a model path to get a VRAM estimate and slider.';
+    ctxHint.textContent = 'Select a GGUF file to get a VRAM estimate and slider.';
 
-    // Reapply format-dependent visibility + trigger GGUF info fetch.
+    // If we already have GgufMeta (from step 1 or stored on the model),
+    // apply it immediately to the VRAM preview.
+    const meta = m.gguf_meta || (mode === 'edit' ? _editingModelGgufMeta : _currentGgufMeta);
+    if (_ggufApplyInfo && meta) {
+        _ggufApplyInfo(meta);
+    }
+
+    // Format-dependent llama section visibility.
     document.getElementById('llama-section').style.display =
         (m.weights_format || 'gguf') === 'gguf' ? '' : 'none';
-    if ((m.weights_format || 'gguf') === 'gguf' && m.model_path) {
-        document.getElementById('model_path').dispatchEvent(new Event('input'));
-    }
 }
 
 function setPair(name, value) {
@@ -916,27 +1126,14 @@ async function deleteModel(id, name) {
     apply();
 })();
 
-// ----- Role toggle -----
-// Changing role flips which form sections apply. Run once at load so the
-// initial state matches the default-checked radio (target).
-(function bindRoleToggle() {
-    document.querySelectorAll('input[name="role"]').forEach(r => {
-        r.addEventListener('change', applyRoleVisibility);
-    });
-    applyRoleVisibility();
-})();
-
 // ----- Live GGUF metadata + VRAM preview -----
 (function() {
-    const pathInput = document.getElementById('model_path');
-    const formatInputs = document.querySelectorAll('input[name="weights_format"]');
     const ctxInput = document.getElementById('context');
     const slider = document.getElementById('context-slider');
     const readout = document.getElementById('vram-readout');
     const modelMaxEl = document.getElementById('context-model-max');
     const hint = document.getElementById('context-hint');
     let info = null;
-    let pending = null;
 
     function gib(bytes) { return (bytes / 1073741824).toFixed(2); }
 
@@ -949,27 +1146,16 @@ async function deleteModel(id, name) {
 
     function recompute(ctx) {
         if (!info) return;
-        // Full-context head dim. Prefer <arch>.attention.key_length
-        // (exact, published by modern GGUFs); fall back to n_embd /
-        // n_head; finally to 128 when head count is unknown.
         const fullHeadDim = info.key_length > 0
             ? info.key_length
             : (info.n_head > 0 ? Math.floor(info.n_embd / info.n_head) : 128);
-        // SWA head dim: some models (e.g. gemma-4: 256 vs 512 full)
-        // publish a distinct `key_length_swa`; otherwise reuse full.
         const swaHeadDim = info.key_length_swa > 0 ? info.key_length_swa : fullHeadDim;
-
         const perK = cacheBytes('cache_type_k');
         const perV = cacheBytes('cache_type_v');
-
-        // Full-context layers cache every one of `ctx` tokens.
-        // Sliding-window layers cap at `sliding_window`. For gemma-4
-        // that turns the 131k-ctx run from ~110 GiB of KV into ~5 GiB.
         const fullHeads = info.full_kv_heads != null ? info.full_kv_heads
             : (info.kv_heads_total || info.n_layers * Math.max(info.n_head_kv || 0, 1));
         const swaHeads = info.swa_kv_heads || 0;
         const window = info.sliding_window || 0;
-
         const fullKv = ctx * fullHeads * fullHeadDim * (perK + perV);
         const swaKv = window > 0
             ? Math.min(ctx, window) * swaHeads * swaHeadDim * (perK + perV)
@@ -1008,46 +1194,10 @@ async function deleteModel(id, name) {
         recompute(current);
     }
 
-    function clearInfo(msg) {
-        info = null;
-        slider.style.display = 'none';
-        readout.style.display = 'none';
-        modelMaxEl.textContent = '';
-        hint.style.display = '';
-        hint.textContent = msg || 'Enter a model path to get a VRAM estimate and slider.';
-        ctxInput.removeAttribute('max');
-    }
+    // Expose so that _showStep2 / populateModelForm can trigger a preview
+    // without needing a user-visible path input field.
+    _ggufApplyInfo = applyInfo;
 
-    async function fetchInfo() {
-        const path = pathInput.value.trim();
-        const fmt = document.querySelector('input[name="weights_format"]:checked').value;
-        if (!path || fmt !== 'gguf') {
-            clearInfo(fmt === 'safetensors' ? 'GGUF metadata preview only available for GGUF.' : undefined);
-            return;
-        }
-        hint.style.display = '';
-        hint.textContent = 'Reading GGUF metadata…';
-        try {
-            const r = await fetch(`/api/gguf-info?path=${encodeURIComponent(path)}`);
-            if (!r.ok) {
-                const j = await r.json().catch(() => ({}));
-                clearInfo(`GGUF read failed: ${j.error || r.statusText}`);
-                return;
-            }
-            applyInfo(await r.json());
-        } catch (e) {
-            clearInfo(`GGUF read failed: ${e}`);
-        }
-    }
-
-    function schedule() {
-        if (pending) clearTimeout(pending);
-        pending = setTimeout(fetchInfo, 300);
-    }
-
-    pathInput.addEventListener('input', schedule);
-    pathInput.addEventListener('blur', fetchInfo);
-    formatInputs.forEach(el => el.addEventListener('change', schedule));
     slider.addEventListener('input', () => {
         ctxInput.value = slider.value;
         recompute(parseInt(slider.value, 10));
@@ -1064,6 +1214,16 @@ async function deleteModel(id, name) {
     });
     document.getElementById('cache_type_v').addEventListener('change', () => {
         if (info) recompute(parseInt(slider.value || ctxInput.value, 10) || 0);
+    });
+})();
+
+// ----- Wire tab badge updates to all form field changes -----
+(function bindBadgeUpdates() {
+    const f = document.getElementById('model-form');
+    if (!f) return;
+    f.querySelectorAll('input, select, textarea').forEach(el => {
+        el.addEventListener('change', updateTabBadges);
+        el.addEventListener('input', updateTabBadges);
     });
 })();
 
@@ -1264,13 +1424,11 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         const n = parseFloat(s);
         return Number.isNaN(n) ? null : n;
     };
-    const role = (document.querySelector('input[name="role"]:checked') || {}).value || 'target';
     const presetSel = document.getElementById('binary_preset');
     const presetChoice = presetSel ? presetSel.value : '__custom__';
     const body = {
         id: f.id.value.trim(),
         name: f.name.value.trim(),
-        role,
         weights_format: f.weights_format.value,
         binary_preset: presetChoice === '__custom__' ? null : presetChoice,
         binary: presetChoice === '__custom__' ? f.binary.value.trim() : '',
@@ -1286,36 +1444,26 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         n_gpu_layers: toOptInt(f.n_gpu_layers.value),
         mlock: f.mlock.checked,
         no_mmap: f.no_mmap.checked,
-        // `parallel_slots` controls concurrent-request slots on the
-        // target's server. Drafts don't serve, so the validator
-        // rejects it — scrub when submitting a draft.
-        parallel_slots: role === 'draft' ? null : toOptInt(f.parallel_slots.value),
+        parallel_slots: toOptInt(f.parallel_slots.value),
         cache_type_k: toOptStr(f.cache_type_k.value),
         cache_type_v: toOptStr(f.cache_type_v.value),
-        // Target-only structured fields: drop when saving a draft so
-        // the server-side validator doesn't reject them. The UI already
-        // hid these inputs, but they still carry values from populate().
-        split_mode: role === 'draft' ? null : toOptStr(f.split_mode.value),
-        main_gpu: role === 'draft' ? null : toOptInt(f.main_gpu.value),
-        tensor_split: role === 'draft' ? null : toOptStr(f.tensor_split.value),
+        split_mode: toOptStr(f.split_mode.value),
+        main_gpu: toOptInt(f.main_gpu.value),
+        tensor_split: toOptStr(f.tensor_split.value),
         threads: toOptInt(f.threads.value),
         cache_ram_mib: toOptInt(f.cache_ram_mib.value),
-        reasoning_format: role === 'draft' ? null : toOptStr(f.reasoning_format.value),
-        reasoning_budget: role === 'draft' ? null : toOptInt(f.reasoning_budget.value),
-        chat_template_kwargs: role === 'draft' ? null : toOptStr(f.chat_template_kwargs.value),
-        // Draft-only: -devd device list.
-        device: role === 'draft' ? toOptStr(f.device.value) : null,
-        // Target-only: spec-decode reference + policy knobs. Empty
-        // draft_model_id means spec-decode off (policy fields are
-        // harmless in that case — llama-server ignores them).
-        draft_model_id: role === 'target' ? toOptStr(f.draft_model_id.value) : null,
-        draft_max: role === 'target' ? toOptInt(f.draft_max.value) : null,
-        draft_min: role === 'target' ? toOptInt(f.draft_min.value) : null,
-        draft_p_min: role === 'target' ? toOptFloat(f.draft_p_min.value) : null,
-        ctx_checkpoints: role === 'target' ? toOptInt(f.ctx_checkpoints.value) : null,
-        checkpoint_every_n_tokens:
-            role === 'target' ? toOptInt(f.checkpoint_every_n_tokens.value) : null,
+        reasoning_format: toOptStr(f.reasoning_format.value),
+        reasoning_budget: toOptInt(f.reasoning_budget.value),
+        chat_template_kwargs: toOptStr(f.chat_template_kwargs.value),
+        device: toOptStr(f.device.value),
+        draft_model_id: toOptStr(f.draft_model_id.value),
+        draft_max: toOptInt(f.draft_max.value),
+        draft_min: toOptInt(f.draft_min.value),
+        draft_p_min: toOptFloat(f.draft_p_min.value),
+        ctx_checkpoints: toOptInt(f.ctx_checkpoints.value),
+        checkpoint_every_n_tokens: toOptInt(f.checkpoint_every_n_tokens.value),
         extra_args: extra,
+        gguf_meta: mode === 'add' ? (_currentGgufMeta || null) : (_editingModelGgufMeta || null),
     };
     // Validate chat_template_kwargs is parseable JSON if supplied.
     if (body.chat_template_kwargs) {

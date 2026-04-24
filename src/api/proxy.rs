@@ -162,11 +162,9 @@ pub async fn proxy_handler(
 /// Drafts are filtered out: they have no standalone process and shouldn't
 /// appear as selectable models to OpenAI clients.
 pub async fn list_v1_models(State(state): State<AppState>) -> impl IntoResponse {
-    use crate::config::ModelRole;
     let models = state.list_models().await;
     let data: Vec<_> = models
         .into_iter()
-        .filter(|m| m.role != ModelRole::Draft)
         .map(|m| {
             json!({
                 "id": m.id,

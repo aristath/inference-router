@@ -4,6 +4,7 @@ use ggus::{
     GGufMetaValueArray, GGufReader,
 };
 use memmap2::Mmap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -67,7 +68,7 @@ impl VramEstimate {
 ///   gemma with sliding-window attention on most layers) they carry
 ///   the per-layer shape so the estimate stays grounded in what
 ///   llama.cpp actually allocates.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct GgufInfo {
     pub max_context: u32,
     pub n_layers: u32,
@@ -221,6 +222,284 @@ impl GgufInfo {
         let elements = full_elements + swa_elements;
         elements * kv_bytes.k.0 / kv_bytes.k.1 + elements * kv_bytes.v.0 / kv_bytes.v.1
     }
+}
+
+impl From<&GgufMeta> for GgufInfo {
+    fn from(m: &GgufMeta) -> Self {
+        Self {
+            max_context: m.max_context,
+            n_layers: m.n_layers,
+            n_embd: m.n_embd,
+            n_head: m.n_head,
+            n_head_kv: m.n_head_kv,
+            key_length: m.key_length,
+            key_length_swa: m.key_length_swa,
+            full_kv_heads: m.full_kv_heads,
+            swa_kv_heads: m.swa_kv_heads,
+            kv_heads_total: m.kv_heads_total,
+            sliding_window: m.sliding_window,
+            file_size: m.file_size,
+        }
+    }
+}
+
+/// Maps `general.file_type` integer to its canonical quant label string.
+pub fn file_type_label(ft: u32) -> &'static str {
+    match ft {
+        0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 4 => "Q4_1_F16",
+        7 => "Q8_0", 8 => "Q5_0", 9 => "Q5_1",
+        10 => "Q2_K", 11 => "Q3_K_S", 12 => "Q3_K_M", 13 => "Q3_K_L",
+        14 => "Q4_K_S", 15 => "Q4_K_M", 16 => "Q5_K_S", 17 => "Q5_K_M",
+        18 => "Q6_K", 19 => "IQ2_XXS", 20 => "IQ2_XS", 21 => "Q2_K_S",
+        22 => "IQ3_XS", 23 => "IQ3_XXS", 24 => "IQ1_S", 25 => "IQ4_NL",
+        26 => "IQ3_S", 27 => "IQ3_M", 28 => "IQ2_S", 29 => "IQ2_M",
+        30 => "IQ4_XS", 31 => "IQ1_M", 32 => "BF16",
+        33 => "Q4_0_4_4", 34 => "Q4_0_4_8", 35 => "Q4_0_8_8",
+        _ => "Unknown",
+    }
+}
+
+/// Richer GGUF metadata — a superset of `GgufInfo` — used for the
+/// dashboard's 2-step "Add model" flow and stored as `gguf_meta` in the
+/// model JSON so the UI can render rich labels without re-reading the file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GgufMeta {
+    // VRAM-estimation fields (same names as GgufInfo for front-end compat)
+    pub max_context: u32,
+    pub n_layers: u32,
+    pub n_embd: u32,
+    pub n_head: u32,
+    pub n_head_kv: u32,
+    pub key_length: u32,
+    pub key_length_swa: u32,
+    pub full_kv_heads: u64,
+    pub swa_kv_heads: u64,
+    pub kv_heads_total: u64,
+    pub sliding_window: u32,
+    pub file_size: u64,
+    // Identity
+    pub architecture: Option<String>,
+    pub name: Option<String>,
+    pub basename: Option<String>,
+    pub size_label: Option<String>,
+    pub file_type: Option<u32>,
+    pub quant_label: Option<String>,
+    pub quantized_by: Option<String>,
+    pub license: Option<String>,
+    pub tags: Vec<String>,
+    // Provenance
+    pub base_model_name: Option<String>,
+    pub base_model_org: Option<String>,
+    pub base_model_repo: Option<String>,
+    // Architecture detail
+    pub feed_forward_length: Option<u32>,
+    pub expert_count: Option<u32>,
+    pub expert_used_count: Option<u32>,
+    pub rope_freq_base: Option<f32>,
+    pub ssm_inner_size: Option<u32>,
+    pub full_attention_interval: Option<u32>,
+    // Tokenizer
+    pub chat_template: Option<String>,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+    // Derived suggestions for the "Add model" form
+    pub suggested_id: String,
+    pub suggested_name: String,
+}
+
+impl GgufMeta {
+    pub fn read(path: &Path) -> Result<Self, EstimateError> {
+        let file = File::open(path)?;
+        let file_size = sharded_total_size(path).unwrap_or_else(|| {
+            file.metadata().map(|m| m.len()).unwrap_or(0)
+        });
+        let mmap = unsafe { Mmap::map(&file) }?;
+        let kvs = read_metadata_kvs(&mmap)?;
+        let map = MetaMap(kvs);
+
+        // --- GgufInfo fields (same logic as GgufInfo::read) ---
+        let max_context = map.llm_context_length().map_err(meta_err)? as u32;
+        let n_layers = map.llm_block_count().map_err(meta_err)? as u32;
+        let n_embd = map.llm_embedding_length().map_err(meta_err)? as u32;
+
+        let head_stats = read_int_field(&map, &attention_key(&map, "head_count")?)?;
+        let kv_heads_per_layer =
+            read_int_field_per_layer(&map, &attention_key(&map, "head_count_kv")?, n_layers)?;
+
+        let key_length = read_optional_u32(&map, &attention_key(&map, "key_length")?)?;
+        let key_length_swa = read_optional_u32(&map, &attention_key(&map, "key_length_swa")?)?;
+        let sliding_window = read_optional_u32(&map, &attention_key(&map, "sliding_window")?)?;
+
+        let swa_pattern =
+            read_bool_array_field(&map, &attention_key(&map, "sliding_window_pattern")?)?;
+
+        let (full_kv_heads, swa_kv_heads) =
+            split_kv_heads(&kv_heads_per_layer, &swa_pattern, sliding_window, n_layers);
+        let kv_heads_total = full_kv_heads + swa_kv_heads;
+        let n_head_kv_max = kv_heads_per_layer.iter().copied().max().unwrap_or(0) as u32;
+
+        // --- Architecture string (needed for all <arch>. keys) ---
+        let arch = map.general_architecture().ok().map(|s| s.to_string());
+        let arch_ref = arch.as_deref().unwrap_or("");
+
+        // --- Identity ---
+        let name = meta_read_str(&map, "general.name");
+        let basename = meta_read_str(&map, "general.basename");
+        let size_label = meta_read_str(&map, "general.size_label");
+        let quantized_by = meta_read_str(&map, "general.quantized_by");
+        let license = meta_read_str(&map, "general.license");
+        let tags = meta_read_str_array(&map, "general.tags");
+
+        let file_type: Option<u32> = map.get_usize("general.file_type").ok().map(|v| v as u32);
+        let quant_label = file_type.map(|ft| file_type_label(ft).to_string());
+
+        // --- Provenance ---
+        let base_model_name = meta_read_str(&map, "general.base_model.0.name");
+        let base_model_org = meta_read_str(&map, "general.base_model.0.organization");
+        let base_model_repo = meta_read_str(&map, "general.base_model.0.repo_url");
+
+        // --- Architecture detail ---
+        let feed_forward_length =
+            map.get_usize(&format!("{arch_ref}.feed_forward_length")).ok().map(|v| v as u32);
+        let expert_count =
+            map.get_usize(&format!("{arch_ref}.expert_count")).ok().map(|v| v as u32);
+        let expert_used_count =
+            map.get_usize(&format!("{arch_ref}.expert_used_count")).ok().map(|v| v as u32);
+        let rope_freq_base = meta_read_f32(&map, &format!("{arch_ref}.rope.freq_base"));
+        let ssm_inner_size =
+            map.get_usize(&format!("{arch_ref}.ssm.inner_size")).ok().map(|v| v as u32);
+        let full_attention_interval =
+            map.get_usize(&format!("{arch_ref}.full_attention_interval")).ok().map(|v| v as u32);
+
+        // --- Tokenizer ---
+        let chat_template = meta_read_str(&map, "tokenizer.chat_template");
+        let bos_token_id =
+            map.get_usize("tokenizer.ggml.bos_token_id").ok().map(|v| v as u32);
+        let eos_token_id =
+            map.get_usize("tokenizer.ggml.eos_token_id").ok().map(|v| v as u32);
+
+        // --- Derived suggestions ---
+        let quant_lower = quant_label.as_deref().unwrap_or("").to_ascii_lowercase();
+        let base_slug = {
+            let raw = basename.as_deref()
+                .or(name.as_deref())
+                .unwrap_or_else(|| {
+                    path.file_stem().and_then(|s| s.to_str()).unwrap_or("model")
+                });
+            slug(raw)
+        };
+        let suggested_id = if quant_lower.is_empty() {
+            base_slug.clone()
+        } else {
+            format!("{base_slug}-{quant_lower}")
+        };
+        let display_name = name.as_deref()
+            .or(basename.as_deref())
+            .unwrap_or("Model");
+        let suggested_name = if quant_label.as_deref().map_or(true, |q| q == "Unknown") {
+            display_name.to_owned()
+        } else {
+            format!("{} {}", display_name, quant_label.as_deref().unwrap_or(""))
+        };
+
+        Ok(Self {
+            max_context, n_layers, n_embd,
+            n_head: head_stats.max,
+            n_head_kv: n_head_kv_max,
+            key_length, key_length_swa,
+            full_kv_heads, swa_kv_heads, kv_heads_total,
+            sliding_window, file_size,
+            architecture: arch,
+            name, basename, size_label, file_type, quant_label,
+            quantized_by, license, tags,
+            base_model_name, base_model_org, base_model_repo,
+            feed_forward_length, expert_count, expert_used_count,
+            rope_freq_base, ssm_inner_size, full_attention_interval,
+            chat_template, bos_token_id, eos_token_id,
+            suggested_id, suggested_name,
+        })
+    }
+}
+
+/// Produce a dash-separated, lowercase ID-safe slug from a display string.
+/// Keeps alphanumeric, `-`, and `.`; collapses runs of invalid chars to `-`.
+fn slug(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_sep = true;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' {
+            out.push(c.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if c == '-' || c == '_' || c == ' ' {
+            if !last_was_sep {
+                out.push('-');
+            }
+            last_was_sep = true;
+        }
+        // other chars skipped
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Read an optional string from the GGUF metadata map.
+/// GGUF string value format: `u64_len (LE) + UTF-8 bytes`.
+fn meta_read_str(map: &MetaMap, key: &str) -> Option<String> {
+    let (ty, bytes) = map.get(key)?;
+    if ty != Ty::String || bytes.len() < 8 {
+        return None;
+    }
+    let len = u64::from_le_bytes(bytes[..8].try_into().ok()?) as usize;
+    let end = 8usize.checked_add(len)?;
+    std::str::from_utf8(bytes.get(8..end)?).ok().map(|s| s.to_owned())
+}
+
+/// Read an optional f32 from the GGUF metadata map.
+fn meta_read_f32(map: &MetaMap, key: &str) -> Option<f32> {
+    let (ty, bytes) = map.get(key)?;
+    if ty != Ty::F32 || bytes.len() < 4 {
+        return None;
+    }
+    Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Read a GGUF string array from the metadata map.
+/// Array header: `elem_type (u32 LE) + count (u64 LE)`.
+/// Each element: `u64_len (LE) + UTF-8 bytes`.
+fn meta_read_str_array(map: &MetaMap, key: &str) -> Vec<String> {
+    let (ty, bytes) = match map.get(key) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    if ty != Ty::Array || bytes.len() < 12 {
+        return Vec::new();
+    }
+    let elem_ty = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if elem_ty != 8 {
+        // 8 = STRING in GGUF spec
+        return Vec::new();
+    }
+    let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap_or([0; 8])) as usize;
+    let mut pos = 12usize;
+    let mut result = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        if pos + 8 > bytes.len() {
+            break;
+        }
+        let str_len =
+            u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap_or([0; 8])) as usize;
+        pos += 8;
+        if pos + str_len > bytes.len() {
+            break;
+        }
+        if let Ok(s) = std::str::from_utf8(&bytes[pos..pos + str_len]) {
+            result.push(s.to_owned());
+        }
+        pos += str_len;
+    }
+    result
 }
 
 fn read_optional_u32(map: &MetaMap, key: &str) -> Result<u32, EstimateError> {

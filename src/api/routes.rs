@@ -7,7 +7,7 @@ use std::path::Path as StdPath;
 
 use crate::config::{BinaryPreset, ModelConfig};
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
-use crate::vram::estimator::GgufInfo;
+use crate::vram::estimator::GgufMeta;
 
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.list_models().await)
@@ -101,12 +101,7 @@ pub async fn load_model(
             Json(serde_json::json!({"error": format!("model '{id}' not found")})),
         )
             .into_response(),
-        Err(
-            e @ (LoadError::PresetNotFound(_)
-            | LoadError::CannotLoadDraft(_)
-            | LoadError::DraftNotFound { .. }
-            | LoadError::DraftRoleMismatch { .. }),
-        ) => (
+        Err(e @ (LoadError::PresetNotFound(_) | LoadError::DraftNotFound { .. })) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": e.to_string()})),
         )
@@ -194,7 +189,7 @@ pub struct GgufInfoQuery {
 /// the context slider's upper bound and the live VRAM preview.
 pub async fn gguf_info(Query(q): Query<GgufInfoQuery>) -> impl IntoResponse {
     let expanded = shellexpand::tilde(&q.path).to_string();
-    match GgufInfo::read(StdPath::new(&expanded)) {
+    match GgufMeta::read(StdPath::new(&expanded)) {
         Ok(info) => (StatusCode::OK, Json(info)).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

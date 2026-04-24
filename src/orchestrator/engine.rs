@@ -1,5 +1,5 @@
 use crate::config::{
-    BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelRole, ModelState, WeightsFormat,
+    BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat,
 };
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
@@ -175,7 +175,6 @@ impl Orchestrator {
     }
 
     pub async fn add_model(&self, model: ModelConfig) -> Result<(), MutationError> {
-        model.validate_for_role().map_err(MutationError::from)?;
         let mut data = self.data.lock().await;
         if data.models.contains_key(&model.id) {
             return Err(MutationError::Conflict(model.id));
@@ -189,7 +188,6 @@ impl Orchestrator {
     }
 
     pub async fn update_model(&self, new: ModelConfig) -> Result<(), MutationError> {
-        new.validate_for_role().map_err(MutationError::from)?;
         let mut data = self.data.lock().await;
         if let Some(ref did) = new.draft_model_id {
             validate_draft_reference(&data.models, &new.id, did)?;
@@ -228,23 +226,23 @@ impl Orchestrator {
     pub async fn remove_model(&self, id: &str) -> Result<(), MutationError> {
         {
             let data = self.data.lock().await;
-            let m = data.models.get(id).ok_or_else(|| MutationError::NotFound(id.into()))?;
-            // Refuse to delete a draft that any target references —
-            // otherwise the target would try to spawn with a stale
-            // draft_model_id pointing at nothing.
-            if m.role == ModelRole::Draft {
-                let referrers: Vec<String> = data
-                    .models
-                    .values()
-                    .filter(|other| other.draft_model_id.as_deref() == Some(id))
-                    .map(|other| other.id.clone())
-                    .collect();
-                if !referrers.is_empty() {
-                    return Err(MutationError::DraftInUse {
-                        id: id.into(),
-                        targets: referrers,
-                    });
-                }
+            if !data.models.contains_key(id) {
+                return Err(MutationError::NotFound(id.into()));
+            }
+            // Refuse to delete a model that any other model uses as a draft —
+            // that would leave the referencing model trying to spawn with a
+            // stale draft_model_id pointing at nothing.
+            let referrers: Vec<String> = data
+                .models
+                .values()
+                .filter(|other| other.draft_model_id.as_deref() == Some(id))
+                .map(|other| other.id.clone())
+                .collect();
+            if !referrers.is_empty() {
+                return Err(MutationError::DraftInUse {
+                    id: id.into(),
+                    targets: referrers,
+                });
             }
         };
         // Try a graceful stop first so the child dies cleanly.
@@ -407,11 +405,6 @@ impl Orchestrator {
                     .get(id)
                     .cloned()
                     .ok_or_else(|| LoadError::ModelNotFound(id.into()))?;
-                // Drafts never spawn on their own. Route the caller to
-                // the target that should be loaded instead.
-                if m.role == ModelRole::Draft {
-                    return Err(LoadError::CannotLoadDraft(id.into()));
-                }
                 if let Some(ref preset_id) = m.binary_preset {
                     match data.presets.get(preset_id) {
                         Some(p) => m.binary = p.binary.clone(),
@@ -430,12 +423,6 @@ impl Orchestrator {
                             target: id.into(),
                         }
                     })?;
-                    if d.role != ModelRole::Draft {
-                        return Err(LoadError::DraftRoleMismatch {
-                            id: did.clone(),
-                            target: id.into(),
-                        });
-                    }
                     Some(d)
                 } else {
                     None
@@ -597,8 +584,8 @@ impl Orchestrator {
             let (mut model, draft) = {
                 let data = self.data.lock().await;
                 let m = match data.models.get(id) {
-                    Some(m) if m.role != ModelRole::Draft => m.clone(),
-                    _ => return,
+                    Some(m) => m.clone(),
+                    None => return,
                 };
                 let mut model = m;
                 if let Some(ref preset_id) = model.binary_preset {
@@ -746,17 +733,8 @@ pub enum LoadError {
     #[error("binary preset '{0}' not found — edit the model and pick an existing preset or a custom path")]
     PresetNotFound(String),
 
-    #[error(
-        "'{0}' is a draft model — drafts don't spawn their own process. \
-         Load the target that references this draft instead."
-    )]
-    CannotLoadDraft(String),
-
-    #[error("target '{target}' references draft '{id}', but no model with that id exists")]
+    #[error("model references draft '{id}', but no model '{id}' exists (target: '{target}')")]
     DraftNotFound { id: String, target: String },
-
-    #[error("target '{target}' references '{id}' as a draft, but that model's role is not 'draft'")]
-    DraftRoleMismatch { id: String, target: String },
 
     #[error("spawn failed: {0}")]
     SpawnFailed(SpawnError),
@@ -779,7 +757,7 @@ pub enum MutationError {
     #[error("invalid config: {0}")]
     InvalidConfig(#[from] ConfigError),
 
-    #[error("cannot delete draft '{id}': referenced by {}", targets.join(", "))]
+    #[error("cannot delete '{id}': used as a draft by {}", targets.join(", "))]
     DraftInUse { id: String, targets: Vec<String> },
 }
 
@@ -787,8 +765,6 @@ pub enum MutationError {
 ///
 /// Checked conditions:
 /// - The referenced id exists in the table.
-/// - That model has `role = Draft`.
-/// - A target isn't referencing itself.
 fn validate_draft_reference(
     models: &HashMap<String, ModelConfig>,
     self_id: &str,
@@ -797,18 +773,10 @@ fn validate_draft_reference(
     if draft_id == self_id {
         return Err(MutationError::InvalidConfig(ConfigError::DraftSelfReference));
     }
-    let Some(referenced) = models.get(draft_id) else {
+    if !models.contains_key(draft_id) {
         return Err(MutationError::InvalidConfig(ConfigError::DraftNotFound {
             id: draft_id.to_string(),
         }));
-    };
-    if referenced.role != ModelRole::Draft {
-        return Err(MutationError::InvalidConfig(
-            ConfigError::ReferencedModelNotADraft {
-                id: draft_id.to_string(),
-                role: "target",
-            },
-        ));
     }
     Ok(())
 }
@@ -1001,11 +969,10 @@ mod tests {
 
     // ----- Speculative decoding -----
 
-    fn draft(id: &str) -> ModelConfig {
+    fn draft_model(id: &str) -> ModelConfig {
         ModelConfig {
             id: id.into(),
             name: id.into(),
-            role: ModelRole::Draft,
             model_path: PathBuf::from("/tmp/draft.gguf"),
             context: 16384,
             device: Some("Vulkan1".into()),
@@ -1014,10 +981,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_draft_and_target_referencing_it() {
+    async fn add_model_with_draft_reference() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(draft("d")).await.unwrap();
+        o.add_model(draft_model("d")).await.unwrap();
         let mut t = model("t");
         t.draft_model_id = Some("d".into());
         t.draft_max = Some(16);
@@ -1027,7 +994,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_target_referencing_nonexistent_draft_errors() {
+    async fn add_model_referencing_nonexistent_draft_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
         let mut t = model("t");
@@ -1040,21 +1007,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_target_referencing_another_target_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("other")).await.unwrap();
-        let mut t = model("t");
-        t.draft_model_id = Some("other".into());
-        let err = o.add_model(t).await.unwrap_err();
-        assert!(matches!(
-            err,
-            MutationError::InvalidConfig(ConfigError::ReferencedModelNotADraft { .. }),
-        ));
-    }
-
-    #[tokio::test]
-    async fn target_cannot_reference_itself_as_draft() {
+    async fn model_cannot_reference_itself_as_draft() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
         let mut t = model("t");
@@ -1067,10 +1020,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_draft_in_use_errors_with_referrers() {
+    async fn remove_model_in_use_as_draft_errors_with_referrers() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(draft("d")).await.unwrap();
+        o.add_model(draft_model("d")).await.unwrap();
         let mut t1 = model("t1");
         t1.draft_model_id = Some("d".into());
         let mut t2 = model("t2");
@@ -1090,10 +1043,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_draft_after_unreferencing_succeeds() {
+    async fn remove_model_after_unreferencing_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let o = orch(&tmp);
-        o.add_model(draft("d")).await.unwrap();
+        o.add_model(draft_model("d")).await.unwrap();
         let mut t = model("t");
         t.draft_model_id = Some("d".into());
         o.add_model(t.clone()).await.unwrap();
@@ -1102,15 +1055,6 @@ mod tests {
         t.draft_model_id = None;
         o.update_model(t).await.unwrap();
         assert!(o.remove_model("d").await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn ensure_loaded_rejects_draft_with_helpful_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(draft("d")).await.unwrap();
-        let err = o.clone().ensure_loaded("d").await.unwrap_err();
-        assert!(matches!(err, LoadError::CannotLoadDraft(_)));
     }
 
     #[tokio::test]

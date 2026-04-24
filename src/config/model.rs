@@ -24,23 +24,6 @@ pub enum WeightsFormat {
     Safetensors,
 }
 
-/// A model's role in the inference pipeline.
-///
-/// - `Target` (default): a normal model that serves requests on its own
-///   port. Can optionally reference a `Draft` model via `draft_model_id`
-///   for speculative decoding.
-/// - `Draft`: a model that exists only to be used as a draft by some
-///   target. Never spawns its own process, never appears in /v1/models,
-///   and many `ModelConfig` fields (port, binary, sampling, reasoning,
-///   split mode, etc.) are meaningless for it.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelRole {
-    #[default]
-    Target,
-    Draft,
-}
-
 /// Runtime state of a model.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum ModelState {
@@ -232,25 +215,20 @@ pub struct ModelConfig {
     pub chat_template_kwargs: Option<String>,
 
     // ===== Speculative decoding =====
-    // Data model: drafts are first-class `ModelConfig` entries with
-    // `role = Draft`. A target references a draft by id; the argv
+    // A model can reference another model by id as its draft. The argv
     // builder pulls the draft's `model_path`, `context`, `n_gpu_layers`,
     // `cache_type_{k,v}`, and `device` to emit `-md / -cd / -ngld /
-    // -ctkd / -ctvd / -devd`. Spec-decode policy (how hard the target
-    // drives the draft) lives on the target: `draft_max`, `draft_min`,
+    // -ctkd / -ctvd / -devd`. Spec-decode policy (how hard this model
+    // drives the draft) lives here: `draft_max`, `draft_min`,
     // `draft_p_min`, `ctx_checkpoints`, `checkpoint_every_n_tokens`.
 
-    #[serde(default)]
-    pub role: ModelRole,
-
-    /// `-devd <dev1,dev2,…>` device list for the draft model. Only
-    /// meaningful when `role = Draft`; targets place their own layers
-    /// via `tensor_split`.
+    /// `-devd <dev1,dev2,…>` device list when this model is embedded as
+    /// a draft inside another model's spawn. Leave blank to let llama.cpp pick.
     #[serde(default)]
     pub device: Option<String>,
 
-    /// ID of a `role = Draft` entry to use for speculative decoding.
-    /// Only meaningful when `role = Target`. Presence enables spec-decode.
+    /// ID of another model to use as a speculative-decoding draft.
+    /// Presence enables spec-decode.
     #[serde(default)]
     pub draft_model_id: Option<String>,
 
@@ -280,6 +258,11 @@ pub struct ModelConfig {
     pub estimated_vram: u64,
     #[serde(default)]
     pub last_used: Option<f64>,
+    /// Rich GGUF metadata snapshot stored at model-creation time.
+    /// Populated by the dashboard's 2-step "Add model" flow; absent for
+    /// models added before this field existed or via the API without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gguf_meta: Option<crate::vram::estimator::GgufMeta>,
 }
 
 impl Default for ModelConfig {
@@ -314,7 +297,6 @@ impl Default for ModelConfig {
             reasoning_format: None,
             reasoning_budget: None,
             chat_template_kwargs: None,
-            role: ModelRole::default(),
             device: None,
             draft_model_id: None,
             draft_max: None,
@@ -326,23 +308,17 @@ impl Default for ModelConfig {
             pid: None,
             estimated_vram: 0,
             last_used: None,
+            gguf_meta: None,
         }
     }
 }
 
-/// Validation error returned by `ModelConfig::validate_for_role`.
-///
-/// Thin and structured so the API can translate it into a helpful 4xx
-/// without string-sniffing.
+/// Validation error returned when adding/updating a model config.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("field '{field}' is not valid for role '{role}'")]
-    FieldNotAllowedForRole { field: &'static str, role: &'static str },
-    #[error("target references draft '{id}', but no model with that id exists")]
+    #[error("model references draft '{id}', but no model with that id exists")]
     DraftNotFound { id: String },
-    #[error("target references '{id}' as a draft, but that model has role '{role}'")]
-    ReferencedModelNotADraft { id: String, role: &'static str },
-    #[error("target cannot reference itself as a draft")]
+    #[error("model cannot reference itself as a draft")]
     DraftSelfReference,
 }
 
@@ -477,62 +453,6 @@ impl ModelConfig {
         changed
     }
 
-    /// Validate that the fields present are consistent with `self.role`.
-    ///
-    /// - `Target` role forbids `device` (targets use `tensor_split`).
-    /// - `Draft` role forbids target-only fields: any spec-decode flag,
-    ///   any flag that controls standalone-server behaviour (port's
-    ///   backend binding, multi-GPU split modes, sampling, reasoning
-    ///   template knobs, etc.).
-    ///
-    /// Called from the orchestrator on add/update. Fields that are
-    /// *silently ignored* (binary, binary_preset, sampling params on a
-    /// draft) are NOT rejected — they're harmless and make copy-paste
-    /// from an existing target form less painful. Fields that would
-    /// actively misconfigure the spawn or mislead the user (draft
-    /// trying to set its own draft_model_id, target setting `device`
-    /// instead of tensor_split) are rejected with a structured error.
-    pub fn validate_for_role(&self) -> Result<(), ConfigError> {
-        match self.role {
-            ModelRole::Target => {
-                if self.device.is_some() {
-                    return Err(ConfigError::FieldNotAllowedForRole {
-                        field: "device",
-                        role: "target",
-                    });
-                }
-            }
-            ModelRole::Draft => {
-                let checks: &[(&'static str, bool)] = &[
-                    ("parallel_slots", self.parallel_slots.is_some()),
-                    ("split_mode", self.split_mode.is_some()),
-                    ("main_gpu", self.main_gpu.is_some()),
-                    ("tensor_split", self.tensor_split.is_some()),
-                    ("reasoning_format", self.reasoning_format.is_some()),
-                    ("reasoning_budget", self.reasoning_budget.is_some()),
-                    ("chat_template_kwargs", self.chat_template_kwargs.is_some()),
-                    ("draft_model_id", self.draft_model_id.is_some()),
-                    ("draft_max", self.draft_max.is_some()),
-                    ("draft_min", self.draft_min.is_some()),
-                    ("draft_p_min", self.draft_p_min.is_some()),
-                    ("ctx_checkpoints", self.ctx_checkpoints.is_some()),
-                    (
-                        "checkpoint_every_n_tokens",
-                        self.checkpoint_every_n_tokens.is_some(),
-                    ),
-                ];
-                for (field, present) in checks {
-                    if *present {
-                        return Err(ConfigError::FieldNotAllowedForRole {
-                            field,
-                            role: "draft",
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -620,7 +540,6 @@ mod tests {
         assert_eq!(parsed.presence_penalty, 0.0);
         assert_eq!(parsed.repeat_penalty, 1.0);
         // Spec-decode fields default to off/unset.
-        assert_eq!(parsed.role, ModelRole::Target);
         assert_eq!(parsed.device, None);
         assert_eq!(parsed.draft_model_id, None);
         assert_eq!(parsed.draft_max, None);
@@ -799,122 +718,6 @@ mod tests {
     }
 
     // ----- Speculative decoding -----
-
-    fn target() -> ModelConfig {
-        ModelConfig {
-            id: "target".into(),
-            name: "T".into(),
-            binary: PathBuf::from("/bin/llama"),
-            model_path: PathBuf::from("/m.gguf"),
-            ..ModelConfig::default()
-        }
-    }
-
-    fn draft() -> ModelConfig {
-        ModelConfig {
-            id: "draft".into(),
-            name: "D".into(),
-            model_path: PathBuf::from("/d.gguf"),
-            role: ModelRole::Draft,
-            ..ModelConfig::default()
-        }
-    }
-
-    #[test]
-    fn model_role_serializes_lowercase() {
-        assert_eq!(serde_json::to_string(&ModelRole::Target).unwrap(), "\"target\"");
-        assert_eq!(serde_json::to_string(&ModelRole::Draft).unwrap(), "\"draft\"");
-    }
-
-    #[test]
-    fn role_defaults_to_target_for_legacy_json() {
-        // Pre-spec-decode JSON (no "role" field) must deserialize as Target
-        // so old models.json files keep working.
-        let json = r#"{
-            "id": "legacy", "name": "Legacy",
-            "weights_format": "gguf",
-            "binary": "/bin/llama", "model_path": "/m.gguf",
-            "port": 9001, "context": 4096
-        }"#;
-        let parsed: ModelConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.role, ModelRole::Target);
-    }
-
-    #[test]
-    fn target_with_draft_reference_is_valid() {
-        let mut t = target();
-        t.draft_model_id = Some("draft".into());
-        t.draft_max = Some(16);
-        t.ctx_checkpoints = Some(4);
-        assert!(t.validate_for_role().is_ok());
-    }
-
-    #[test]
-    fn target_cannot_set_device() {
-        // `device` is draft-only. Targets place their own layers via
-        // tensor_split; rejecting `device` here prevents confusion.
-        let mut t = target();
-        t.device = Some("Vulkan0".into());
-        let err = t.validate_for_role().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::FieldNotAllowedForRole { field: "device", role: "target" },
-        ));
-    }
-
-    #[test]
-    fn draft_cannot_set_draft_model_id() {
-        // A draft referencing another draft makes no sense — only
-        // targets drive speculative decoding.
-        let mut d = draft();
-        d.draft_model_id = Some("another-draft".into());
-        let err = d.validate_for_role().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::FieldNotAllowedForRole { field: "draft_model_id", role: "draft" },
-        ));
-    }
-
-    #[test]
-    fn draft_cannot_set_tensor_split() {
-        // Drafts place themselves with -devd; the tensor-split concept
-        // doesn't apply.
-        let mut d = draft();
-        d.tensor_split = Some("0.5,0.5".into());
-        let err = d.validate_for_role().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::FieldNotAllowedForRole { field: "tensor_split", role: "draft" },
-        ));
-    }
-
-    #[test]
-    fn draft_cannot_set_reasoning_or_chat_template() {
-        // Reasoning / chat template knobs affect the server's response
-        // shaping, which drafts don't do — they produce candidate tokens
-        // that the target validates and re-samples.
-        for mut d in [draft(), draft(), draft()] {
-            d.reasoning_format = Some(ReasoningFormat::Auto);
-            assert!(d.validate_for_role().is_err());
-        }
-        let mut d = draft();
-        d.chat_template_kwargs = Some(r#"{"enable_thinking":false}"#.into());
-        assert!(d.validate_for_role().is_err());
-    }
-
-    #[test]
-    fn draft_allows_device_model_path_context_cache_types() {
-        // The fields that ARE meaningful on a draft (what gets passed as
-        // -md / -cd / -ctkd / -ctvd / -devd / -ngld) must pass validation.
-        let mut d = draft();
-        d.device = Some("Vulkan1".into());
-        d.context = 16384;
-        d.cache_type_k = Some(CacheType::Q8_0);
-        d.cache_type_v = Some(CacheType::Q8_0);
-        d.n_gpu_layers = Some(99);
-        d.flash_attn = true;
-        assert!(d.validate_for_role().is_ok());
-    }
 
     #[test]
     fn migrate_extracts_spec_decode_policy_flags() {

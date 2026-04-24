@@ -1,4 +1,4 @@
-use crate::config::{ModelConfig, ModelRole, SplitMode, WeightsFormat};
+use crate::config::{ModelConfig, SplitMode, WeightsFormat};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -339,7 +339,7 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
                 args.push(kw.clone());
             }
 
-            if let (Some(d), ModelRole::Target) = (draft, model.role) {
+            if let Some(d) = draft {
                 args.push("-md".into());
                 args.push(d.model_path.to_string_lossy().into_owned());
                 if let Some(n) = d.n_gpu_layers {
@@ -723,11 +723,9 @@ mod tests {
     }
 
     fn draft_model() -> ModelConfig {
-        use crate::config::ModelRole;
         ModelConfig {
             id: "draft".into(),
             name: "D".into(),
-            role: ModelRole::Draft,
             model_path: PathBuf::from("/models/draft.gguf"),
             context: 16384,
             n_gpu_layers: Some(99),
