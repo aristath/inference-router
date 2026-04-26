@@ -88,7 +88,7 @@
             <button type="button" class="btn btn-primary" onclick="openAddModelModal()">+ Add Model</button>
         </div>
 
-        {% if models.is_empty() %}
+        {% if groups.is_empty() %}
         <div class="card">
             <div class="empty-state">
                 <p>No models configured.</p>
@@ -96,48 +96,50 @@
             </div>
         </div>
         {% else %}
-        <div class="card" style="padding: 0; overflow-x: auto;">
-            <table id="models-table">
-                <thead>
-                    <tr>
-                        <th class="sortable" data-col="name"    data-type="text">Name</th>
-                        <th class="sortable" data-col="format"  data-type="text">Format</th>
-                        <th class="sortable" data-col="context" data-type="num">Context</th>
-                        <th class="sortable" data-col="size"    data-type="num">Size (GB)</th>
-                        <th class="sortable" data-col="reqvram" data-type="num">Required VRAM</th>
-                        <th class="sortable" data-col="status"  data-type="text">Status</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for model in models %}
-                    <tr id="model-row-{{ model.id }}" data-name="{{ model.name }}">
-                        <td data-sort="{{ model.name }}">{{ model.name }}</td>
-                        <td data-sort="{{ model.format_str }}">{{ model.format_str }}</td>
-                        <td data-sort="{{ model.context }}">{{ model.context }}</td>
-                        <td data-sort="{{ model.file_size_bytes }}">{{ model.file_size_gib_str }} GiB</td>
-                        <td data-sort="{{ model.required_vram_bytes }}">{{ model.required_vram_gib_str }} GiB</td>
-                        <td data-sort="{{ model.state_class }}">
-                            <span class="badge badge-{{ model.state_class }}" id="model-status-{{ model.id }}">
-                                {{ model.state_display }}
-                            </span>
-                        </td>
-                        <td>
-                            <div class="actions">
-                                {% if model.state_class == "idle" || model.state_class == "error" %}
-                                <button type="button" class="btn btn-success btn-sm" onclick="loadModel('{{ model.id }}')">Load</button>
-                                {% endif %}
-                                {% if model.state_class == "running" %}
-                                <button type="button" class="btn btn-danger btn-sm" onclick="stopModel('{{ model.id }}')">Stop</button>
-                                {% endif %}
-                                <button type="button" class="btn btn-secondary btn-sm" onclick="editModel('{{ model.id }}')">Edit</button>
-                                <button type="button" class="btn btn-danger btn-sm" onclick="deleteModel('{{ model.id }}', '{{ model.name }}')">Delete</button>
-                            </div>
-                        </td>
-                    </tr>
+        <div id="model-groups">
+            {% for group in groups %}
+            <div class="model-group">
+                <h3 class="model-group-heading">{{ group.display_name }}</h3>
+                <div class="model-cards">
+                    {% for model in group.models %}
+                    <div class="model-card" id="model-card-{{ model.id }}" data-name="{{ model.name }}">
+                        <div class="model-card-header">
+                            <span class="model-card-name">{{ model.name }}</span>
+                            <span class="badge badge-{{ model.state_class }}" id="model-status-{{ model.id }}">{{ model.state_display }}</span>
+                        </div>
+                        <div class="model-card-chips">
+                            {% if !model.size_label.is_empty() %}
+                            <span class="model-chip size">{{ model.size_label }}</span>
+                            {% endif %}
+                            {% if !model.quant_label.is_empty() %}
+                            <span class="model-chip quant">{{ model.quant_label }}</span>
+                            {% endif %}
+                            <span class="model-chip">{{ model.format_str }}</span>
+                        </div>
+                        <div class="model-card-stats">
+                            <span>{{ model.context_str }}</span>
+                            {% if !model.file_size_gib_str.eq("—") %}
+                            <span>{{ model.file_size_gib_str }} GiB</span>
+                            {% endif %}
+                            {% if !model.required_vram_gib_str.eq("—") %}
+                            <span title="Estimated VRAM">{{ model.required_vram_gib_str }} GiB VRAM</span>
+                            {% endif %}
+                        </div>
+                        <div class="model-card-actions">
+                            {% if model.state_class == "idle" || model.state_class == "error" %}
+                            <button type="button" class="btn btn-success btn-sm" onclick="loadModel('{{ model.id }}')">Load</button>
+                            {% endif %}
+                            {% if model.state_class == "running" %}
+                            <button type="button" class="btn btn-danger btn-sm" onclick="stopModel('{{ model.id }}')">Stop</button>
+                            {% endif %}
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="editModel('{{ model.id }}')">Edit</button>
+                            <button type="button" class="btn btn-danger btn-sm" onclick="deleteModel('{{ model.id }}', '{{ model.name }}')">Delete</button>
+                        </div>
+                    </div>
                     {% endfor %}
-                </tbody>
-            </table>
+                </div>
+            </div>
+            {% endfor %}
         </div>
         {% endif %}
     </div>
@@ -189,7 +191,6 @@
                     <span id="model-path-meta-pill" style="background:#0f172a; border:1px solid #475569; border-radius:4px; padding:0.1rem 0.5rem; font-size:0.85rem; color:#94a3b8; white-space:nowrap;"></span>
                 </div>
                 <input type="hidden" id="form-mode" value="add">
-                <input type="hidden" id="model_path" name="model_path">
 
                 <!-- Tab bar -->
                 <div class="tab-bar">
@@ -201,6 +202,7 @@
                 </div>
 
                 <form id="model-form">
+                    <input type="hidden" id="model_path" name="model_path">
 
                     <!-- ── Essentials ── -->
                     <div class="tab-panel active" id="tab-essentials">
@@ -334,110 +336,112 @@
                     <!-- ── Hardware ── -->
                     <div class="tab-panel" id="tab-hardware">
                         <small class="field-help" style="display:block; margin-bottom:0.75rem;">Backend flags for <code>llama-server</code>. Applied only when Weights format is GGUF.</small>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label style="display:flex; align-items:center; gap:0.5rem;">
-                                    <input type="checkbox" id="flash_attn" name="flash_attn">Flash attention
-                                </label>
-                                <small class="field-help">Lower VRAM, faster attention. Required for KV cache quantization.</small>
+                        <div id="llama-section">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label style="display:flex; align-items:center; gap:0.5rem;">
+                                        <input type="checkbox" id="flash_attn" name="flash_attn">Flash attention
+                                    </label>
+                                    <small class="field-help">Lower VRAM, faster attention. Required for KV cache quantization.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label style="display:flex; align-items:center; gap:0.5rem;">
+                                        <input type="checkbox" id="mlock" name="mlock">Lock in RAM (mlock)
+                                    </label>
+                                    <small class="field-help">Pin model in RAM to prevent swap.</small>
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label style="display:flex; align-items:center; gap:0.5rem;">
+                                        <input type="checkbox" id="no_mmap" name="no_mmap">Disable mmap
+                                    </label>
+                                    <small class="field-help">Load fully into RAM instead of memory-mapping from disk.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="parallel_slots">
+                                        Parallel slots
+                                        <span id="parallel_slots_display" style="color:#38bdf8; font-weight:normal; margin-left:0.5rem;"></span>
+                                    </label>
+                                    <div class="slider-container">
+                                        <input type="range" id="parallel_slots_slider" min="0" max="16" step="1" value="0">
+                                        <input type="hidden" id="parallel_slots" name="parallel_slots" value="">
+                                    </div>
+                                    <small class="field-help">Concurrent request slots. 0 = llama.cpp default.</small>
+                                </div>
                             </div>
                             <div class="form-group">
-                                <label style="display:flex; align-items:center; gap:0.5rem;">
-                                    <input type="checkbox" id="mlock" name="mlock">Lock in RAM (mlock)
-                                </label>
-                                <small class="field-help">Pin model in RAM to prevent swap.</small>
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label style="display:flex; align-items:center; gap:0.5rem;">
-                                    <input type="checkbox" id="no_mmap" name="no_mmap">Disable mmap
-                                </label>
-                                <small class="field-help">Load fully into RAM instead of memory-mapping from disk.</small>
-                            </div>
-                            <div class="form-group">
-                                <label for="parallel_slots">
-                                    Parallel slots
-                                    <span id="parallel_slots_display" style="color:#38bdf8; font-weight:normal; margin-left:0.5rem;"></span>
+                                <label for="n_gpu_layers">
+                                    GPU layers (<code>-ngl</code>)
+                                    <span id="ngl_display" style="color:#38bdf8; font-weight:normal; margin-left:0.5rem;"></span>
                                 </label>
                                 <div class="slider-container">
-                                    <input type="range" id="parallel_slots_slider" min="0" max="16" step="1" value="0">
-                                    <input type="hidden" id="parallel_slots" name="parallel_slots" value="">
+                                    <input type="range" id="n_gpu_layers_slider" min="0" max="128" step="1" value="0">
+                                    <input type="hidden" id="n_gpu_layers" name="n_gpu_layers" value="">
                                 </div>
-                                <small class="field-help">Concurrent request slots. 0 = llama.cpp default.</small>
+                                <small class="field-help" id="ngl_help">Layers to offload to GPU. 0 = leave flag off (default).</small>
                             </div>
-                        </div>
-                        <div class="form-group">
-                            <label for="n_gpu_layers">
-                                GPU layers (<code>-ngl</code>)
-                                <span id="ngl_display" style="color:#38bdf8; font-weight:normal; margin-left:0.5rem;"></span>
-                            </label>
-                            <div class="slider-container">
-                                <input type="range" id="n_gpu_layers_slider" min="0" max="128" step="1" value="0">
-                                <input type="hidden" id="n_gpu_layers" name="n_gpu_layers" value="">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="split_mode">Split mode</label>
+                                    <select id="split_mode" name="split_mode">
+                                        <option value="">auto</option>
+                                        <option value="none">none — single GPU</option>
+                                        <option value="layer">layer — pipeline parallelism</option>
+                                        <option value="row">row — row-wise split</option>
+                                        <option value="tensor">tensor — tensor parallelism</option>
+                                    </select>
+                                    <small class="field-help"><strong>layer</strong> = safe multi-GPU default. row/tensor require ROCm build.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="tensor_split">Tensor split</label>
+                                    <input type="text" id="tensor_split" name="tensor_split" placeholder="leave blank for auto">
+                                    <small class="field-help">Fractions per GPU (e.g. <code>0.5,0.5,0</code>). Blank = auto-allocate.</small>
+                                </div>
                             </div>
-                            <small class="field-help" id="ngl_help">Layers to offload to GPU. 0 = leave flag off (default).</small>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="split_mode">Split mode</label>
-                                <select id="split_mode" name="split_mode">
-                                    <option value="">auto</option>
-                                    <option value="none">none — single GPU</option>
-                                    <option value="layer">layer — pipeline parallelism</option>
-                                    <option value="row">row — row-wise split</option>
-                                    <option value="tensor">tensor — tensor parallelism</option>
-                                </select>
-                                <small class="field-help"><strong>layer</strong> = safe multi-GPU default. row/tensor require ROCm build.</small>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="main_gpu">Main GPU</label>
+                                    <input type="number" id="main_gpu" name="main_gpu" min="0" placeholder="auto">
+                                </div>
+                                <div class="form-group">
+                                    <label for="device">Draft device (<code>-devd</code>)</label>
+                                    <input type="text" id="device" name="device" placeholder="e.g. Vulkan1">
+                                    <small class="field-help">GPU(s) when embedded as a spec-decode draft. Blank = auto.</small>
+                                </div>
                             </div>
-                            <div class="form-group">
-                                <label for="tensor_split">Tensor split</label>
-                                <input type="text" id="tensor_split" name="tensor_split" placeholder="leave blank for auto">
-                                <small class="field-help">Fractions per GPU (e.g. <code>0.5,0.5,0</code>). Blank = auto-allocate.</small>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="cache_type_k">K cache quantization</label>
+                                    <select id="cache_type_k" name="cache_type_k">
+                                        <option value="">default (f16)</option>
+                                        <option value="f16">f16</option>
+                                        <option value="q8_0">q8_0 (½ VRAM)</option>
+                                        <option value="q4_0">q4_0 (¼ VRAM)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="cache_type_v">V cache quantization</label>
+                                    <select id="cache_type_v" name="cache_type_v">
+                                        <option value="">default (f16)</option>
+                                        <option value="f16">f16</option>
+                                        <option value="q8_0">q8_0 (½ VRAM)</option>
+                                        <option value="q4_0">q4_0 (¼ VRAM)</option>
+                                    </select>
+                                    <small class="field-help">Requires flash attention if not f16.</small>
+                                </div>
                             </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="main_gpu">Main GPU</label>
-                                <input type="number" id="main_gpu" name="main_gpu" min="0" placeholder="auto">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="threads">Threads (<code>--threads</code>)</label>
+                                    <input type="number" id="threads" name="threads" min="-1" placeholder="-1 (auto)">
+                                </div>
+                                <div class="form-group">
+                                    <label for="cache_ram_mib">Cache RAM / MiB (<code>--cache-ram</code>)</label>
+                                    <input type="number" id="cache_ram_mib" name="cache_ram_mib" min="-1" placeholder="8192 (default)">
+                                </div>
                             </div>
-                            <div class="form-group">
-                                <label for="device">Draft device (<code>-devd</code>)</label>
-                                <input type="text" id="device" name="device" placeholder="e.g. Vulkan1">
-                                <small class="field-help">GPU(s) when embedded as a spec-decode draft. Blank = auto.</small>
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="cache_type_k">K cache quantization</label>
-                                <select id="cache_type_k" name="cache_type_k">
-                                    <option value="">default (f16)</option>
-                                    <option value="f16">f16</option>
-                                    <option value="q8_0">q8_0 (½ VRAM)</option>
-                                    <option value="q4_0">q4_0 (¼ VRAM)</option>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label for="cache_type_v">V cache quantization</label>
-                                <select id="cache_type_v" name="cache_type_v">
-                                    <option value="">default (f16)</option>
-                                    <option value="f16">f16</option>
-                                    <option value="q8_0">q8_0 (½ VRAM)</option>
-                                    <option value="q4_0">q4_0 (¼ VRAM)</option>
-                                </select>
-                                <small class="field-help">Requires flash attention if not f16.</small>
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="threads">Threads (<code>--threads</code>)</label>
-                                <input type="number" id="threads" name="threads" min="-1" placeholder="-1 (auto)">
-                            </div>
-                            <div class="form-group">
-                                <label for="cache_ram_mib">Cache RAM / MiB (<code>--cache-ram</code>)</label>
-                                <input type="number" id="cache_ram_mib" name="cache_ram_mib" min="-1" placeholder="8192 (default)">
-                            </div>
-                        </div>
+                        </div><!-- /llama-section -->
                     </div><!-- /tab-hardware -->
 
                     <!-- ── Speculative decoding ── -->
@@ -590,6 +594,20 @@
 .browser-item.is-dir { color:#38bdf8; }
 .browser-item.is-file { color:#94a3b8; }
 .browser-item.is-gguf { color:#34d399; }
+/* ── Model card grid ── */
+.model-group { margin-bottom: 1.75rem; }
+.model-group + .model-group { border-top: 1px solid #334155; padding-top: 1.5rem; }
+.model-group-heading { font-size: 1.1rem; font-weight: 700; color: #94a3b8; margin: 0 0 0.75rem 0; letter-spacing: 0.04em; }
+.model-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.65rem; }
+.model-card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 0.85rem 0.95rem; display: flex; flex-direction: column; gap: 0.45rem; }
+.model-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem; }
+.model-card-name { font-weight: 600; font-size: 0.95rem; color: #e2e8f0; flex: 1; line-height: 1.35; word-break: break-word; }
+.model-card-chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.model-chip { font-size: 0.75rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: #0f172a; border: 1px solid #334155; color: #64748b; }
+.model-chip.quant { color: #38bdf8; border-color: #1e40af; }
+.model-chip.size  { color: #a78bfa; border-color: #4c1d95; }
+.model-card-stats { font-size: 0.85rem; color: #475569; display: flex; gap: 0.6rem; flex-wrap: wrap; }
+.model-card-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.1rem; }
 </style>
 
 <script>
@@ -656,6 +674,8 @@ async function step1Continue() {
         return;
     }
     if (hint) { hint.textContent = ''; hint.style.color = ''; }
+    const browser = document.getElementById('step1-browser');
+    if (browser) browser.style.display = 'none';
     // Build a pre-populated model object from metadata.
     const m = Object.assign({}, MODEL_DEFAULTS, {
         model_path: path,
@@ -671,6 +691,8 @@ function step1Manual() {
     _currentGgufMeta = null;
     const pathEl = document.getElementById('step1-path');
     const path = (pathEl ? pathEl.value : '').trim();
+    const browser = document.getElementById('step1-browser');
+    if (browser) browser.style.display = 'none';
     const m = Object.assign({}, MODEL_DEFAULTS, { model_path: path });
     _showStep2(m, 'add');
 }
@@ -742,9 +764,7 @@ function step1BrowserUp() {
     _loadBrowserDir(parent === _step1BrowserCwd ? '/' : parent);
 }
 
-async function _showStep2(m, mode) {
-    await refreshPresetSelect();
-    await refreshDraftSelect();
+function _showStep2(m, mode) {
     document.getElementById('modal-step1').style.display = 'none';
     document.getElementById('modal-step2').style.display = '';
     populateModelForm(m, mode);
@@ -904,22 +924,21 @@ async function editModel(id) {
         const m = models.find(x => x.id === id);
         if (!m) { alert(`Model ${id} not found.`); return; }
         _editingModelGgufMeta = m.gguf_meta || null;
-        // If the target's currently-selected draft_model_id no longer
-        // exists in the list (e.g. the draft was deleted), keep the
-        // stored value visible as a disabled option so the user sees
-        // what needs fixing instead of silently losing it.
         await refreshPresetSelect();
         await refreshDraftSelect();
-        const sel = document.getElementById('draft_model_id');
-        if (sel && m.draft_model_id && !models.some(x => x.id === m.draft_model_id)) {
-            const o = document.createElement('option');
-            o.value = m.draft_model_id;
-            o.textContent = `${m.draft_model_id} (missing!)`;
-            o.disabled = false;
-            sel.appendChild(o);
+        // If the draft no longer exists, append a placeholder option so the
+        // user can see what needs fixing rather than silently losing it.
+        if (m.draft_model_id && !models.some(x => x.id === m.draft_model_id)) {
+            const sel = document.getElementById('draft_model_id');
+            if (sel) {
+                const o = document.createElement('option');
+                o.value = m.draft_model_id;
+                o.textContent = `${m.draft_model_id} (missing!)`;
+                sel.appendChild(o);
+            }
         }
+        _showStep2(m, 'edit');
         openModal('model-modal');
-        await _showStep2(m, 'edit');
     } catch (e) {
         alert(`Could not load model: ${e}`);
     }
@@ -1227,56 +1246,26 @@ async function deleteModel(id, name) {
     });
 })();
 
-// ===== Models table: filter + sort =====
+// ===== Model cards: filter =====
 
-(function wireModelTableControls() {
-    const table  = document.getElementById('models-table');
+(function wireModelFilter() {
     const filter = document.getElementById('model-filter');
-    if (!table || !filter) return;
-    const tbody = table.querySelector('tbody');
+    if (!filter) return;
 
     function applyFilter() {
         const needle = filter.value.trim().toLowerCase();
-        tbody.querySelectorAll('tr').forEach(tr => {
-            const name = (tr.dataset.name || '').toLowerCase();
-            tr.style.display = !needle || name.includes(needle) ? '' : 'none';
+        document.querySelectorAll('.model-group').forEach(group => {
+            let anyVisible = false;
+            group.querySelectorAll('.model-card').forEach(card => {
+                const name = (card.dataset.name || '').toLowerCase();
+                const show = !needle || name.includes(needle);
+                card.style.display = show ? '' : 'none';
+                if (show) anyVisible = true;
+            });
+            group.style.display = anyVisible ? '' : 'none';
         });
     }
     filter.addEventListener('input', applyFilter);
-
-    // Click-to-sort on every <th class="sortable">. Repeated clicks on the
-    // same column toggle asc / desc. Sort keys come from each cell's
-    // `data-sort` attribute so numbers sort numerically regardless of the
-    // displayed suffix (e.g. "12.3 GiB" sorts by raw bytes).
-    table.querySelectorAll('th.sortable').forEach((th, colIdx) => {
-        th.addEventListener('click', () => {
-            const type = th.dataset.type || 'text';
-            const currentlyAsc = th.classList.contains('sort-asc');
-            // Clear siblings.
-            table.querySelectorAll('th.sortable').forEach(other => {
-                other.classList.remove('sort-asc', 'sort-desc');
-            });
-            const asc = !currentlyAsc;
-            th.classList.add(asc ? 'sort-asc' : 'sort-desc');
-
-            const rows = Array.from(tbody.querySelectorAll('tr'));
-            rows.sort((a, b) => {
-                const av = a.children[colIdx].dataset.sort ?? a.children[colIdx].textContent;
-                const bv = b.children[colIdx].dataset.sort ?? b.children[colIdx].textContent;
-                let cmp;
-                if (type === 'num') {
-                    cmp = (parseFloat(av) || 0) - (parseFloat(bv) || 0);
-                } else {
-                    cmp = av.toString().localeCompare(bv.toString(), undefined, { sensitivity: 'base' });
-                }
-                return asc ? cmp : -cmp;
-            });
-            // Reinsert in the sorted order (DocumentFragment avoids reflows per-row).
-            const frag = document.createDocumentFragment();
-            rows.forEach(r => frag.appendChild(r));
-            tbody.appendChild(frag);
-        });
-    });
 })();
 
 // ===== Preset management (Settings modal) =====

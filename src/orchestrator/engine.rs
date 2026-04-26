@@ -33,6 +33,11 @@ pub struct Orchestrator {
     pub system_tracker: Arc<SystemTracker>,
     /// Cross-model serialization for VRAM admission + spawn. See `do_load`.
     pub admission: Arc<Mutex<()>>,
+    /// VRAM (bytes) reserved by in-flight loads: processes that have been
+    /// fork/exec'd but whose weights haven't yet appeared in sysfs readings.
+    /// Subtracted from the sysfs free-VRAM figure inside every admission
+    /// window so concurrent loads don't double-book the same headroom.
+    pub reserved_vram: Arc<std::sync::atomic::AtomicU64>,
     /// Per-model lock so concurrent `ensure_loaded("m")` calls collapse:
     /// the second waits, then sees `Running` and returns the existing port.
     pub load_guards: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -87,6 +92,7 @@ impl Orchestrator {
             vram_tracker: Arc::new(VRAMTracker),
             system_tracker: Arc::new(SystemTracker::default()),
             admission: Arc::new(Mutex::new(())),
+            reserved_vram: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             load_guards: Arc::new(Mutex::new(HashMap::new())),
             store,
             presets_store,
@@ -387,7 +393,7 @@ impl Orchestrator {
         // inside the admission block during GGUF reads; used after the health
         // check to recompute estimated_vram from the measured KV bytes.
         let mut weight_file_size: u64 = 0;
-        let (mut pending, pid, port) = {
+        let (mut pending, pid, port, vram_reservation) = {
             let _admit = self.admission.lock().await;
 
             // Refresh VRAM into AppData.
@@ -482,7 +488,12 @@ impl Orchestrator {
             }
 
             // Evict if needed.
-            let free: u64 = gpus.iter().map(|g| g.free_vram()).sum();
+            // Subtract VRAM already reserved by concurrent in-flight loads:
+            // their processes exist but haven't yet faulted weights into VRAM,
+            // so sysfs still reports the full free figure.
+            let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
+            let free: u64 = gpus.iter().map(|g| g.free_vram()).sum::<u64>()
+                .saturating_sub(already_reserved);
             if model.estimated_vram > free {
                 let snapshot = self.data.lock().await.models.clone();
                 for EvictionAction::Evict(victim) in
@@ -525,7 +536,13 @@ impl Orchestrator {
                 .map_err(LoadError::SpawnFailed)?;
             let pid = pending.pid;
             let port = pending.port;
-            (pending, pid, port)
+            // Reserve this model's VRAM before releasing admission so the
+            // next concurrent do_load sees the correct remaining budget.
+            let vram_reservation = model.estimated_vram;
+            if vram_reservation > 0 {
+                self.reserved_vram.fetch_add(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+            }
+            (pending, pid, port, vram_reservation)
         };
         // Admission and process_manager mutexes are dropped here; other
         // loads can proceed even while we're still waiting for `pending`
@@ -533,6 +550,10 @@ impl Orchestrator {
 
         match pending.wait_for_health(std::time::Duration::from_secs(180)).await {
             Ok(kv_bytes) => {
+                // Weights are now in VRAM and sysfs reflects reality — release reservation.
+                if vram_reservation > 0 {
+                    self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                }
                 // register() returns the guard for this request (active starts at 1).
                 let guard = self.process_manager.lock().await.register(pending);
                 // pm lock dropped before acquiring data lock.
@@ -559,6 +580,10 @@ impl Orchestrator {
                 Ok(guard)
             }
             Err(e) => {
+                // Spawn failed — release reservation so subsequent loads aren't blocked.
+                if vram_reservation > 0 {
+                    self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                }
                 error!(pid, port, error = %e, "health check failed; spawn cancelled");
                 Err(LoadError::SpawnFailed(crate::process::manager::SpawnError::HealthCheckFailed(e)))
             }
@@ -570,7 +595,7 @@ impl Orchestrator {
     /// Serialized via the admission lock; aborts silently if an idle instance
     /// appears by the time admission is acquired (another spawn beat us to it).
     async fn spawn_additional_instance(&self, id: &str) {
-        let (mut pending, pid, port) = {
+        let (mut pending, pid, port, vram_reservation) = {
             let _admit = self.admission.lock().await;
 
             // Re-check: did an idle instance appear while we waited?
@@ -602,7 +627,9 @@ impl Orchestrator {
                 (model, draft)
             };
 
-            let free: u64 = gpus.iter().map(|g| g.free_vram()).sum();
+            let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
+            let free: u64 = gpus.iter().map(|g| g.free_vram()).sum::<u64>()
+                .saturating_sub(already_reserved);
             if model.estimated_vram == 0 || free < model.estimated_vram {
                 return;
             }
@@ -625,18 +652,28 @@ impl Orchestrator {
             };
             let pid = pending.pid;
             let port = pending.port;
-            (pending, pid, port)
+            let vram_reservation = model.estimated_vram;
+            if vram_reservation > 0 {
+                self.reserved_vram.fetch_add(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+            }
+            (pending, pid, port, vram_reservation)
         };
         // Admission lock dropped; health check runs without blocking other spawns.
 
         match pending.wait_for_health(std::time::Duration::from_secs(180)).await {
             Ok(_) => {
+                if vram_reservation > 0 {
+                    self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                }
                 // Drop the guard immediately — no user request is attached.
                 drop(self.process_manager.lock().await.register(pending));
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "extra instance ready");
             }
             Err(e) => {
+                if vram_reservation > 0 {
+                    self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                }
                 warn!(pid, port, model = id, error = %e, "extra instance health check failed");
             }
         }
@@ -1055,6 +1092,48 @@ mod tests {
         t.draft_model_id = None;
         o.update_model(t).await.unwrap();
         assert!(o.remove_model("d").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reserved_vram_prevents_concurrent_overcommit() {
+        // Simulates the race: two concurrent do_load calls both see enough
+        // free VRAM individually, but together would OOM. The reservation
+        // counter must block the second one.
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+
+        // Inject a fake GPU with 10 GiB free.
+        {
+            let mut data = o.data.lock().await;
+            data.gpus = vec![GpuInfo {
+                id: "card0".into(),
+                total_vram: 10 * 1024 * 1024 * 1024,
+                used_vram: 0,
+                busy_pct: 0,
+                temp_c: None,
+            }];
+        }
+
+        // Model A needs 6 GiB; model B needs 6 GiB. Together they need 12 GiB > 10 GiB.
+        let six_gib: u64 = 6 * 1024 * 1024 * 1024;
+
+        // Simulate: model A has been fork/exec'd (reservation active) but
+        // sysfs hasn't caught up yet (vram_used still 0).
+        o.reserved_vram.store(six_gib, std::sync::atomic::Ordering::SeqCst);
+
+        // Now the admission logic for model B should see only 4 GiB free.
+        let already_reserved = o.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
+        let data = o.data.lock().await;
+        let raw_free: u64 = data.gpus.iter().map(|g| g.free_vram()).sum();
+        let effective_free = raw_free.saturating_sub(already_reserved);
+        drop(data);
+
+        assert_eq!(raw_free, 10 * 1024 * 1024 * 1024, "sysfs still shows 10 GiB");
+        assert_eq!(effective_free, 4 * 1024 * 1024 * 1024, "but effective free is only 4 GiB");
+        assert!(
+            effective_free < six_gib,
+            "model B (6 GiB) must be rejected when only 4 GiB is effectively available"
+        );
     }
 
     #[tokio::test]

@@ -103,13 +103,18 @@ pub struct ModelDisplay {
     pub name: String,
     pub format_str: String,
     pub context: u32,
-    /// Raw bytes for client-side numeric sort (via `data-sort` attribute).
+    pub context_str: String,
+    /// Raw bytes for grouping/sorting (not rendered directly).
     pub file_size_bytes: u64,
     pub file_size_gib_str: String,
     pub required_vram_bytes: u64,
     pub required_vram_gib_str: String,
     pub state_display: String,
     pub state_class: String,
+    /// Architecture string from gguf_meta (e.g. "llama", "qwen2"). Empty when unknown.
+    pub architecture: String,
+    pub quant_label: String,
+    pub size_label: String,
 }
 
 impl ModelDisplay {
@@ -127,18 +132,49 @@ impl ModelDisplay {
 
         let (file_size_bytes, required_vram_bytes) = compute_sizes(m);
 
+        let architecture = m.gguf_meta.as_ref()
+            .and_then(|g| g.architecture.clone())
+            .unwrap_or_default();
+        let quant_label = m.gguf_meta.as_ref()
+            .and_then(|g| g.quant_label.clone())
+            .unwrap_or_default();
+        let size_label = m.gguf_meta.as_ref()
+            .and_then(|g| g.size_label.clone())
+            .unwrap_or_default();
+
         Self {
             id: m.id.clone(),
             name: m.name.clone(),
             format_str,
             context: m.context,
+            context_str: format_context(m.context),
             file_size_bytes,
             file_size_gib_str: gib_or_dash(file_size_bytes),
             required_vram_bytes,
             required_vram_gib_str: gib_or_dash(required_vram_bytes),
             state_display,
             state_class,
+            architecture,
+            quant_label,
+            size_label,
         }
+    }
+}
+
+/// Architecture-grouped collection of models for the dashboard card grid.
+#[derive(Debug, Clone)]
+pub struct ModelGroup {
+    /// Display name for the group heading (capitalized, e.g. "Llama", "Qwen2").
+    pub display_name: String,
+    /// Models sorted by file size ascending.
+    pub models: Vec<ModelDisplay>,
+}
+
+fn format_context(ctx: u32) -> String {
+    if ctx >= 1024 {
+        format!("{}K ctx", ctx / 1024)
+    } else {
+        format!("{} ctx", ctx)
     }
 }
 
@@ -213,6 +249,6 @@ pub struct DashboardTemplate {
     pub title: String,
     pub system: SystemDisplay,
     pub gpus: Vec<GpuDisplay>,
-    pub models: Vec<ModelDisplay>,
+    pub groups: Vec<ModelGroup>,
     pub server_port: u16,
 }
