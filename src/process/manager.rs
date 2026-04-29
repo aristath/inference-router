@@ -361,15 +361,15 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
                     args.push(v.as_arg().into());
                 }
                 if let Some(n) = model.draft_max {
-                    args.push("--draft-max".into());
+                    args.push("--spec-draft-n-max".into());
                     args.push(n.to_string());
                 }
                 if let Some(n) = model.draft_min {
-                    args.push("--draft-min".into());
+                    args.push("--spec-draft-n-min".into());
                     args.push(n.to_string());
                 }
                 if let Some(p) = model.draft_p_min {
-                    args.push("--draft-p-min".into());
+                    args.push("--spec-draft-p-min".into());
                     args.push(p.to_string());
                 }
                 if let Some(n) = model.ctx_checkpoints {
@@ -757,9 +757,9 @@ mod tests {
         assert_eq!(find_flag(&args, "-cd"), Some("16384"));
         assert_eq!(find_flag(&args, "-ctkd"), Some("q8_0"));
         assert_eq!(find_flag(&args, "-ctvd"), Some("q8_0"));
-        assert_eq!(find_flag(&args, "--draft-max"), Some("16"));
-        assert_eq!(find_flag(&args, "--draft-min"), Some("1"));
-        assert_eq!(find_flag(&args, "--draft-p-min"), Some("0.75"));
+        assert_eq!(find_flag(&args, "--spec-draft-n-max"), Some("16"));
+        assert_eq!(find_flag(&args, "--spec-draft-n-min"), Some("1"));
+        assert_eq!(find_flag(&args, "--spec-draft-p-min"), Some("0.75"));
         assert_eq!(find_flag(&args, "--ctx-checkpoints"), Some("4"));
         assert_eq!(find_flag(&args, "--checkpoint-every-n-tokens"), Some("-1"));
     }
@@ -773,7 +773,7 @@ mod tests {
         let args = build_command_args(&t, None, 9001);
         let joined = args.join(" ");
         assert!(!joined.contains("-md"), "{joined}");
-        assert!(!joined.contains("--draft-max"), "{joined}");
+        assert!(!joined.contains("--spec-draft-n-max"), "{joined}");
         assert!(!joined.contains("--ctx-checkpoints"), "{joined}");
     }
 
@@ -783,10 +783,10 @@ mod tests {
         t.draft_model_id = Some("draft".into());
         t.draft_max = Some(8);
         let args = build_command_args(&t, Some(&draft_model()), 9001);
-        assert_eq!(find_flag(&args, "--draft-max"), Some("8"));
+        assert_eq!(find_flag(&args, "--spec-draft-n-max"), Some("8"));
         let joined = args.join(" ");
-        assert!(!joined.contains("--draft-min"), "{joined}");
-        assert!(!joined.contains("--draft-p-min"), "{joined}");
+        assert!(!joined.contains("--spec-draft-n-min"), "{joined}");
+        assert!(!joined.contains("--spec-draft-p-min"), "{joined}");
         assert!(!joined.contains("--ctx-checkpoints"), "{joined}");
         assert!(!joined.contains("--checkpoint-every-n-tokens"), "{joined}");
     }
