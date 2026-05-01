@@ -59,6 +59,7 @@ pub struct ProcessManager {
     /// model_id → spawned-but-not-yet-healthy process count.
     pending_instances: HashMap<String, usize>,
     request_done: Arc<Notify>,
+    backend_port_range: Option<(u16, u16)>,
 }
 
 impl Default for ProcessManager {
@@ -69,6 +70,7 @@ impl Default for ProcessManager {
             reserved_ports: HashSet::new(),
             pending_instances: HashMap::new(),
             request_done: Arc::new(Notify::new()),
+            backend_port_range: parse_port_range_env("INFERENCE_ROUTER_BACKEND_PORT_RANGE"),
         }
     }
 }
@@ -88,7 +90,8 @@ impl ProcessManager {
         model: &ModelConfig,
         draft: Option<&ModelConfig>,
     ) -> Result<PendingChild, SpawnError> {
-        let port = find_free_port(&self.reserved_ports).ok_or(SpawnError::NoFreePort)?;
+        let port = find_free_port(&self.reserved_ports, self.backend_port_range)
+            .ok_or(SpawnError::NoFreePort)?;
         self.reserved_ports.insert(port);
         *self.pending_instances.entry(model.id.clone()).or_insert(0) += 1;
 
@@ -554,7 +557,19 @@ async fn wait_for_health_or_exit(
     }
 }
 
-fn find_free_port(reserved: &HashSet<u16>) -> Option<u16> {
+fn find_free_port(reserved: &HashSet<u16>, range: Option<(u16, u16)>) -> Option<u16> {
+    if let Some((start, end)) = range {
+        for port in start..=end {
+            if reserved.contains(&port) {
+                continue;
+            }
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return Some(port);
+            }
+        }
+        return None;
+    }
+
     for _ in 0..128 {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .ok()
@@ -565,6 +580,17 @@ fn find_free_port(reserved: &HashSet<u16>) -> Option<u16> {
         }
     }
     None
+}
+
+fn parse_port_range_env(name: &str) -> Option<(u16, u16)> {
+    parse_port_range(&std::env::var(name).ok()?)
+}
+
+fn parse_port_range(raw: &str) -> Option<(u16, u16)> {
+    let (a, b) = raw.split_once('-')?;
+    let start = a.trim().parse::<u16>().ok()?;
+    let end = b.trim().parse::<u16>().ok()?;
+    (start <= end).then_some((start, end))
 }
 
 fn parse_kv_size_mib(line: &str) -> Option<f64> {
@@ -949,5 +975,12 @@ mod tests {
 
         assert_eq!(pm.instance_count("m"), 1);
         assert_eq!(pm.total_instance_count("m"), 2);
+    }
+
+    #[test]
+    fn parses_backend_port_range() {
+        assert_eq!(parse_port_range("9100-9200"), Some((9100, 9200)));
+        assert_eq!(parse_port_range("9200-9100"), None);
+        assert_eq!(parse_port_range("nope"), None);
     }
 }
