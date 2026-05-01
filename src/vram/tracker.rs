@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+const MIN_USABLE_GPU_VRAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// One GPU's VRAM + activity + temperature state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GpuInfo {
@@ -62,6 +64,9 @@ impl VRAMTracker {
                 Some(v) => v,
                 None => continue,
             };
+            if total < MIN_USABLE_GPU_VRAM_BYTES {
+                continue;
+            }
             let used = read_u64(&device.join("mem_info_vram_used")).unwrap_or(0);
             let busy_pct = read_u64(&device.join("gpu_busy_percent"))
                 .map(|v| v.min(100) as u8)
@@ -69,7 +74,13 @@ impl VRAMTracker {
             let temp_c = read_gpu_junction_temp(&device);
 
             let id = name.trim_start_matches("card").to_string();
-            gpus.push(GpuInfo { id, total_vram: total, used_vram: used, busy_pct, temp_c });
+            gpus.push(GpuInfo {
+                id,
+                total_vram: total,
+                used_vram: used,
+                busy_pct,
+                temp_c,
+            });
         }
 
         gpus.sort_by(|a, b| a.id.cmp(&b.id));
@@ -78,7 +89,11 @@ impl VRAMTracker {
 }
 
 fn read_u64(path: &Path) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// Reads the AMD junction temperature from `device/hwmon/hwmonN/temp2_input`
@@ -106,7 +121,13 @@ mod tests {
 
     #[test]
     fn free_vram_saturates() {
-        let g = GpuInfo { id: "0".into(), total_vram: 100, used_vram: 150, busy_pct: 0, temp_c: None };
+        let g = GpuInfo {
+            id: "0".into(),
+            total_vram: 100,
+            used_vram: 150,
+            busy_pct: 0,
+            temp_c: None,
+        };
         assert_eq!(g.free_vram(), 0);
     }
 
@@ -116,7 +137,11 @@ mod tests {
         let root = tmp.path();
         let device = root.join("card1").join("device");
         fs::create_dir_all(&device).unwrap();
-        fs::write(device.join("mem_info_vram_total"), "1").unwrap();
+        fs::write(
+            device.join("mem_info_vram_total"),
+            MIN_USABLE_GPU_VRAM_BYTES.to_string(),
+        )
+        .unwrap();
 
         let hwmon = device.join("hwmon").join("hwmon2");
         fs::create_dir_all(&hwmon).unwrap();
@@ -153,7 +178,11 @@ mod tests {
         let root = tmp.path();
         let dev = root.join("card1").join("device");
         fs::create_dir_all(&dev).unwrap();
-        fs::write(dev.join("mem_info_vram_total"), "1").unwrap();
+        fs::write(
+            dev.join("mem_info_vram_total"),
+            MIN_USABLE_GPU_VRAM_BYTES.to_string(),
+        )
+        .unwrap();
         fs::write(dev.join("gpu_busy_percent"), "250").unwrap();
         let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
         assert_eq!(gpus[0].busy_pct, 100);
@@ -198,5 +227,31 @@ mod tests {
 
         let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
         assert!(gpus.is_empty());
+    }
+
+    #[test]
+    fn refresh_skips_cards_below_minimum_usable_vram() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let igpu = root.join("card0").join("device");
+        fs::create_dir_all(&igpu).unwrap();
+        fs::write(
+            igpu.join("mem_info_vram_total"),
+            (2 * 1024 * 1024 * 1024u64).to_string(),
+        )
+        .unwrap();
+
+        let dgpu = root.join("card1").join("device");
+        fs::create_dir_all(&dgpu).unwrap();
+        fs::write(
+            dgpu.join("mem_info_vram_total"),
+            MIN_USABLE_GPU_VRAM_BYTES.to_string(),
+        )
+        .unwrap();
+
+        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].id, "1");
     }
 }

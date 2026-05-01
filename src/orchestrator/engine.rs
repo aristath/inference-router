@@ -1,6 +1,4 @@
-use crate::config::{
-    BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat,
-};
+use crate::config::{BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat};
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
@@ -72,8 +70,8 @@ impl Orchestrator {
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
         server_port: u16,
     ) -> Self {
-        let max_body_bytes = env_usize("INFERENCE_ROUTER_MAX_BODY_BYTES")
-            .unwrap_or(DEFAULT_MAX_BODY_BYTES);
+        let max_body_bytes =
+            env_usize("INFERENCE_ROUTER_MAX_BODY_BYTES").unwrap_or(DEFAULT_MAX_BODY_BYTES);
         let max_instances_per_model = env_usize("INFERENCE_ROUTER_MAX_INSTANCES_PER_MODEL")
             .unwrap_or(DEFAULT_MAX_INSTANCES_PER_MODEL)
             .max(1);
@@ -113,7 +111,11 @@ impl Orchestrator {
             .collect();
 
         Self {
-            data: Arc::new(Mutex::new(AppData { models, gpus: Vec::new(), presets })),
+            data: Arc::new(Mutex::new(AppData {
+                models,
+                gpus: Vec::new(),
+                presets,
+            })),
             process_manager: Arc::new(Mutex::new(ProcessManager::default())),
             vram_tracker: Arc::new(VRAMTracker),
             system_tracker: Arc::new(SystemTracker::default()),
@@ -137,8 +139,7 @@ impl Orchestrator {
     /// Lists every configured model, sorted by `id` so the JSON response and
     /// dashboard have a stable deterministic order.
     pub async fn list_models(&self) -> Vec<ModelConfig> {
-        let mut list: Vec<ModelConfig> =
-            self.data.lock().await.models.values().cloned().collect();
+        let mut list: Vec<ModelConfig> = self.data.lock().await.models.values().cloned().collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
     }
@@ -215,10 +216,13 @@ impl Orchestrator {
         let mut models_to_stop = Vec::new();
         {
             let mut data = self.data.lock().await;
-            let existing = data.presets.get(&preset.id)
+            let existing = data
+                .presets
+                .get(&preset.id)
                 .ok_or_else(|| MutationError::NotFound(preset.id.clone()))?;
             if existing.binary != preset.binary {
-                models_to_stop = data.models
+                models_to_stop = data
+                    .models
                     .values()
                     .filter(|m| {
                         m.binary_preset.as_deref() == Some(preset.id.as_str())
@@ -232,7 +236,8 @@ impl Orchestrator {
         }
         for id in models_to_stop {
             info!(model = id, "stopping model after binary preset change");
-            self.record_event("info", format!("stopping {id}: binary preset changed")).await;
+            self.record_event("info", format!("stopping {id}: binary preset changed"))
+                .await;
             if let Err(e) = self.stop_model_inner(&id).await {
                 warn!(model = id, error = %e, "failed to stop model after preset change");
             }
@@ -270,7 +275,9 @@ impl Orchestrator {
             if let Some(ref did) = new.draft_model_id {
                 validate_draft_reference(&data.models, &new.id, did)?;
             }
-            let existing = data.models.get_mut(&new.id)
+            let existing = data
+                .models
+                .get_mut(&new.id)
                 .ok_or_else(|| MutationError::NotFound(new.id.clone()))?;
 
             let process_live =
@@ -304,8 +311,12 @@ impl Orchestrator {
         }
         self.dirty.store(true, Ordering::Relaxed);
         if stop_after_update {
-            info!(model = id, "stopping model after spawn-affecting config change");
-            self.record_event("info", format!("stopping {id}: configuration changed")).await;
+            info!(
+                model = id,
+                "stopping model after spawn-affecting config change"
+            );
+            self.record_event("info", format!("stopping {id}: configuration changed"))
+                .await;
             if let Err(e) = self.stop_model_inner(&id).await {
                 warn!(model = id, error = %e, "failed to stop model after config change");
             }
@@ -410,7 +421,10 @@ impl Orchestrator {
         // No instances: serialize the first spawn via a per-model load_guard.
         let load_guard = {
             let mut guards = self.load_guards.lock().await;
-            guards.entry(id.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+            guards
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
         };
 
         let id_owned = id.to_string();
@@ -419,7 +433,14 @@ impl Orchestrator {
             let _lock = load_guard.lock().await;
 
             // Re-check after acquiring the lock — another task may have spawned already.
-            if let Some(g) = me.process_manager.lock().await.acquire_idle_instance(&id_owned) {
+            // If that instance is already serving the request that started it, reuse it
+            // instead of spawning a duplicate backend while max_instances_per_model is 1.
+            if let Some(g) = me
+                .process_manager
+                .lock()
+                .await
+                .acquire_any_instance(&id_owned)
+            {
                 return Ok(g);
             }
 
@@ -528,17 +549,18 @@ impl Orchestrator {
                 // Resolve the draft reference now so any missing/
                 // role-mismatched draft surfaces as a load-time error
                 // rather than a cryptic spawn failure.
-                let draft = if let Some(ref did) = m.draft_model_id {
-                    let d = data.models.get(did).cloned().ok_or_else(|| {
-                        LoadError::DraftNotFound {
-                            id: did.clone(),
-                            target: id.into(),
-                        }
-                    })?;
-                    Some(d)
-                } else {
-                    None
-                };
+                let draft =
+                    if let Some(ref did) = m.draft_model_id {
+                        let d = data.models.get(did).cloned().ok_or_else(|| {
+                            LoadError::DraftNotFound {
+                                id: did.clone(),
+                                target: id.into(),
+                            }
+                        })?;
+                        Some(d)
+                    } else {
+                        None
+                    };
                 (m, draft)
             };
 
@@ -559,7 +581,9 @@ impl Orchestrator {
                         let est = VramEstimate::compute(info.file_size, kv);
                         model.estimated_vram = est.total_vram;
                     }
-                    Err(e) => warn!(model = id, error = %e, "gguf parse failed; loading without estimate"),
+                    Err(e) => {
+                        warn!(model = id, error = %e, "gguf parse failed; loading without estimate")
+                    }
                 }
                 // Fold the draft's VRAM (weights + KV cache at its own
                 // context, with its own KV quant) into the target's
@@ -577,8 +601,8 @@ impl Orchestrator {
                             weight_file_size += info.file_size;
                             let kv = info.kv_cache_bytes(d.context, d_kv);
                             let est = VramEstimate::compute(info.file_size, kv);
-                            model.estimated_vram = model.estimated_vram
-                                .saturating_add(est.total_vram);
+                            model.estimated_vram =
+                                model.estimated_vram.saturating_add(est.total_vram);
                         }
                         Err(e) => warn!(
                             target = id, draft = d.id,
@@ -607,14 +631,16 @@ impl Orchestrator {
                     decide_eviction(&snapshot, free, model.estimated_vram, &idle_models)
                 {
                     info!(victim = victim, "evicting to make room");
-                    self.record_event("info", format!("evicting {victim} to load {id}")).await;
+                    self.record_event("info", format!("evicting {victim} to load {id}"))
+                        .await;
                     if let Err(e) = self.stop_model_inner(&victim).await {
                         warn!(model = victim, error = %e, "eviction stop failed");
                     }
                 }
                 // Re-read VRAM after eviction so the allocator sees the freed space.
                 let gpus_after = self.vram_tracker.refresh();
-                let adjusted_after = subtract_reserved_from_gpus(gpus_after.clone(), already_reserved);
+                let adjusted_after =
+                    subtract_reserved_from_gpus(gpus_after.clone(), already_reserved);
                 free = adjusted_after.iter().map(|g| g.free_vram()).sum();
                 self.data.lock().await.gpus = gpus_after;
             }
@@ -651,14 +677,16 @@ impl Orchestrator {
                 pm.spawn_child(&model, draft.as_ref())
                     .map_err(LoadError::SpawnFailed)?
             };
-            self.record_event("info", format!("loading {id} on port {}", pending.port)).await;
+            self.record_event("info", format!("loading {id} on port {}", pending.port))
+                .await;
             let pid = pending.pid;
             let port = pending.port;
             // Reserve this model's VRAM before releasing admission so the
             // next concurrent do_load sees the correct remaining budget.
             let vram_reservation = model.estimated_vram;
             if vram_reservation > 0 {
-                self.reserved_vram.fetch_add(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                self.reserved_vram
+                    .fetch_add(vram_reservation, std::sync::atomic::Ordering::SeqCst);
             }
             (pending, pid, port, vram_reservation)
         };
@@ -666,11 +694,15 @@ impl Orchestrator {
         // loads can proceed even while we're still waiting for `pending`
         // to report healthy (up to 180 seconds).
 
-        match pending.wait_for_health(std::time::Duration::from_secs(180)).await {
+        match pending
+            .wait_for_health(std::time::Duration::from_secs(180))
+            .await
+        {
             Ok(kv_bytes) => {
                 // Weights are now in VRAM and sysfs reflects reality — release reservation.
                 if vram_reservation > 0 {
-                    self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                    self.reserved_vram
+                        .fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
                 }
                 // register() returns the guard for this request (active starts at 1).
                 let guard = self.process_manager.lock().await.register(pending);
@@ -682,8 +714,7 @@ impl Orchestrator {
                         m.pid = Some(pid);
                         m.last_used = Some(unix_now());
                         if kv_bytes > 0 && weight_file_size > 0 {
-                            m.estimated_vram =
-                                ((weight_file_size + kv_bytes) as f64 * 1.1) as u64;
+                            m.estimated_vram = ((weight_file_size + kv_bytes) as f64 * 1.1) as u64;
                             info!(
                                 model = id,
                                 kv_mib = kv_bytes / 1024 / 1024,
@@ -695,18 +726,23 @@ impl Orchestrator {
                 }
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "inference server ready");
-                self.record_event("info", format!("{id} ready on port {port}")).await;
+                self.record_event("info", format!("{id} ready on port {port}"))
+                    .await;
                 Ok(guard)
             }
             Err(e) => {
                 // Spawn failed — release reservation so subsequent loads aren't blocked.
                 if vram_reservation > 0 {
-                    self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                    self.reserved_vram
+                        .fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
                 }
                 self.process_manager.lock().await.discard_pending(pending);
                 error!(pid, port, error = %e, "health check failed; spawn cancelled");
-                self.record_event("error", format!("{id} failed health check: {e}")).await;
-                Err(LoadError::SpawnFailed(crate::process::manager::SpawnError::HealthCheckFailed(e)))
+                self.record_event("error", format!("{id} failed health check: {e}"))
+                    .await;
+                Err(LoadError::SpawnFailed(
+                    crate::process::manager::SpawnError::HealthCheckFailed(e),
+                ))
             }
         }
     }
@@ -723,12 +759,16 @@ impl Orchestrator {
             if !self.process_manager.lock().await.all_busy(id) {
                 return;
             }
-            if self.process_manager.lock().await.total_instance_count(id) >= self.max_instances_per_model {
+            if self.process_manager.lock().await.total_instance_count(id)
+                >= self.max_instances_per_model
+            {
                 return;
             }
 
             let gpus = self.vram_tracker.refresh();
-            { self.data.lock().await.gpus = gpus.clone(); }
+            {
+                self.data.lock().await.gpus = gpus.clone();
+            }
 
             let (mut model, draft) = {
                 let data = self.data.lock().await;
@@ -741,12 +781,18 @@ impl Orchestrator {
                     match data.presets.get(preset_id) {
                         Some(p) => model.binary = p.binary.clone(),
                         None => {
-                            warn!(model = id, preset = preset_id, "preset not found for extra instance");
+                            warn!(
+                                model = id,
+                                preset = preset_id,
+                                "preset not found for extra instance"
+                            );
                             return;
                         }
                     }
                 }
-                let draft = model.draft_model_id.as_ref()
+                let draft = model
+                    .draft_model_id
+                    .as_ref()
                     .and_then(|did| data.models.get(did).cloned());
                 (model, draft)
             };
@@ -768,7 +814,12 @@ impl Orchestrator {
                 }
             }
 
-            let pending = match self.process_manager.lock().await.spawn_child(&model, draft.as_ref()) {
+            let pending = match self
+                .process_manager
+                .lock()
+                .await
+                .spawn_child(&model, draft.as_ref())
+            {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(model = id, error = %e, "failed to spawn extra instance");
@@ -777,33 +828,48 @@ impl Orchestrator {
             };
             let pid = pending.pid;
             let port = pending.port;
-            self.record_event("info", format!("loading extra {id} instance on port {port}")).await;
+            self.record_event(
+                "info",
+                format!("loading extra {id} instance on port {port}"),
+            )
+            .await;
             let vram_reservation = model.estimated_vram;
             if vram_reservation > 0 {
-                self.reserved_vram.fetch_add(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                self.reserved_vram
+                    .fetch_add(vram_reservation, std::sync::atomic::Ordering::SeqCst);
             }
             (pending, pid, port, vram_reservation)
         };
         // Admission lock dropped; health check runs without blocking other spawns.
 
-        match pending.wait_for_health(std::time::Duration::from_secs(180)).await {
+        match pending
+            .wait_for_health(std::time::Duration::from_secs(180))
+            .await
+        {
             Ok(_) => {
                 if vram_reservation > 0 {
-                    self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                    self.reserved_vram
+                        .fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
                 }
                 // Drop the guard immediately — no user request is attached.
                 drop(self.process_manager.lock().await.register(pending));
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "extra instance ready");
-                self.record_event("info", format!("extra {id} instance ready on port {port}")).await;
+                self.record_event("info", format!("extra {id} instance ready on port {port}"))
+                    .await;
             }
             Err(e) => {
                 if vram_reservation > 0 {
-                    self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
+                    self.reserved_vram
+                        .fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
                 }
                 self.process_manager.lock().await.discard_pending(pending);
                 warn!(pid, port, model = id, error = %e, "extra instance health check failed");
-                self.record_event("warn", format!("extra {id} instance failed health check: {e}")).await;
+                self.record_event(
+                    "warn",
+                    format!("extra {id} instance failed health check: {e}"),
+                )
+                .await;
             }
         }
     }
@@ -839,7 +905,9 @@ impl Orchestrator {
     async fn stop_model_inner(&self, id: &str) -> Result<(), StopError> {
         {
             let data = self.data.lock().await;
-            data.models.get(id).ok_or_else(|| StopError::ModelNotFound(id.into()))?;
+            data.models
+                .get(id)
+                .ok_or_else(|| StopError::ModelNotFound(id.into()))?;
         }
         let pids = self.process_manager.lock().await.pids_for_model(id);
         for pid in &pids {
@@ -865,7 +933,9 @@ impl Orchestrator {
     /// Called on a 5s timer by `lifecycle::run`.
     pub async fn reconcile(&self) {
         let gpus = self.vram_tracker.refresh();
-        { self.data.lock().await.gpus = gpus; }
+        {
+            self.data.lock().await.gpus = gpus;
+        }
 
         // Ask ProcessManager which instances have died since the last tick.
         let dead = self.process_manager.lock().await.dead_instances();
@@ -947,7 +1017,11 @@ pub enum LoadError {
     SpawnFailed(SpawnError),
 
     #[error("not enough idle VRAM to load '{model}': need {:.1} GiB, have {:.1} GiB (active requests are not evicted)", bytes_to_gib(*needed), bytes_to_gib(*free))]
-    InsufficientVram { model: String, needed: u64, free: u64 },
+    InsufficientVram {
+        model: String,
+        needed: u64,
+        free: u64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -981,7 +1055,9 @@ fn validate_draft_reference(
     draft_id: &str,
 ) -> Result<(), MutationError> {
     if draft_id == self_id {
-        return Err(MutationError::InvalidConfig(ConfigError::DraftSelfReference));
+        return Err(MutationError::InvalidConfig(
+            ConfigError::DraftSelfReference,
+        ));
     }
     if !models.contains_key(draft_id) {
         return Err(MutationError::InvalidConfig(ConfigError::DraftNotFound {
@@ -1067,8 +1143,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn orch(tmp: &TempDir) -> Arc<Orchestrator> {
-        let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(tmp.path().join("models.json")));
-        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(tmp.path().join("presets.json")));
+        let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(
+            tmp.path().join("models.json"),
+        ));
+        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
+            tmp.path().join("presets.json"),
+        ));
         Arc::new(Orchestrator::new(store, presets, 8080))
     }
 
@@ -1112,7 +1192,10 @@ mod tests {
         o.dirty.store(false, Ordering::Relaxed);
         o.mark_used("a").await;
         assert!(o.get_model("a").await.unwrap().last_used.is_some());
-        assert!(o.dirty.load(Ordering::Relaxed), "mark_used must mark dirty so reconcile persists");
+        assert!(
+            o.dirty.load(Ordering::Relaxed),
+            "mark_used must mark dirty so reconcile persists"
+        );
     }
 
     #[tokio::test]
@@ -1131,14 +1214,18 @@ mod tests {
         o.add_model(model("a")).await.unwrap();
 
         // Prime the load-guard entry (ensure_loaded would insert one).
-        o.load_guards.lock().await
+        o.load_guards
+            .lock()
+            .await
             .entry("a".into())
             .or_insert_with(|| Arc::new(Mutex::new(())));
         assert!(o.load_guards.lock().await.contains_key("a"));
 
         o.remove_model("a").await.unwrap();
-        assert!(!o.load_guards.lock().await.contains_key("a"),
-            "load_guards must drop entries for removed models so the map doesn't grow forever");
+        assert!(
+            !o.load_guards.lock().await.contains_key("a"),
+            "load_guards must drop entries for removed models so the map doesn't grow forever"
+        );
     }
 
     #[tokio::test]
@@ -1174,6 +1261,39 @@ mod tests {
         }
         let final_state = o.get_model("a").await.unwrap().state;
         panic!("state never left Loading after caller cancellation: {final_state:?}");
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_reuses_busy_instance_after_waiting_on_load_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("a")).await.unwrap();
+
+        let guard = Arc::new(Mutex::new(()));
+        let locked = guard.lock().await;
+        o.load_guards.lock().await.insert("a".into(), guard.clone());
+
+        let ensure = {
+            let o = o.clone();
+            tokio::spawn(async move { o.ensure_loaded("a").await })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        o.process_manager
+            .lock()
+            .await
+            .register_test_instance("a", -1, 9000);
+        let _busy = o
+            .process_manager
+            .lock()
+            .await
+            .acquire_idle_instance("a")
+            .unwrap();
+
+        drop(locked);
+
+        let reused = ensure.await.unwrap().unwrap();
+        assert_eq!(reused.port, 9000);
     }
 
     #[tokio::test]
@@ -1255,7 +1375,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&vec![m]).unwrap()).unwrap();
 
         let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(path));
-        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(tmp.path().join("presets.json")));
+        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
+            tmp.path().join("presets.json"),
+        ));
         let o = Arc::new(Orchestrator::new(store, presets, 8080));
         let loaded = o.get_model("a").await.unwrap();
         assert_eq!(loaded.state, ModelState::Idle);
@@ -1272,7 +1394,10 @@ mod tests {
         o.add_model(m).await.unwrap();
 
         // Register a synthetic instance with a definitely-dead pid.
-        o.process_manager.lock().await.register_test_instance("a", 999_999, 9000);
+        o.process_manager
+            .lock()
+            .await
+            .register_test_instance("a", 999_999, 9000);
 
         o.reconcile().await;
         let after = o.get_model("a").await.unwrap();
@@ -1398,7 +1523,8 @@ mod tests {
 
         // Simulate: model A has been fork/exec'd (reservation active) but
         // sysfs hasn't caught up yet (vram_used still 0).
-        o.reserved_vram.store(six_gib, std::sync::atomic::Ordering::SeqCst);
+        o.reserved_vram
+            .store(six_gib, std::sync::atomic::Ordering::SeqCst);
 
         // Now the admission logic for model B should see only 4 GiB free.
         let already_reserved = o.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
@@ -1407,8 +1533,16 @@ mod tests {
         let effective_free = raw_free.saturating_sub(already_reserved);
         drop(data);
 
-        assert_eq!(raw_free, 10 * 1024 * 1024 * 1024, "sysfs still shows 10 GiB");
-        assert_eq!(effective_free, 4 * 1024 * 1024 * 1024, "but effective free is only 4 GiB");
+        assert_eq!(
+            raw_free,
+            10 * 1024 * 1024 * 1024,
+            "sysfs still shows 10 GiB"
+        );
+        assert_eq!(
+            effective_free,
+            4 * 1024 * 1024 * 1024,
+            "but effective free is only 4 GiB"
+        );
         assert!(
             effective_free < six_gib,
             "model B (6 GiB) must be rejected when only 4 GiB is effectively available"
@@ -1420,7 +1554,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("models.json");
         let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(path.clone()));
-        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(tmp.path().join("presets.json")));
+        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
+            tmp.path().join("presets.json"),
+        ));
         let o = Arc::new(Orchestrator::new(store, presets, 8080));
 
         // First reconcile: nothing dirty, no file written.
