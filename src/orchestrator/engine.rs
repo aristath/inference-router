@@ -806,9 +806,17 @@ impl Orchestrator {
             let snapshot: Vec<ModelConfig> =
                 self.data.lock().await.models.values().cloned().collect();
             self.store.replace(snapshot);
-            if let Err(e) = self.store.save() {
-                error!(error = %e, "failed to persist models.json");
-                self.dirty.store(true, Ordering::Relaxed);
+            let store = self.store.clone();
+            match tokio::task::spawn_blocking(move || store.save()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!(error = %e, "failed to persist models.json");
+                    self.dirty.store(true, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error!(error = %e, "models.json persistence task failed");
+                    self.dirty.store(true, Ordering::Relaxed);
+                }
             }
         }
 
@@ -816,9 +824,17 @@ impl Orchestrator {
             let snapshot: Vec<BinaryPreset> =
                 self.data.lock().await.presets.values().cloned().collect();
             self.presets_store.replace(snapshot);
-            if let Err(e) = self.presets_store.save() {
-                error!(error = %e, "failed to persist presets.json");
-                self.presets_dirty.store(true, Ordering::Relaxed);
+            let store = self.presets_store.clone();
+            match tokio::task::spawn_blocking(move || store.save()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!(error = %e, "failed to persist presets.json");
+                    self.presets_dirty.store(true, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error!(error = %e, "presets.json persistence task failed");
+                    self.presets_dirty.store(true, Ordering::Relaxed);
+                }
             }
         }
     }
