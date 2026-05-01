@@ -45,6 +45,10 @@ pub struct ProcessManager {
     running: HashMap<i32, RunningChild>,
     /// model_id → pool of live instances.
     instances: HashMap<String, Vec<InstanceInfo>>,
+    /// Ports handed to spawned-but-not-yet-registered children.
+    reserved_ports: HashSet<u16>,
+    /// model_id → spawned-but-not-yet-healthy process count.
+    pending_instances: HashMap<String, usize>,
 }
 
 /// A freshly spawned but not-yet-healthy child.
@@ -58,11 +62,14 @@ pub struct PendingChild {
 
 impl ProcessManager {
     pub fn spawn_child(
-        &self,
+        &mut self,
         model: &ModelConfig,
         draft: Option<&ModelConfig>,
     ) -> Result<PendingChild, SpawnError> {
-        let port = find_free_port().ok_or(SpawnError::NoFreePort)?;
+        let port = find_free_port(&self.reserved_ports).ok_or(SpawnError::NoFreePort)?;
+        self.reserved_ports.insert(port);
+        *self.pending_instances.entry(model.id.clone()).or_insert(0) += 1;
+
         let args = build_command_args(model, draft, port);
 
         info!(
@@ -80,7 +87,10 @@ impl ProcessManager {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| SpawnError::SpawnFailed(e, model.binary.clone()))?;
+            .map_err(|e| {
+                self.release_pending(&model.id, port);
+                SpawnError::SpawnFailed(e, model.binary.clone())
+            })?;
 
         let pid = child.id().expect("spawned child has no PID") as i32;
 
@@ -107,6 +117,7 @@ impl ProcessManager {
     pub fn register(&mut self, pending: PendingChild) -> RequestGuard {
         let active = Arc::new(AtomicUsize::new(1));
         let port = pending.port;
+        self.release_pending(&pending.model_id, pending.port);
         self.instances.entry(pending.model_id.clone()).or_default().push(InstanceInfo {
             pid: pending.pid,
             port,
@@ -118,6 +129,13 @@ impl ProcessManager {
             child: pending.child,
         });
         RequestGuard { port, active }
+    }
+
+    /// Drop tracking for a pending child that failed health checks. Consuming
+    /// the PendingChild lets its `kill_on_drop` child handle clean up too.
+    pub fn discard_pending(&mut self, pending: PendingChild) {
+        self.release_pending(&pending.model_id, pending.port);
+        drop(pending);
     }
 
     /// Find an idle instance (active == 0), increment its counter, and return
@@ -146,6 +164,12 @@ impl ProcessManager {
     /// Number of live instances for a model.
     pub fn instance_count(&self, model_id: &str) -> usize {
         self.instances.get(model_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Number of live plus health-checking instances for a model.
+    pub fn total_instance_count(&self, model_id: &str) -> usize {
+        self.instance_count(model_id)
+            + self.pending_instances.get(model_id).copied().unwrap_or(0)
     }
 
     /// Model ids whose live instances are all idle.
@@ -232,6 +256,16 @@ impl ProcessManager {
         }
     }
 
+    fn release_pending(&mut self, model_id: &str, port: u16) {
+        self.reserved_ports.remove(&port);
+        if let Some(n) = self.pending_instances.get_mut(model_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.pending_instances.remove(model_id);
+            }
+        }
+    }
+
     /// Directly registers an instance without a real process.
     /// Used in tests to synthesize a Running model (integration tests use
     /// pid=-1; unit tests can pass a specific pid to test dead-process detection).
@@ -249,6 +283,12 @@ impl ProcessManager {
     #[allow(dead_code)]
     pub fn register_port(&mut self, model_id: &str, port: u16) {
         self.register_test_instance(model_id, -1, port);
+    }
+
+    #[cfg(test)]
+    pub fn reserve_test_pending(&mut self, model_id: &str, port: u16) {
+        self.reserved_ports.insert(port);
+        *self.pending_instances.entry(model_id.into()).or_insert(0) += 1;
     }
 }
 
@@ -457,11 +497,17 @@ async fn wait_for_health_or_exit(
     }
 }
 
-fn find_free_port() -> Option<u16> {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
+fn find_free_port(reserved: &HashSet<u16>) -> Option<u16> {
+    for _ in 0..128 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())?;
+        if !reserved.contains(&port) {
+            return Some(port);
+        }
+    }
+    None
 }
 
 fn parse_kv_size_mib(line: &str) -> Option<f64> {
@@ -836,5 +882,15 @@ mod tests {
         let args = build_command_args(&t, Some(&d), 9001);
         let joined = args.join(" ");
         assert!(!joined.contains("-devd"), "{joined}");
+    }
+
+    #[test]
+    fn pending_instances_count_toward_total() {
+        let mut pm = ProcessManager::default();
+        pm.register_test_instance("m", 123, 9001);
+        pm.reserve_test_pending("m", 9002);
+
+        assert_eq!(pm.instance_count("m"), 1);
+        assert_eq!(pm.total_instance_count("m"), 2);
     }
 }

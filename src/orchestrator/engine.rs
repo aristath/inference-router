@@ -304,7 +304,10 @@ impl Orchestrator {
         }
 
         // All instances busy (or none). Check if instances exist at all.
-        let instance_count = self.process_manager.lock().await.instance_count(id);
+        let (instance_count, total_instance_count) = {
+            let pm = self.process_manager.lock().await;
+            (pm.instance_count(id), pm.total_instance_count(id))
+        };
         if instance_count > 0 {
             let (estimated_vram, free_vram, model_exists) = {
                 let data = self.data.lock().await;
@@ -318,7 +321,7 @@ impl Orchestrator {
             if !model_exists {
                 return Err(LoadError::ModelNotFound(id.into()));
             }
-            if instance_count < self.max_instances_per_model
+            if total_instance_count < self.max_instances_per_model
                 && estimated_vram > 0
                 && free_vram >= estimated_vram
             {
@@ -557,12 +560,11 @@ impl Orchestrator {
 
             // Fork + exec (fast). Holding the admission lock across this is
             // still cheap — just until the process exists on disk.
-            let pending = self
-                .process_manager
-                .lock()
-                .await
-                .spawn_child(&model, draft.as_ref())
-                .map_err(LoadError::SpawnFailed)?;
+            let pending = {
+                let mut pm = self.process_manager.lock().await;
+                pm.spawn_child(&model, draft.as_ref())
+                    .map_err(LoadError::SpawnFailed)?
+            };
             let pid = pending.pid;
             let port = pending.port;
             // Reserve this model's VRAM before releasing admission so the
@@ -613,6 +615,7 @@ impl Orchestrator {
                 if vram_reservation > 0 {
                     self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
                 }
+                self.process_manager.lock().await.discard_pending(pending);
                 error!(pid, port, error = %e, "health check failed; spawn cancelled");
                 Err(LoadError::SpawnFailed(crate::process::manager::SpawnError::HealthCheckFailed(e)))
             }
@@ -631,7 +634,7 @@ impl Orchestrator {
             if !self.process_manager.lock().await.all_busy(id) {
                 return;
             }
-            if self.process_manager.lock().await.instance_count(id) >= self.max_instances_per_model {
+            if self.process_manager.lock().await.total_instance_count(id) >= self.max_instances_per_model {
                 return;
             }
 
@@ -707,6 +710,7 @@ impl Orchestrator {
                 if vram_reservation > 0 {
                     self.reserved_vram.fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
                 }
+                self.process_manager.lock().await.discard_pending(pending);
                 warn!(pid, port, model = id, error = %e, "extra instance health check failed");
             }
         }
