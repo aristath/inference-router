@@ -135,6 +135,8 @@ impl CacheType {
 pub struct ModelConfig {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub profile: Option<String>,
 
     pub weights_format: WeightsFormat,
     /// If set, looked up in the presets table at spawn time to get the actual
@@ -273,6 +275,7 @@ impl Default for ModelConfig {
         Self {
             id: String::new(),
             name: String::new(),
+            profile: None,
             weights_format: WeightsFormat::default(),
             binary_preset: None,
             binary: PathBuf::new(),
@@ -473,6 +476,7 @@ mod tests {
         ModelConfig {
             id: "qwen3-30b".into(),
             name: "Qwen3 30B".into(),
+            profile: Some("coding".into()),
             binary_preset: Some("llama-vulkan".into()),
             binary: PathBuf::from("/home/u/llama.cpp/build-vulkan/bin/llama-server"),
             model_path: PathBuf::from("/models/qwen3-30b.gguf"),
@@ -526,6 +530,7 @@ mod tests {
         assert_eq!(parsed.pid, None);
         assert_eq!(parsed.estimated_vram, 0);
         assert_eq!(parsed.last_used, None);
+        assert_eq!(parsed.profile, None);
         assert_eq!(parsed.extra_args, Vec::<String>::new());
         assert_eq!(parsed.temperature, 0.6);
         assert_eq!(parsed.top_p, 0.95);

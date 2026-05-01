@@ -36,6 +36,7 @@ struct GpuResponse {
 struct ModelResponse {
     id: String,
     name: String,
+    profile: Option<String>,
     weights_format: &'static str,
     binary: String,
     model_path: String,
@@ -91,6 +92,7 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
                 ModelResponse {
                     id: m.id,
                     name: m.name,
+                    profile: m.profile,
                     weights_format: match m.weights_format {
                         WeightsFormat::Gguf => "gguf",
                         WeightsFormat::Safetensors => "safetensors",

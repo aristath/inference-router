@@ -109,7 +109,7 @@
                 <h3 class="model-group-heading">{{ group.display_name }}</h3>
                 <div class="model-cards">
                     {% for model in group.models %}
-                    <div class="model-card" id="model-card-{{ model.id }}" data-name="{{ model.name }}">
+                    <div class="model-card" id="model-card-{{ model.id }}" data-name="{{ model.name }}" data-profile="{{ model.profile }}">
                         <div class="model-card-header">
                             <span class="model-card-name">{{ model.name }}</span>
                             <span class="badge badge-{{ model.state_class }}" id="model-status-{{ model.id }}">{{ model.state_display }}</span>
@@ -117,6 +117,9 @@
                         <div class="model-card-chips">
                             {% if !model.size_label.is_empty() %}
                             <span class="model-chip size">{{ model.size_label }}</span>
+                            {% endif %}
+                            {% if !model.profile.is_empty() %}
+                            <span class="model-chip profile">{{ model.profile }}</span>
                             {% endif %}
                             {% if !model.quant_label.is_empty() %}
                             <span class="model-chip quant">{{ model.quant_label }}</span>
@@ -224,6 +227,11 @@
                             <label for="name">Name</label>
                             <input type="text" id="name" name="name" required placeholder="e.g. Qwen3 30B Q4_K_M">
                             <small class="field-help">Friendly label shown in the dashboard.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="profile">Profile</label>
+                            <input type="text" id="profile" name="profile" placeholder="e.g. coding, long-context, vision">
+                            <small class="field-help">Optional workspace label for filtering and grouping your own model sets.</small>
                         </div>
                         <div class="form-group">
                             <label>Weights format</label>
@@ -620,6 +628,7 @@
 .model-chip { font-size: 0.75rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: #0f172a; border: 1px solid #334155; color: #64748b; }
 .model-chip.quant { color: #38bdf8; border-color: #1e40af; }
 .model-chip.size  { color: #a78bfa; border-color: #4c1d95; }
+.model-chip.profile { color: #34d399; border-color: #065f46; }
 .model-card-stats { font-size: 0.85rem; color: #475569; display: flex; gap: 0.6rem; flex-wrap: wrap; }
 .model-runtime { color: #94a3b8; }
 .model-card-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.1rem; }
@@ -634,6 +643,7 @@
 // Defaults for the "Add model" state.
 const MODEL_DEFAULTS = {
     id: '', name: '',
+    profile: null,
     weights_format: 'gguf',
     binary: '', model_path: '',
     mmproj_path: null,
@@ -974,6 +984,7 @@ function populateModelForm(m, mode) {
     f.id.value = m.id || '';
     f.id.readOnly = (mode === 'edit');
     f.name.value = m.name || '';
+    f.profile.value = m.profile || '';
     f.weights_format.value = m.weights_format || 'gguf';
     // radio groups need per-input checking
     [...f.querySelectorAll('input[name="weights_format"]')].forEach(r => r.checked = (r.value === (m.weights_format || 'gguf')));
@@ -1292,8 +1303,8 @@ document.getElementById('model-groups')?.addEventListener('click', (e) => {
         document.querySelectorAll('.model-group').forEach(group => {
             let anyVisible = false;
             group.querySelectorAll('.model-card').forEach(card => {
-                const name = (card.dataset.name || '').toLowerCase();
-                const show = !needle || name.includes(needle);
+                const haystack = `${card.dataset.name || ''} ${card.dataset.profile || ''}`.toLowerCase();
+                const show = !needle || haystack.includes(needle);
                 card.style.display = show ? '' : 'none';
                 if (show) anyVisible = true;
             });
@@ -1453,6 +1464,7 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
     const body = {
         id: f.id.value.trim(),
         name: f.name.value.trim(),
+        profile: toOptStr(f.profile.value),
         weights_format: f.weights_format.value,
         binary_preset: presetChoice === '__custom__' ? null : presetChoice,
         binary: presetChoice === '__custom__' ? f.binary.value.trim() : '',

@@ -70,6 +70,7 @@ State files under `~/.config/inference-router/`:
 - **`presets.json`** — named binary paths. Lets you rebuild llama.cpp once and have every model pick up the new binary.
 - **`models.json`** — one entry per model. Key fields:
   - `binary_preset` (optional): preset id to resolve `binary` from at spawn time.
+  - `profile` (optional): workspace label such as `coding`, `long-context`, or `vision` for dashboard filtering.
   - `binary`, `model_path`, `port`, `context`: mandatory.
   - `weights_format`: `gguf` (llama.cpp argv style) or `safetensors` (vLLM style).
   - llama.cpp knobs: `flash_attn`, `n_gpu_layers`, `mlock`, `no_mmap`, `parallel_slots`, `cache_type_{k,v}`, `split_mode` (`none | layer | row | tensor`), `main_gpu`, `tensor_split`.

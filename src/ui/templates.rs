@@ -101,6 +101,7 @@ fn temp_class(celsius: f32) -> String {
 pub struct ModelDisplay {
     pub id: String,
     pub name: String,
+    pub profile: String,
     pub format_str: String,
     pub context_str: String,
     /// Raw bytes for grouping/sorting (not rendered directly).
@@ -143,6 +144,7 @@ impl ModelDisplay {
         Self {
             id: m.id.clone(),
             name: m.name.clone(),
+            profile: m.profile.clone().unwrap_or_default(),
             format_str,
             context_str: format_context(m.context),
             file_size_bytes,
