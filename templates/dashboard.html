@@ -124,6 +124,8 @@
                             {% if !model.required_vram_gib_str.eq("—") %}
                             <span title="Estimated VRAM">{{ model.required_vram_gib_str }} GiB VRAM</span>
                             {% endif %}
+                            <span class="model-runtime" id="model-active-{{ model.id }}" style="display:none;"></span>
+                            <span class="model-runtime" id="model-pending-{{ model.id }}" style="display:none;"></span>
                         </div>
                         <div class="model-card-actions">
                             {% if model.state_class == "idle" || model.state_class == "error" %}
@@ -612,6 +614,7 @@
 .model-chip.quant { color: #38bdf8; border-color: #1e40af; }
 .model-chip.size  { color: #a78bfa; border-color: #4c1d95; }
 .model-card-stats { font-size: 0.85rem; color: #475569; display: flex; gap: 0.6rem; flex-wrap: wrap; }
+.model-runtime { color: #94a3b8; }
 .model-card-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.1rem; }
 </style>
 

@@ -23,6 +23,13 @@ pub struct InstanceInfo {
     pub active: Arc<AtomicUsize>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelRuntime {
+    pub instances: usize,
+    pub pending: usize,
+    pub active: usize,
+}
+
 /// RAII handle returned by `ensure_loaded`. Holds the port to forward to
 /// and keeps the instance's active counter incremented for the duration of
 /// the request. Dropped when the response body is fully consumed or the
@@ -204,6 +211,22 @@ impl ProcessManager {
 
     pub fn request_done_notifier(&self) -> Arc<Notify> {
         self.request_done.clone()
+    }
+
+    pub fn model_runtimes(&self) -> HashMap<String, ModelRuntime> {
+        let mut runtimes = HashMap::new();
+        for (model_id, insts) in &self.instances {
+            let entry = runtimes.entry(model_id.clone()).or_insert_with(ModelRuntime::default);
+            entry.instances = insts.len();
+            entry.active = insts
+                .iter()
+                .map(|i| i.active.load(Ordering::Relaxed))
+                .sum();
+        }
+        for (model_id, pending) in &self.pending_instances {
+            runtimes.entry(model_id.clone()).or_insert_with(ModelRuntime::default).pending = *pending;
+        }
+        runtimes
     }
 
     /// Model ids whose live instances are all idle.

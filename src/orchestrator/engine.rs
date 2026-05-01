@@ -3,7 +3,7 @@ use crate::config::{
 };
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
-use crate::process::manager::{ProcessManager, RequestGuard, SpawnError};
+use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
 use crate::system::stats::{SystemStats, SystemTracker};
 use crate::vram::estimator::VramEstimate;
 use crate::vram::tracker::{GpuInfo, VRAMTracker};
@@ -155,6 +155,10 @@ impl Orchestrator {
         let mut data = self.data.lock().await;
         data.gpus = fresh.clone();
         fresh
+    }
+
+    pub async fn model_runtimes(&self) -> HashMap<String, ModelRuntime> {
+        self.process_manager.lock().await.model_runtimes()
     }
 
     #[cfg(test)]

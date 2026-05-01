@@ -45,12 +45,16 @@ struct ModelResponse {
     pid: Option<i32>,
     estimated_vram: u64,
     last_used: Option<f64>,
+    instances: usize,
+    pending_instances: usize,
+    active_requests: usize,
 }
 
 /// Full system snapshot used by the dashboard poller.
 pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
     let gpus = state.list_gpus().await;
     let models = state.list_models().await;
+    let runtimes = state.model_runtimes().await;
     let sys = state.system_stats();
 
     let response = StatusResponse {
@@ -74,6 +78,7 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
         models: models
             .into_iter()
             .map(|m| {
+                let runtime = runtimes.get(&m.id).copied().unwrap_or_default();
                 let (state_name, state_message) = match &m.state {
                     ModelState::Idle => ("idle", None),
                     ModelState::Loading => ("loading", None),
@@ -96,6 +101,9 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
                     pid: m.pid,
                     estimated_vram: m.estimated_vram,
                     last_used: m.last_used,
+                    instances: runtime.instances,
+                    pending_instances: runtime.pending,
+                    active_requests: runtime.active,
                 }
             })
             .collect(),

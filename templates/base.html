@@ -326,6 +326,18 @@
                     const label = cls.charAt(0).toUpperCase() + cls.slice(1);
                     el.textContent = model.state_message ? `${label}: ${model.state_message}` : label;
                 }
+                const active = document.getElementById('model-active-' + model.id);
+                if (active) {
+                    const n = model.active_requests || 0;
+                    active.textContent = n === 1 ? '1 active' : `${n} active`;
+                    active.style.display = n > 0 ? '' : 'none';
+                }
+                const pending = document.getElementById('model-pending-' + model.id);
+                if (pending) {
+                    const n = model.pending_instances || 0;
+                    pending.textContent = n === 1 ? '1 loading' : `${n} loading`;
+                    pending.style.display = n > 0 ? '' : 'none';
+                }
             });
         }
         // Polling interval is a per-browser UI preference, stored in
