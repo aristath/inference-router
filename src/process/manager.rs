@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 /// A live inference-server process owned by the orchestrator.
@@ -30,16 +31,17 @@ pub struct InstanceInfo {
 pub struct RequestGuard {
     pub port: u16,
     active: Arc<AtomicUsize>,
+    request_done: Arc<Notify>,
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::Relaxed);
+        self.request_done.notify_waiters();
     }
 }
 
 /// Owns running inference-server processes. Single instance per `Orchestrator`.
-#[derive(Default)]
 pub struct ProcessManager {
     /// pid → child handle (kept for kill_on_drop).
     running: HashMap<i32, RunningChild>,
@@ -49,6 +51,19 @@ pub struct ProcessManager {
     reserved_ports: HashSet<u16>,
     /// model_id → spawned-but-not-yet-healthy process count.
     pending_instances: HashMap<String, usize>,
+    request_done: Arc<Notify>,
+}
+
+impl Default for ProcessManager {
+    fn default() -> Self {
+        Self {
+            running: HashMap::new(),
+            instances: HashMap::new(),
+            reserved_ports: HashSet::new(),
+            pending_instances: HashMap::new(),
+            request_done: Arc::new(Notify::new()),
+        }
+    }
 }
 
 /// A freshly spawned but not-yet-healthy child.
@@ -128,7 +143,7 @@ impl ProcessManager {
             model_id: pending.model_id,
             child: pending.child,
         });
-        RequestGuard { port, active }
+        RequestGuard { port, active, request_done: self.request_done.clone() }
     }
 
     /// Drop tracking for a pending child that failed health checks. Consuming
@@ -144,7 +159,11 @@ impl ProcessManager {
         for inst in self.instances.get(model_id)?.iter() {
             if inst.active.load(Ordering::Relaxed) == 0 {
                 inst.active.fetch_add(1, Ordering::Relaxed);
-                return Some(RequestGuard { port: inst.port, active: inst.active.clone() });
+                return Some(RequestGuard {
+                    port: inst.port,
+                    active: inst.active.clone(),
+                    request_done: self.request_done.clone(),
+                });
             }
         }
         None
@@ -158,7 +177,11 @@ impl ProcessManager {
         }
         let inst = self.instances.get(model_id)?.first()?;
         inst.active.fetch_add(1, Ordering::Relaxed);
-        Some(RequestGuard { port: inst.port, active: inst.active.clone() })
+        Some(RequestGuard {
+            port: inst.port,
+            active: inst.active.clone(),
+            request_done: self.request_done.clone(),
+        })
     }
 
     /// Number of live instances for a model.
@@ -170,6 +193,17 @@ impl ProcessManager {
     pub fn total_instance_count(&self, model_id: &str) -> usize {
         self.instance_count(model_id)
             + self.pending_instances.get(model_id).copied().unwrap_or(0)
+    }
+
+    pub fn has_active_requests(&self) -> bool {
+        self.instances
+            .values()
+            .flatten()
+            .any(|i| i.active.load(Ordering::Relaxed) > 0)
+    }
+
+    pub fn request_done_notifier(&self) -> Arc<Notify> {
+        self.request_done.clone()
     }
 
     /// Model ids whose live instances are all idle.

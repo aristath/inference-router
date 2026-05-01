@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_INSTANCES_PER_MODEL: usize = 1;
+pub const DEFAULT_VRAM_WAIT_MS: u64 = 300_000;
 
 /// Shared runtime data — single source of truth for models + gpus + presets.
 #[derive(Default)]
@@ -52,6 +53,7 @@ pub struct Orchestrator {
     pub server_port: u16,
     pub max_body_bytes: usize,
     pub max_instances_per_model: usize,
+    pub vram_wait_timeout: std::time::Duration,
 }
 
 impl Orchestrator {
@@ -65,6 +67,9 @@ impl Orchestrator {
         let max_instances_per_model = env_usize("INFERENCE_ROUTER_MAX_INSTANCES_PER_MODEL")
             .unwrap_or(DEFAULT_MAX_INSTANCES_PER_MODEL)
             .max(1);
+        let vram_wait_timeout = std::time::Duration::from_millis(
+            env_u64("INFERENCE_ROUTER_VRAM_WAIT_MS").unwrap_or(DEFAULT_VRAM_WAIT_MS),
+        );
 
         // One-shot migration of legacy `extra_args` into structured fields.
         // If any model changed, mark dirty so reconcile persists the
@@ -112,6 +117,7 @@ impl Orchestrator {
             server_port,
             max_body_bytes,
             max_instances_per_model,
+            vram_wait_timeout,
         }
     }
 
@@ -399,16 +405,30 @@ impl Orchestrator {
                 }
             }
 
-            match me.do_load(&id_owned).await {
-                Ok(guard) => Ok(guard),
-                Err(e) => {
-                    let mut data = me.data.lock().await;
-                    if let Some(m) = data.models.get_mut(&id_owned) {
-                        m.state = ModelState::Error(e.to_string());
-                        m.pid = None;
+            let started = std::time::Instant::now();
+            loop {
+                match me.do_load(&id_owned).await {
+                    Ok(guard) => return Ok(guard),
+                    Err(e @ LoadError::InsufficientVram { .. }) => {
+                        if !me.should_wait_for_vram(started).await {
+                            let mut data = me.data.lock().await;
+                            if let Some(m) = data.models.get_mut(&id_owned) {
+                                m.state = ModelState::Idle;
+                                m.pid = None;
+                            }
+                            me.dirty.store(true, Ordering::Relaxed);
+                            return Err(e);
+                        }
                     }
-                    me.dirty.store(true, Ordering::Relaxed);
-                    Err(e)
+                    Err(e) => {
+                        let mut data = me.data.lock().await;
+                        if let Some(m) = data.models.get_mut(&id_owned) {
+                            m.state = ModelState::Error(e.to_string());
+                            m.pid = None;
+                        }
+                        me.dirty.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
                 }
             }
         });
@@ -748,6 +768,28 @@ impl Orchestrator {
         }
     }
 
+    async fn should_wait_for_vram(&self, started: std::time::Instant) -> bool {
+        if self.vram_wait_timeout.is_zero() {
+            return false;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= self.vram_wait_timeout {
+            return false;
+        }
+
+        let (has_active, notify) = {
+            let pm = self.process_manager.lock().await;
+            (pm.has_active_requests(), pm.request_done_notifier())
+        };
+        if !has_active {
+            return false;
+        }
+
+        tokio::time::timeout(self.vram_wait_timeout - elapsed, notify.notified())
+            .await
+            .is_ok()
+    }
+
     pub async fn stop_model(&self, id: &str) -> Result<(), StopError> {
         self.stop_model_inner(id).await
     }
@@ -965,6 +1007,10 @@ fn subtract_reserved_from_gpus(mut gpus: Vec<GpuInfo>, mut reserved: u64) -> Vec
 
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.parse::<usize>().ok()
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse::<u64>().ok()
 }
 
 fn bytes_to_gib(bytes: u64) -> f64 {
