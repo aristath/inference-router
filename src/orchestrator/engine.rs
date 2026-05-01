@@ -175,12 +175,30 @@ impl Orchestrator {
     }
 
     pub async fn update_preset(&self, preset: BinaryPreset) -> Result<(), MutationError> {
-        let mut data = self.data.lock().await;
-        if !data.presets.contains_key(&preset.id) {
-            return Err(MutationError::NotFound(preset.id));
+        let mut models_to_stop = Vec::new();
+        {
+            let mut data = self.data.lock().await;
+            let existing = data.presets.get(&preset.id)
+                .ok_or_else(|| MutationError::NotFound(preset.id.clone()))?;
+            if existing.binary != preset.binary {
+                models_to_stop = data.models
+                    .values()
+                    .filter(|m| {
+                        m.binary_preset.as_deref() == Some(preset.id.as_str())
+                            && (m.state == ModelState::Running || m.state == ModelState::Loading)
+                    })
+                    .map(|m| m.id.clone())
+                    .collect();
+            }
+            data.presets.insert(preset.id.clone(), preset);
+            self.presets_dirty.store(true, Ordering::Relaxed);
         }
-        data.presets.insert(preset.id.clone(), preset);
-        self.presets_dirty.store(true, Ordering::Relaxed);
+        for id in models_to_stop {
+            info!(model = id, "stopping model after binary preset change");
+            if let Err(e) = self.stop_model_inner(&id).await {
+                warn!(model = id, error = %e, "failed to stop model after preset change");
+            }
+        }
         Ok(())
     }
 
@@ -207,38 +225,52 @@ impl Orchestrator {
     }
 
     pub async fn update_model(&self, new: ModelConfig) -> Result<(), MutationError> {
-        let mut data = self.data.lock().await;
-        if let Some(ref did) = new.draft_model_id {
-            validate_draft_reference(&data.models, &new.id, did)?;
+        let stop_after_update;
+        let id = new.id.clone();
+        {
+            let mut data = self.data.lock().await;
+            if let Some(ref did) = new.draft_model_id {
+                validate_draft_reference(&data.models, &new.id, did)?;
+            }
+            let existing = data.models.get_mut(&new.id)
+                .ok_or_else(|| MutationError::NotFound(new.id.clone()))?;
+
+            let process_live =
+                existing.state == ModelState::Running || existing.state == ModelState::Loading;
+            stop_after_update = process_live && spawn_config_changed(existing, &new);
+
+            // Preserve runtime fields if the model is currently running/loading —
+            // we don't want the form to wipe state by accident.
+            let preserved_state = existing.state.clone();
+            let preserved_pid = existing.pid;
+            let preserved_last_used = existing.last_used;
+
+            let mut updated = new;
+            // Drop the estimate whenever anything that affects KV cache size or
+            // weight layout changes — it'll be remeasured on next load.
+            let kv_invalidated = existing.model_path != updated.model_path
+                || existing.context != updated.context
+                || existing.cache_type_k != updated.cache_type_k
+                || existing.cache_type_v != updated.cache_type_v
+                || existing.n_gpu_layers != updated.n_gpu_layers;
+            if kv_invalidated {
+                updated.estimated_vram = 0;
+            } else {
+                updated.estimated_vram = existing.estimated_vram;
+            }
+            updated.state = preserved_state;
+            updated.pid = preserved_pid;
+            updated.last_used = preserved_last_used;
+
+            *existing = updated;
         }
-        let existing = data.models.get_mut(&new.id)
-            .ok_or_else(|| MutationError::NotFound(new.id.clone()))?;
-
-        // Preserve runtime fields if the model is currently running/loading —
-        // we don't want the form to wipe state by accident.
-        let preserved_state = existing.state.clone();
-        let preserved_pid = existing.pid;
-        let preserved_last_used = existing.last_used;
-
-        let mut updated = new;
-        // Drop the estimate whenever anything that affects KV cache size or
-        // weight layout changes — it'll be remeasured on next load.
-        let kv_invalidated = existing.model_path != updated.model_path
-            || existing.context != updated.context
-            || existing.cache_type_k != updated.cache_type_k
-            || existing.cache_type_v != updated.cache_type_v
-            || existing.n_gpu_layers != updated.n_gpu_layers;
-        if kv_invalidated {
-            updated.estimated_vram = 0;
-        } else {
-            updated.estimated_vram = existing.estimated_vram;
-        }
-        updated.state = preserved_state;
-        updated.pid = preserved_pid;
-        updated.last_used = preserved_last_used;
-
-        *existing = updated;
         self.dirty.store(true, Ordering::Relaxed);
+        if stop_after_update {
+            info!(model = id, "stopping model after spawn-affecting config change");
+            if let Err(e) = self.stop_model_inner(&id).await {
+                warn!(model = id, error = %e, "failed to stop model after config change");
+            }
+        }
         Ok(())
     }
 
@@ -858,6 +890,44 @@ fn validate_draft_reference(
     Ok(())
 }
 
+fn spawn_config_changed(old: &ModelConfig, new: &ModelConfig) -> bool {
+    old.weights_format != new.weights_format
+        || old.binary_preset != new.binary_preset
+        || old.binary != new.binary
+        || old.model_path != new.model_path
+        || old.mmproj_path != new.mmproj_path
+        || old.extra_args != new.extra_args
+        || old.context != new.context
+        || old.temperature != new.temperature
+        || old.top_p != new.top_p
+        || old.top_k != new.top_k
+        || old.min_p != new.min_p
+        || old.presence_penalty != new.presence_penalty
+        || old.repeat_penalty != new.repeat_penalty
+        || old.flash_attn != new.flash_attn
+        || old.n_gpu_layers != new.n_gpu_layers
+        || old.mlock != new.mlock
+        || old.no_mmap != new.no_mmap
+        || old.parallel_slots != new.parallel_slots
+        || old.cache_type_k != new.cache_type_k
+        || old.cache_type_v != new.cache_type_v
+        || old.split_mode != new.split_mode
+        || old.main_gpu != new.main_gpu
+        || old.tensor_split != new.tensor_split
+        || old.threads != new.threads
+        || old.cache_ram_mib != new.cache_ram_mib
+        || old.reasoning_format != new.reasoning_format
+        || old.reasoning_budget != new.reasoning_budget
+        || old.chat_template_kwargs != new.chat_template_kwargs
+        || old.device != new.device
+        || old.draft_model_id != new.draft_model_id
+        || old.draft_max != new.draft_max
+        || old.draft_min != new.draft_min
+        || old.draft_p_min != new.draft_p_min
+        || old.ctx_checkpoints != new.ctx_checkpoints
+        || old.checkpoint_every_n_tokens != new.checkpoint_every_n_tokens
+}
+
 fn subtract_reserved_from_gpus(mut gpus: Vec<GpuInfo>, mut reserved: u64) -> Vec<GpuInfo> {
     if reserved == 0 {
         return gpus;
@@ -1028,6 +1098,43 @@ mod tests {
         updated.model_path = PathBuf::from("/tmp/m2.gguf");
         o.update_model(updated).await.unwrap();
         assert_eq!(o.get_model("a").await.unwrap().estimated_vram, 0);
+    }
+
+    #[tokio::test]
+    async fn update_running_model_name_only_keeps_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        let mut m = model("a");
+        m.state = ModelState::Running;
+        m.pid = Some(123);
+        o.add_model(m.clone()).await.unwrap();
+
+        m.name = "renamed".into();
+        o.update_model(m).await.unwrap();
+
+        let after = o.get_model("a").await.unwrap();
+        assert_eq!(after.name, "renamed");
+        assert_eq!(after.state, ModelState::Running);
+        assert_eq!(after.pid, Some(123));
+    }
+
+    #[tokio::test]
+    async fn update_running_model_spawn_change_stops_to_apply_new_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        let mut m = model("a");
+        m.state = ModelState::Running;
+        m.pid = Some(123);
+        o.add_model(m.clone()).await.unwrap();
+
+        m.context = 8192;
+        o.update_model(m).await.unwrap();
+
+        let after = o.get_model("a").await.unwrap();
+        assert_eq!(after.context, 8192);
+        assert_eq!(after.state, ModelState::Idle);
+        assert_eq!(after.pid, None);
+        assert_eq!(after.estimated_vram, 0);
     }
 
     #[tokio::test]
