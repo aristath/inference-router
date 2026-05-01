@@ -77,6 +77,13 @@
             <p style="color: #94a3b8;">No AMD GPUs found via sysfs.</p>
         </div>
         {% endif %}
+
+        <h2 class="section" style="margin-top: 1.5rem;">Events</h2>
+        <div class="card">
+            <div id="event-log" class="event-log">
+                <div style="color:#64748b;">No recent events.</div>
+            </div>
+        </div>
     </div>
 
     <!-- ===== Right column: Models ===== -->
@@ -616,6 +623,11 @@
 .model-card-stats { font-size: 0.85rem; color: #475569; display: flex; gap: 0.6rem; flex-wrap: wrap; }
 .model-runtime { color: #94a3b8; }
 .model-card-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.1rem; }
+.event-log { display:flex; flex-direction:column; gap:0.35rem; max-height:18rem; overflow:auto; font-size:0.82rem; }
+.event-row { display:grid; grid-template-columns:4.5rem 3.5rem 1fr; gap:0.45rem; color:#94a3b8; }
+.event-level-info { color:#38bdf8; }
+.event-level-warn { color:#fde047; }
+.event-level-error { color:#fca5a5; }
 </style>
 
 <script>

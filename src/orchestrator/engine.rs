@@ -7,7 +7,8 @@ use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnE
 use crate::system::stats::{SystemStats, SystemTracker};
 use crate::vram::estimator::VramEstimate;
 use crate::vram::tracker::{GpuInfo, VRAMTracker};
-use std::collections::HashMap;
+use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -16,6 +17,7 @@ use tracing::{error, info, warn};
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_INSTANCES_PER_MODEL: usize = 1;
 pub const DEFAULT_VRAM_WAIT_MS: u64 = 300_000;
+const MAX_EVENTS: usize = 200;
 
 /// Shared runtime data — single source of truth for models + gpus + presets.
 #[derive(Default)]
@@ -23,6 +25,13 @@ pub struct AppData {
     pub models: HashMap<String, ModelConfig>,
     pub gpus: Vec<GpuInfo>,
     pub presets: HashMap<String, BinaryPreset>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AppEvent {
+    pub ts: f64,
+    pub level: &'static str,
+    pub message: String,
 }
 
 /// Thin handle injected into axum handlers. Cheap to clone.
@@ -54,6 +63,7 @@ pub struct Orchestrator {
     pub max_body_bytes: usize,
     pub max_instances_per_model: usize,
     pub vram_wait_timeout: std::time::Duration,
+    events: Arc<Mutex<VecDeque<AppEvent>>>,
 }
 
 impl Orchestrator {
@@ -118,6 +128,7 @@ impl Orchestrator {
             max_body_bytes,
             max_instances_per_model,
             vram_wait_timeout,
+            events: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -159,6 +170,22 @@ impl Orchestrator {
 
     pub async fn model_runtimes(&self) -> HashMap<String, ModelRuntime> {
         self.process_manager.lock().await.model_runtimes()
+    }
+
+    pub async fn recent_events(&self) -> Vec<AppEvent> {
+        self.events.lock().await.iter().cloned().collect()
+    }
+
+    async fn record_event(&self, level: &'static str, message: impl Into<String>) {
+        let mut events = self.events.lock().await;
+        events.push_front(AppEvent {
+            ts: unix_now(),
+            level,
+            message: message.into(),
+        });
+        while events.len() > MAX_EVENTS {
+            events.pop_back();
+        }
     }
 
     #[cfg(test)]
@@ -205,6 +232,7 @@ impl Orchestrator {
         }
         for id in models_to_stop {
             info!(model = id, "stopping model after binary preset change");
+            self.record_event("info", format!("stopping {id}: binary preset changed")).await;
             if let Err(e) = self.stop_model_inner(&id).await {
                 warn!(model = id, error = %e, "failed to stop model after preset change");
             }
@@ -277,6 +305,7 @@ impl Orchestrator {
         self.dirty.store(true, Ordering::Relaxed);
         if stop_after_update {
             info!(model = id, "stopping model after spawn-affecting config change");
+            self.record_event("info", format!("stopping {id}: configuration changed")).await;
             if let Err(e) = self.stop_model_inner(&id).await {
                 warn!(model = id, error = %e, "failed to stop model after config change");
             }
@@ -578,6 +607,7 @@ impl Orchestrator {
                     decide_eviction(&snapshot, free, model.estimated_vram, &idle_models)
                 {
                     info!(victim = victim, "evicting to make room");
+                    self.record_event("info", format!("evicting {victim} to load {id}")).await;
                     if let Err(e) = self.stop_model_inner(&victim).await {
                         warn!(model = victim, error = %e, "eviction stop failed");
                     }
@@ -621,6 +651,7 @@ impl Orchestrator {
                 pm.spawn_child(&model, draft.as_ref())
                     .map_err(LoadError::SpawnFailed)?
             };
+            self.record_event("info", format!("loading {id} on port {}", pending.port)).await;
             let pid = pending.pid;
             let port = pending.port;
             // Reserve this model's VRAM before releasing admission so the
@@ -664,6 +695,7 @@ impl Orchestrator {
                 }
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "inference server ready");
+                self.record_event("info", format!("{id} ready on port {port}")).await;
                 Ok(guard)
             }
             Err(e) => {
@@ -673,6 +705,7 @@ impl Orchestrator {
                 }
                 self.process_manager.lock().await.discard_pending(pending);
                 error!(pid, port, error = %e, "health check failed; spawn cancelled");
+                self.record_event("error", format!("{id} failed health check: {e}")).await;
                 Err(LoadError::SpawnFailed(crate::process::manager::SpawnError::HealthCheckFailed(e)))
             }
         }
@@ -744,6 +777,7 @@ impl Orchestrator {
             };
             let pid = pending.pid;
             let port = pending.port;
+            self.record_event("info", format!("loading extra {id} instance on port {port}")).await;
             let vram_reservation = model.estimated_vram;
             if vram_reservation > 0 {
                 self.reserved_vram.fetch_add(vram_reservation, std::sync::atomic::Ordering::SeqCst);
@@ -761,6 +795,7 @@ impl Orchestrator {
                 drop(self.process_manager.lock().await.register(pending));
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "extra instance ready");
+                self.record_event("info", format!("extra {id} instance ready on port {port}")).await;
             }
             Err(e) => {
                 if vram_reservation > 0 {
@@ -768,6 +803,7 @@ impl Orchestrator {
                 }
                 self.process_manager.lock().await.discard_pending(pending);
                 warn!(pid, port, model = id, error = %e, "extra instance health check failed");
+                self.record_event("warn", format!("extra {id} instance failed health check: {e}")).await;
             }
         }
     }
@@ -806,8 +842,11 @@ impl Orchestrator {
             data.models.get(id).ok_or_else(|| StopError::ModelNotFound(id.into()))?;
         }
         let pids = self.process_manager.lock().await.pids_for_model(id);
-        for pid in pids {
-            self.process_manager.lock().await.stop(pid).await;
+        for pid in &pids {
+            self.process_manager.lock().await.stop(*pid).await;
+        }
+        if !pids.is_empty() {
+            self.record_event("info", format!("stopped {id}")).await;
         }
         {
             let mut data = self.data.lock().await;

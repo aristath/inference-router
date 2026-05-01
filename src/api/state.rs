@@ -11,6 +11,7 @@ struct StatusResponse {
     system: SystemResponse,
     gpus: Vec<GpuResponse>,
     models: Vec<ModelResponse>,
+    events: Vec<crate::orchestrator::engine::AppEvent>,
     server_port: u16,
 }
 
@@ -55,10 +56,12 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
     let gpus = state.list_gpus().await;
     let models = state.list_models().await;
     let runtimes = state.model_runtimes().await;
+    let events = state.recent_events().await;
     let sys = state.system_stats();
 
     let response = StatusResponse {
         server_port: state.server_port,
+        events,
         system: SystemResponse {
             cpu_pct: sys.cpu_pct,
             ram_used: sys.ram_used,

@@ -286,6 +286,30 @@
             const v = el.querySelector('.gpu-temp') || el.firstElementChild;
             if (v) v.textContent = c == null ? '—' : Math.round(c);
         }
+        function updateEventLog(events) {
+            const log = document.getElementById('event-log');
+            if (!log) return;
+            const rows = (events || []).slice(0, 30);
+            if (rows.length === 0) {
+                log.innerHTML = '<div style="color:#64748b;">No recent events.</div>';
+                return;
+            }
+            log.innerHTML = '';
+            rows.forEach(ev => {
+                const row = document.createElement('div');
+                row.className = 'event-row';
+                const dt = new Date((ev.ts || 0) * 1000);
+                const time = Number.isFinite(dt.getTime()) ? dt.toLocaleTimeString() : '--:--:--';
+                const level = String(ev.level || 'info');
+                row.innerHTML = `
+                    <span>${time}</span>
+                    <span class="event-level-${level}">${level}</span>
+                    <span></span>
+                `;
+                row.lastElementChild.textContent = ev.message || '';
+                log.appendChild(row);
+            });
+        }
         function updateDashboard(data) {
             // Host (CPU / RAM / CPU temp)
             if (data.system) {
@@ -339,6 +363,7 @@
                     pending.style.display = n > 0 ? '' : 'none';
                 }
             });
+            updateEventLog(data.events || []);
         }
         // Polling interval is a per-browser UI preference, stored in
         // localStorage. The dashboard Settings modal exposes a field to
