@@ -2,15 +2,67 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path as StdPath;
 
-use crate::config::{BinaryPreset, ModelConfig};
+use crate::config::{BinaryPreset, CacheType, ModelConfig, WeightsFormat};
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
 use crate::vram::estimator::GgufMeta;
 
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.list_models().await)
+}
+
+#[derive(Serialize)]
+struct ValidationResponse {
+    valid: bool,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+pub async fn validate_model(
+    State(state): State<AppState>,
+    Json(model): Json<ModelConfig>,
+) -> impl IntoResponse {
+    let presets = state.list_presets().await;
+    let gpus = state.list_gpus().await;
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    let binary = if let Some(preset_id) = model.binary_preset.as_deref() {
+        match presets.iter().find(|p| p.id == preset_id) {
+            Some(p) => Some(p.binary.as_path()),
+            None => {
+                errors.push(format!("binary preset '{preset_id}' does not exist"));
+                None
+            }
+        }
+    } else {
+        Some(model.binary.as_path())
+    };
+
+    if let Some(path) = binary {
+        validate_binary_path(path, &mut errors);
+    }
+    validate_model_path(&model, &mut errors);
+    validate_tensor_split(&model, gpus.len(), &mut errors, &mut warnings);
+    validate_context(&model, &mut warnings);
+    validate_cache_quantization(&model, &mut warnings);
+
+    let status = if errors.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (
+        status,
+        Json(ValidationResponse {
+            valid: errors.is_empty(),
+            errors,
+            warnings,
+        }),
+    )
+        .into_response()
 }
 
 /// Convert the orchestrator's mutation errors into an HTTP response. Used by
@@ -43,6 +95,99 @@ fn mutation_response(e: MutationError) -> axum::response::Response {
             })),
         )
             .into_response(),
+    }
+}
+
+fn validate_binary_path(path: &StdPath, errors: &mut Vec<String>) {
+    if path.as_os_str().is_empty() {
+        errors.push("binary path is empty".into());
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        errors.push(format!("binary '{}' does not exist", path.display()));
+        return;
+    };
+    if !meta.is_file() {
+        errors.push(format!("binary '{}' is not a file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            errors.push(format!("binary '{}' is not executable", path.display()));
+        }
+    }
+}
+
+fn validate_model_path(model: &ModelConfig, errors: &mut Vec<String>) {
+    if model.model_path.as_os_str().is_empty() {
+        errors.push("model path is empty".into());
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(&model.model_path) else {
+        errors.push(format!("model path '{}' does not exist", model.model_path.display()));
+        return;
+    };
+    match model.weights_format {
+        WeightsFormat::Gguf if !meta.is_file() => {
+            errors.push(format!("GGUF model path '{}' is not a file", model.model_path.display()));
+        }
+        WeightsFormat::Safetensors if !meta.is_dir() => {
+            errors.push(format!(
+                "safetensors model path '{}' is not a directory",
+                model.model_path.display(),
+            ));
+        }
+        _ => {}
+    }
+}
+
+fn validate_tensor_split(
+    model: &ModelConfig,
+    gpu_count: usize,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(split) = model.tensor_split.as_deref() else {
+        return;
+    };
+    let parts: Vec<&str> = split.split(',').map(str::trim).collect();
+    if gpu_count > 0 && parts.len() != gpu_count {
+        warnings.push(format!(
+            "tensor_split has {} entries but {} GPUs were detected",
+            parts.len(),
+            gpu_count,
+        ));
+    }
+    let mut non_zero = false;
+    for part in parts {
+        match part.parse::<f32>() {
+            Ok(v) if v > 0.0 => non_zero = true,
+            Ok(_) => {}
+            Err(_) => errors.push(format!("tensor_split entry '{part}' is not a number")),
+        }
+    }
+    if !non_zero {
+        errors.push("tensor_split must contain at least one positive entry".into());
+    }
+}
+
+fn validate_context(model: &ModelConfig, warnings: &mut Vec<String>) {
+    if let Some(meta) = &model.gguf_meta {
+        if model.context > meta.max_context {
+            warnings.push(format!(
+                "context {} exceeds GGUF metadata max_context {}",
+                model.context, meta.max_context,
+            ));
+        }
+    }
+}
+
+fn validate_cache_quantization(model: &ModelConfig, warnings: &mut Vec<String>) {
+    let quantized = matches!(model.cache_type_k, Some(CacheType::Q8_0 | CacheType::Q4_0))
+        || matches!(model.cache_type_v, Some(CacheType::Q8_0 | CacheType::Q4_0));
+    if quantized && !model.flash_attn {
+        warnings.push("KV cache quantization usually requires flash attention".into());
     }
 }
 

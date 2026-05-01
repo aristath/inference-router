@@ -75,6 +75,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         // REST API
         .route("/api/status", get(get_app_state))
         .route("/api/models", get(list_models).post(create_model))
+        .route("/api/models/validate", post(validate_model))
         .route("/api/models/{id}", put(update_model).delete(delete_model))
         .route("/api/models/{id}/load", post(load_model))
         .route("/api/models/{id}/stop", post(stop_model))

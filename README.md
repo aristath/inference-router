@@ -21,6 +21,7 @@ Default bind: `0.0.0.0:8080`.
 | `/` | GET | Dashboard (HTML) |
 | `/api/status` | GET | Live system + GPU + model snapshot (dashboard polls this) |
 | `/api/models` | GET, POST | List / create model definitions |
+| `/api/models/validate` | POST | Validate a model definition without saving it |
 | `/api/models/{id}` | PUT, DELETE | Update / delete |
 | `/api/models/{id}/load` | POST | Load (ensure backend process is running) |
 | `/api/models/{id}/stop` | POST | Stop (kill backend process) |
