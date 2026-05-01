@@ -194,8 +194,14 @@ fn compute_sizes(m: &ModelConfig) -> (u64, u64) {
     use crate::vram::estimator::{GgufInfo, KvPerElement, VramEstimate};
 
     match m.weights_format {
-        WeightsFormat::Gguf => match GgufInfo::read(&m.model_path) {
-            Ok(info) => {
+        WeightsFormat::Gguf => {
+            let info = m
+                .gguf_meta
+                .as_ref()
+                .map(GgufInfo::from)
+                .or_else(|| GgufInfo::read(&m.model_path).ok());
+            match info {
+                Some(info) => {
                 // Honour the model's configured KV cache quantization so
                 // q8_0/q4_0 shrink the Required VRAM column, matching
                 // what llama-server actually allocates at run time.
@@ -209,10 +215,11 @@ fn compute_sizes(m: &ModelConfig) -> (u64, u64) {
                 let estimate = VramEstimate::compute(info.file_size, kv);
                 (info.file_size, estimate.total_vram)
             }
-            // Header unreadable (missing file, non-GGUF, etc.) — show a
-            // dash (the gib_or_dash formatter handles 0).
-            Err(_) => (0, 0),
-        },
+                // Header unreadable (missing file, non-GGUF, etc.) — show a
+                // dash (the gib_or_dash formatter handles 0).
+                None => (0, 0),
+            }
+        }
         // Safetensors: sum the directory's regular files for size, and
         // leave required VRAM blank — estimating vLLM's memory without
         // instantiating the model is too tangled for a quick stat.
