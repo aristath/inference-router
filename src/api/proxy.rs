@@ -56,12 +56,17 @@ pub async fn proxy_handler(
 
     let (parts, body) = req.into_parts();
 
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, state.max_body_bytes).await {
         Ok(b) => b,
         Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("failed to read request body: {e}")})),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": format!(
+                        "request body exceeds max size of {} bytes or could not be read: {e}",
+                        state.max_body_bytes,
+                    ),
+                })),
             )
                 .into_response();
         }

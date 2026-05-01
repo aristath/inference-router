@@ -396,7 +396,7 @@ impl GgufMeta {
         let display_name = name.as_deref()
             .or(basename.as_deref())
             .unwrap_or("Model");
-        let suggested_name = if quant_label.as_deref().map_or(true, |q| q == "Unknown") {
+        let suggested_name = if quant_label.as_deref().is_none_or(|q| q == "Unknown") {
             display_name.to_owned()
         } else {
             format!("{} {}", display_name, quant_label.as_deref().unwrap_or(""))

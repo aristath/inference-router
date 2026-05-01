@@ -13,6 +13,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_INSTANCES_PER_MODEL: usize = 1;
+
 /// Shared runtime data — single source of truth for models + gpus + presets.
 #[derive(Default)]
 pub struct AppData {
@@ -47,6 +50,8 @@ pub struct Orchestrator {
     /// Set when presets change so reconcile persists presets.json.
     pub presets_dirty: Arc<AtomicBool>,
     pub server_port: u16,
+    pub max_body_bytes: usize,
+    pub max_instances_per_model: usize,
 }
 
 impl Orchestrator {
@@ -55,6 +60,12 @@ impl Orchestrator {
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
         server_port: u16,
     ) -> Self {
+        let max_body_bytes = env_usize("INFERENCE_ROUTER_MAX_BODY_BYTES")
+            .unwrap_or(DEFAULT_MAX_BODY_BYTES);
+        let max_instances_per_model = env_usize("INFERENCE_ROUTER_MAX_INSTANCES_PER_MODEL")
+            .unwrap_or(DEFAULT_MAX_INSTANCES_PER_MODEL)
+            .max(1);
+
         // One-shot migration of legacy `extra_args` into structured fields.
         // If any model changed, mark dirty so reconcile persists the
         // migrated shape on the next tick.
@@ -99,6 +110,8 @@ impl Orchestrator {
             dirty: Arc::new(AtomicBool::new(migrated_any)),
             presets_dirty: Arc::new(AtomicBool::new(false)),
             server_port,
+            max_body_bytes,
+            max_instances_per_model,
         }
     }
 
@@ -297,13 +310,18 @@ impl Orchestrator {
                 let data = self.data.lock().await;
                 let m = data.models.get(id);
                 let est = m.map(|m| m.estimated_vram).unwrap_or(0);
-                let free: u64 = data.gpus.iter().map(|g| g.free_vram()).sum();
+                let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
+                let adjusted = subtract_reserved_from_gpus(data.gpus.clone(), already_reserved);
+                let free: u64 = adjusted.iter().map(|g| g.free_vram()).sum();
                 (est, free, m.is_some())
             };
             if !model_exists {
                 return Err(LoadError::ModelNotFound(id.into()));
             }
-            if estimated_vram > 0 && free_vram >= estimated_vram {
+            if instance_count < self.max_instances_per_model
+                && estimated_vram > 0
+                && free_vram >= estimated_vram
+            {
                 // Kick off a background spawn; serve this request on an existing instance.
                 let me = self.clone();
                 let id_owned = id.to_string();
@@ -492,12 +510,13 @@ impl Orchestrator {
             // their processes exist but haven't yet faulted weights into VRAM,
             // so sysfs still reports the full free figure.
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-            let free: u64 = gpus.iter().map(|g| g.free_vram()).sum::<u64>()
-                .saturating_sub(already_reserved);
+            let adjusted_gpus = subtract_reserved_from_gpus(gpus.clone(), already_reserved);
+            let mut free: u64 = adjusted_gpus.iter().map(|g| g.free_vram()).sum();
             if model.estimated_vram > free {
                 let snapshot = self.data.lock().await.models.clone();
+                let idle_models = self.process_manager.lock().await.idle_model_ids();
                 for EvictionAction::Evict(victim) in
-                    decide_eviction(&snapshot, &gpus, model.estimated_vram)
+                    decide_eviction(&snapshot, free, model.estimated_vram, &idle_models)
                 {
                     info!(victim = victim, "evicting to make room");
                     if let Err(e) = self.stop_model_inner(&victim).await {
@@ -506,15 +525,25 @@ impl Orchestrator {
                 }
                 // Re-read VRAM after eviction so the allocator sees the freed space.
                 let gpus_after = self.vram_tracker.refresh();
+                let adjusted_after = subtract_reserved_from_gpus(gpus_after.clone(), already_reserved);
+                free = adjusted_after.iter().map(|g| g.free_vram()).sum();
                 self.data.lock().await.gpus = gpus_after;
+            }
+            if model.estimated_vram > 0 && model.estimated_vram > free {
+                return Err(LoadError::InsufficientVram {
+                    model: id.into(),
+                    needed: model.estimated_vram,
+                    free,
+                });
             }
 
             // Auto-allocate across the smallest viable GPU subset, unless the
             // user pinned an explicit tensor_split.
             if model.weights_format == WeightsFormat::Gguf && model.tensor_split.is_none() {
                 let snapshot = self.data.lock().await.gpus.clone();
-                if snapshot.len() > 1 && model.estimated_vram > 0 {
-                    if let Some(split) = plan_tensor_split(&snapshot, model.estimated_vram) {
+                let adjusted = subtract_reserved_from_gpus(snapshot, already_reserved);
+                if adjusted.len() > 1 && model.estimated_vram > 0 {
+                    if let Some(split) = plan_tensor_split(&adjusted, model.estimated_vram) {
                         info!(
                             model = id,
                             gpus_used = gpus_used(&split),
@@ -602,6 +631,9 @@ impl Orchestrator {
             if !self.process_manager.lock().await.all_busy(id) {
                 return;
             }
+            if self.process_manager.lock().await.instance_count(id) >= self.max_instances_per_model {
+                return;
+            }
 
             let gpus = self.vram_tracker.refresh();
             { self.data.lock().await.gpus = gpus.clone(); }
@@ -628,18 +660,19 @@ impl Orchestrator {
             };
 
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-            let free: u64 = gpus.iter().map(|g| g.free_vram()).sum::<u64>()
-                .saturating_sub(already_reserved);
+            let adjusted_gpus = subtract_reserved_from_gpus(gpus.clone(), already_reserved);
+            let free: u64 = adjusted_gpus.iter().map(|g| g.free_vram()).sum();
             if model.estimated_vram == 0 || free < model.estimated_vram {
                 return;
             }
 
-            if model.weights_format == WeightsFormat::Gguf && model.tensor_split.is_none() {
-                let snapshot = self.data.lock().await.gpus.clone();
-                if snapshot.len() > 1 && model.estimated_vram > 0 {
-                    if let Some(split) = plan_tensor_split(&snapshot, model.estimated_vram) {
-                        model.tensor_split = Some(split);
-                    }
+            if model.weights_format == WeightsFormat::Gguf
+                && model.tensor_split.is_none()
+                && adjusted_gpus.len() > 1
+                && model.estimated_vram > 0
+            {
+                if let Some(split) = plan_tensor_split(&adjusted_gpus, model.estimated_vram) {
+                    model.tensor_split = Some(split);
                 }
             }
 
@@ -775,6 +808,9 @@ pub enum LoadError {
 
     #[error("spawn failed: {0}")]
     SpawnFailed(SpawnError),
+
+    #[error("not enough idle VRAM to load '{model}': need {:.1} GiB, have {:.1} GiB (active requests are not evicted)", bytes_to_gib(*needed), bytes_to_gib(*free))]
+    InsufficientVram { model: String, needed: u64, free: u64 },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -816,6 +852,33 @@ fn validate_draft_reference(
         }));
     }
     Ok(())
+}
+
+fn subtract_reserved_from_gpus(mut gpus: Vec<GpuInfo>, mut reserved: u64) -> Vec<GpuInfo> {
+    if reserved == 0 {
+        return gpus;
+    }
+
+    let mut order: Vec<usize> = (0..gpus.len()).collect();
+    order.sort_by(|a, b| gpus[*b].free_vram().cmp(&gpus[*a].free_vram()));
+    for idx in order {
+        if reserved == 0 {
+            break;
+        }
+        let free = gpus[idx].free_vram();
+        let take = free.min(reserved);
+        gpus[idx].used_vram = gpus[idx].used_vram.saturating_add(take);
+        reserved -= take;
+    }
+    gpus
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse::<usize>().ok()
+}
+
+fn bytes_to_gib(bytes: u64) -> f64 {
+    bytes as f64 / 1_073_741_824.0
 }
 
 #[cfg(test)]

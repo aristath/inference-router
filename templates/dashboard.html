@@ -127,13 +127,13 @@
                         </div>
                         <div class="model-card-actions">
                             {% if model.state_class == "idle" || model.state_class == "error" %}
-                            <button type="button" class="btn btn-success btn-sm" onclick="loadModel('{{ model.id }}')">Load</button>
+                            <button type="button" class="btn btn-success btn-sm" data-model-action="load" data-model-id="{{ model.id }}">Load</button>
                             {% endif %}
                             {% if model.state_class == "running" %}
-                            <button type="button" class="btn btn-danger btn-sm" onclick="stopModel('{{ model.id }}')">Stop</button>
+                            <button type="button" class="btn btn-danger btn-sm" data-model-action="stop" data-model-id="{{ model.id }}">Stop</button>
                             {% endif %}
-                            <button type="button" class="btn btn-secondary btn-sm" onclick="editModel('{{ model.id }}')">Edit</button>
-                            <button type="button" class="btn btn-danger btn-sm" onclick="deleteModel('{{ model.id }}', '{{ model.name }}')">Delete</button>
+                            <button type="button" class="btn btn-secondary btn-sm" data-model-action="edit" data-model-id="{{ model.id }}">Edit</button>
+                            <button type="button" class="btn btn-danger btn-sm" data-model-action="delete" data-model-id="{{ model.id }}" data-model-name="{{ model.name }}">Delete</button>
                         </div>
                     </div>
                     {% endfor %}
@@ -1090,6 +1090,18 @@ async function deleteModel(id, name) {
     if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Delete failed: ' + (j.error || r.statusText)); }
     else location.reload();
 }
+
+document.getElementById('model-groups')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-model-action]');
+    if (!btn) return;
+    const id = btn.dataset.modelId || '';
+    if (!id) return;
+    const action = btn.dataset.modelAction;
+    if (action === 'load') loadModel(id);
+    else if (action === 'stop') stopModel(id);
+    else if (action === 'edit') editModel(id);
+    else if (action === 'delete') deleteModel(id, btn.dataset.modelName || id);
+});
 
 // ----- Slider/number pair sync (sampling) -----
 (function bindSliderPairs() {

@@ -1,5 +1,5 @@
 use crate::config::{ModelConfig, SplitMode, WeightsFormat};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -148,6 +148,23 @@ impl ProcessManager {
         self.instances.get(model_id).map(|v| v.len()).unwrap_or(0)
     }
 
+    /// Model ids whose live instances are all idle.
+    ///
+    /// Eviction stops every instance for a model, so a model is safe to evict
+    /// only when none of its instances are serving a request.
+    pub fn idle_model_ids(&self) -> HashSet<String> {
+        self.instances
+            .iter()
+            .filter(|(_, insts)| {
+                !insts.is_empty()
+                    && insts
+                        .iter()
+                        .all(|i| i.active.load(Ordering::Relaxed) == 0)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// True when every instance for the model has active > 0 (or none exist).
     pub fn all_busy(&self, model_id: &str) -> bool {
         match self.instances.get(model_id) {
@@ -175,10 +192,6 @@ impl ProcessManager {
         self.instances.get(model_id)
             .map(|v| v.iter().map(|i| i.pid).collect())
             .unwrap_or_default()
-    }
-
-    pub fn is_alive(&self, pid: i32) -> bool {
-        is_process_alive(pid)
     }
 
     pub async fn stop(&mut self, pid: i32) {
@@ -222,6 +235,7 @@ impl ProcessManager {
     /// Directly registers an instance without a real process.
     /// Used in tests to synthesize a Running model (integration tests use
     /// pid=-1; unit tests can pass a specific pid to test dead-process detection).
+    #[allow(dead_code)]
     pub fn register_test_instance(&mut self, model_id: &str, pid: i32, port: u16) {
         let active = Arc::new(AtomicUsize::new(0));
         self.instances.entry(model_id.into()).or_default().push(InstanceInfo {
@@ -232,6 +246,7 @@ impl ProcessManager {
     }
 
     /// Convenience wrapper for integration tests (pid is irrelevant there).
+    #[allow(dead_code)]
     pub fn register_port(&mut self, model_id: &str, port: u16) {
         self.register_test_instance(model_id, -1, port);
     }

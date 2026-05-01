@@ -55,6 +55,8 @@ cargo run --release
 Environment:
 - `RUST_LOG` — `tracing` filter, e.g. `inference_router=debug`. Defaults to `info`.
 - `RADV_DEBUG=nocompute` — forces the graphics queue on AMD RDNA4 (2.4x TG improvement over the compute queue). Set in the systemd unit by default.
+- `INFERENCE_ROUTER_MAX_BODY_BYTES` — maximum proxied request body size. Defaults to `1073741824` (1 GiB).
+- `INFERENCE_ROUTER_MAX_INSTANCES_PER_MODEL` — maximum concurrent backend processes per model. Defaults to `1`; raise it if you explicitly want replica scale-out while requests are busy.
 
 The port is `8080`, hardcoded in `AppConfig::default()` (see `src/lifecycle.rs`).
 

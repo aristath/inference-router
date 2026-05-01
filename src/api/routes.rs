@@ -111,6 +111,11 @@ pub async fn load_model(
             Json(serde_json::json!({"error": format!("spawn failed: {e}")})),
         )
             .into_response(),
+        Err(e @ LoadError::InsufficientVram { .. }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
