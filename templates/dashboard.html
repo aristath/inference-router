@@ -399,6 +399,11 @@
                                     <small class="field-help">Fractions per GPU (e.g. <code>0.5,0.5,0</code>). Blank = auto-allocate.</small>
                                 </div>
                             </div>
+                            <div class="form-group">
+                                <label for="mmproj_path">Multimodal projector (<code>--mmproj</code>)</label>
+                                <input type="text" id="mmproj_path" name="mmproj_path" placeholder="/models/mmproj.gguf">
+                                <small class="field-help">Required for llama.cpp image input with GGUF vision models.</small>
+                            </div>
                             <div class="form-row">
                                 <div class="form-group">
                                     <label for="main_gpu">Main GPU</label>
@@ -616,6 +621,7 @@ const MODEL_DEFAULTS = {
     id: '', name: '',
     weights_format: 'gguf',
     binary: '', model_path: '',
+    mmproj_path: null,
     context: 4096,
     temperature: 0.6, top_p: 0.95, top_k: 40, min_p: 0.0,
     presence_penalty: 0.0, repeat_penalty: 1.0,
@@ -807,6 +813,7 @@ function updateTabBadges() {
         !!v('parallel_slots'),
         !!v('split_mode'),
         !!v('tensor_split'),
+        !!v('mmproj_path'),
         v('main_gpu') !== '',
         !!v('device'),
         !!v('cache_type_k'),
@@ -1005,6 +1012,7 @@ function populateModelForm(m, mode) {
     f.split_mode.value = m.split_mode ?? '';
     f.main_gpu.value = m.main_gpu == null ? '' : String(m.main_gpu);
     f.tensor_split.value = m.tensor_split ?? '';
+    f.mmproj_path.value = m.mmproj_path ?? '';
     f.threads.value = m.threads == null ? '' : String(m.threads);
     f.cache_ram_mib.value = m.cache_ram_mib == null ? '' : String(m.cache_ram_mib);
     f.reasoning_format.value = m.reasoning_format ?? '';
@@ -1439,6 +1447,7 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         split_mode: toOptStr(f.split_mode.value),
         main_gpu: toOptInt(f.main_gpu.value),
         tensor_split: toOptStr(f.tensor_split.value),
+        mmproj_path: toOptStr(f.mmproj_path.value),
         threads: toOptInt(f.threads.value),
         cache_ram_mib: toOptInt(f.cache_ram_mib.value),
         reasoning_format: toOptStr(f.reasoning_format.value),

@@ -338,6 +338,10 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
                 args.push("--chat-template-kwargs".into());
                 args.push(kw.clone());
             }
+            if let Some(ref path) = model.mmproj_path {
+                args.push("--mmproj".into());
+                args.push(path.to_string_lossy().into_owned());
+            }
 
             if let Some(d) = draft {
                 args.push("-md".into());
@@ -698,6 +702,15 @@ mod tests {
         assert!(j.contains("--split-mode row"), "{j}");
         assert!(j.contains("--main-gpu 2"), "{j}");
         assert!(j.contains("--tensor-split 0.5,0.5,0"), "{j}");
+    }
+
+    #[test]
+    fn gguf_argv_emits_mmproj() {
+        let mut m = gguf_model();
+        m.mmproj_path = Some(PathBuf::from("/models/mmproj.gguf"));
+        let args = build_command_args(&m, None, 9001);
+        let j = args.join(" ");
+        assert!(j.contains("--mmproj /models/mmproj.gguf"), "{j}");
     }
 
     #[test]

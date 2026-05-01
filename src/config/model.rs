@@ -145,6 +145,9 @@ pub struct ModelConfig {
     pub binary_preset: Option<String>,
     pub binary: PathBuf,
     pub model_path: PathBuf,
+    /// `--mmproj FILE`. Required by llama.cpp for GGUF vision inputs.
+    #[serde(default)]
+    pub mmproj_path: Option<PathBuf>,
     #[serde(default)]
     pub extra_args: Vec<String>,
 
@@ -274,6 +277,7 @@ impl Default for ModelConfig {
             binary_preset: None,
             binary: PathBuf::new(),
             model_path: PathBuf::new(),
+            mmproj_path: None,
             extra_args: Vec::new(),
             context: 4096,
             temperature: default_temperature(),
@@ -393,6 +397,12 @@ impl ModelConfig {
                     }
                     consumed = 2;
                 }
+                ("--mmproj" | "-mm", Some(v)) => {
+                    if self.mmproj_path.is_none() {
+                        self.mmproj_path = Some(PathBuf::from(v));
+                    }
+                    consumed = 2;
+                }
                 // Speculative decoding policy flags. The draft *path*
                 // flags (`-md`, `-ngld`, `-devd`, `-cd`, `-ctkd`, `-ctvd`)
                 // are intentionally left alone — they reference a draft
@@ -466,6 +476,7 @@ mod tests {
             binary_preset: Some("llama-vulkan".into()),
             binary: PathBuf::from("/home/u/llama.cpp/build-vulkan/bin/llama-server"),
             model_path: PathBuf::from("/models/qwen3-30b.gguf"),
+            mmproj_path: Some(PathBuf::from("/models/mmproj.gguf")),
             extra_args: vec!["--override-kv".into(), "something=1".into()],
             context: 32768,
             flash_attn: true,
@@ -595,6 +606,7 @@ mod tests {
             "--repeat-penalty".into(), "1.0".into(),
             "--reasoning-budget".into(), "0".into(),
             "--chat-template-kwargs".into(), r#"{"enable_thinking":false}"#.into(),
+            "--mmproj".into(), "/models/mmproj.gguf".into(),
         ];
         assert!(m.migrate_extra_args());
         assert_eq!(m.threads, Some(16));
@@ -604,6 +616,7 @@ mod tests {
         assert_eq!(m.repeat_penalty, 1.0);
         assert_eq!(m.reasoning_budget, Some(0));
         assert_eq!(m.chat_template_kwargs.as_deref(), Some(r#"{"enable_thinking":false}"#));
+        assert_eq!(m.mmproj_path.as_deref(), Some(std::path::Path::new("/models/mmproj.gguf")));
         assert!(m.extra_args.is_empty());
     }
 
