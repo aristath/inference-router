@@ -11,6 +11,7 @@ use crate::vram::tracker::GpuInfo;
 #[derive(Debug, Clone)]
 pub struct GpuDisplay {
     pub id: String,
+    pub label: String,
     pub used_gib_str: String,
     pub total_gib_str: String,
     pub free_gib_str: String,
@@ -38,6 +39,14 @@ impl GpuDisplay {
         };
         Self {
             id: gpu.id.clone(),
+            label: gpu
+                .vulkan_device
+                .as_ref()
+                .map(|dev| match &gpu.pci_bus_id {
+                    Some(pci) => format!("{dev} / {pci}"),
+                    None => dev.clone(),
+                })
+                .unwrap_or_else(|| gpu.id.clone()),
             used_gib_str: format!("{:.1}", used_gib),
             total_gib_str: format!("{:.1}", total_gib),
             free_gib_str: format!("{:.1}", free_gib),

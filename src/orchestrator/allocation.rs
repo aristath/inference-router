@@ -1,5 +1,5 @@
-//! Pick the smallest subset of GPUs that fits a model + build the positional
-//! `--tensor-split` string llama.cpp expects.
+//! Pick the smallest subset of GPUs that fits a model + build the backend
+//! positional `--tensor-split` string llama.cpp expects.
 
 use crate::vram::tracker::GpuInfo;
 
@@ -12,9 +12,9 @@ const HEADROOM: f64 = 1.05;
 ///
 /// Strategy: sort GPUs by free VRAM descending, greedily add the most-free
 /// GPU until the cumulative free ≥ `needed_vram * 1.05`. Build the
-/// `--tensor-split` string in the GPUs' **original order** (that's how
-/// llama.cpp addresses devices), putting `0` for GPUs not in the chosen set
-/// and proportional shares for the chosen ones.
+/// `--tensor-split` string in llama.cpp's Vulkan device order when that
+/// mapping is known, putting `0` for GPUs not in the chosen set and
+/// proportional shares for the chosen ones.
 ///
 /// If only one GPU is chosen, returns a string with `1.0` in that slot and
 /// zeros elsewhere — callers may pair that with `--split-mode none` but it's
@@ -48,16 +48,18 @@ pub fn plan_tensor_split(gpus: &[GpuInfo], needed_vram: u64) -> Option<String> {
         return None;
     }
 
-    // Emit fractions in the ORIGINAL device order. llama.cpp's
-    // `--tensor-split` is positional: the i-th value applies to device i.
+    // Emit fractions in backend device order. llama.cpp's `--tensor-split`
+    // is positional: the i-th value applies to the i-th selected/offload
+    // device, not Linux DRM card i.
     let mut fracs = vec![0f32; gpus.len()];
     for (idx, free) in &chosen {
         fracs[*idx] = (*free as f64 / acc as f64) as f32;
     }
+    let slots = tensor_split_order(gpus);
     Some(
-        fracs
+        slots
             .iter()
-            .map(|f| format!("{:.3}", f))
+            .map(|idx| format!("{:.3}", fracs[*idx]))
             .collect::<Vec<_>>()
             .join(","),
     )
@@ -72,6 +74,14 @@ pub fn gpus_used(split: &str) -> usize {
         .count()
 }
 
+fn tensor_split_order(gpus: &[GpuInfo]) -> Vec<usize> {
+    let mut slots: Vec<usize> = (0..gpus.len()).collect();
+    if gpus.iter().all(|g| g.vulkan_index.is_some()) {
+        slots.sort_by_key(|idx| gpus[*idx].vulkan_index.unwrap_or(usize::MAX));
+    }
+    slots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +89,9 @@ mod tests {
     fn gpu(id: &str, free: u64) -> GpuInfo {
         GpuInfo {
             id: id.into(),
+            pci_bus_id: None,
+            vulkan_device: None,
+            vulkan_index: None,
             total_vram: free + 1_000_000_000,
             used_vram: 1_000_000_000,
             busy_pct: 0,
@@ -88,7 +101,11 @@ mod tests {
 
     #[test]
     fn single_gpu_fits_alone() {
-        let gpus = vec![gpu("0", 40_000_000_000), gpu("1", 40_000_000_000), gpu("2", 40_000_000_000)];
+        let gpus = vec![
+            gpu("0", 40_000_000_000),
+            gpu("1", 40_000_000_000),
+            gpu("2", 40_000_000_000),
+        ];
         // 10 GB model fits on first GPU alone (biggest-free wins ties by
         // insertion order via stable sort).
         let s = plan_tensor_split(&gpus, 10_000_000_000).unwrap();
@@ -157,5 +174,16 @@ mod tests {
         assert!((parts[1] - 0.6).abs() < 0.01, "{parts:?}");
         let sum: f32 = parts.iter().sum();
         assert!((sum - 1.0).abs() < 0.005, "sum={sum}");
+    }
+
+    #[test]
+    fn emits_split_in_vulkan_order_when_known() {
+        let mut sysfs_first = gpu("card1", 40_000_000_000);
+        sysfs_first.vulkan_index = Some(1);
+        let mut sysfs_second = gpu("card4", 60_000_000_000);
+        sysfs_second.vulkan_index = Some(0);
+
+        let s = plan_tensor_split(&[sysfs_first, sysfs_second], 80_000_000_000).unwrap();
+        assert_eq!(s, "0.600,0.400");
     }
 }

@@ -1,12 +1,23 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
+use std::sync::OnceLock;
 
 const MIN_USABLE_GPU_VRAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// One GPU's VRAM + activity + temperature state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GpuInfo {
+    /// DRM card number, kept as the stable UI/API id for backwards
+    /// compatibility with existing dashboard clients.
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pci_bus_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vulkan_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vulkan_index: Option<usize>,
     pub total_vram: u64,
     pub used_vram: u64,
     /// GPU compute utilization 0..=100, from
@@ -74,8 +85,16 @@ impl VRAMTracker {
             let temp_c = read_gpu_junction_temp(&device);
 
             let id = name.trim_start_matches("card").to_string();
+            let pci_bus_id = read_pci_bus_id(&device);
+            let vulkan_index = pci_bus_id
+                .as_deref()
+                .and_then(|pci| vulkan_devices_by_pci().get(pci).copied());
+            let vulkan_device = vulkan_index.map(|idx| format!("Vulkan{idx}"));
             gpus.push(GpuInfo {
                 id,
+                pci_bus_id,
+                vulkan_device,
+                vulkan_index,
                 total_vram: total,
                 used_vram: used,
                 busy_pct,
@@ -94,6 +113,95 @@ fn read_u64(path: &Path) -> Option<u64> {
         .trim()
         .parse::<u64>()
         .ok()
+}
+
+fn read_pci_bus_id(device: &Path) -> Option<String> {
+    let path = std::fs::canonicalize(device).ok()?;
+    path.components()
+        .rev()
+        .filter_map(|component| component.as_os_str().to_str())
+        .find(|s| is_pci_bus_id(s))
+        .map(str::to_string)
+}
+
+fn is_pci_bus_id(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 12
+        && bytes[4] == b':'
+        && bytes[7] == b':'
+        && bytes[10] == b'.'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(idx, b)| matches!(idx, 4 | 7 | 10) || b.is_ascii_hexdigit())
+}
+
+fn vulkan_devices_by_pci() -> &'static HashMap<String, usize> {
+    static CACHE: OnceLock<HashMap<String, usize>> = OnceLock::new();
+    CACHE.get_or_init(discover_vulkan_devices_by_pci)
+}
+
+fn discover_vulkan_devices_by_pci() -> HashMap<String, usize> {
+    let Ok(output) = Command::new("vulkaninfo").arg("--summary").output() else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+    parse_vulkaninfo_summary(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_vulkaninfo_summary(summary: &str) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    let mut current_index: Option<usize> = None;
+    let mut current_is_discrete_gpu = false;
+
+    for line in summary.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("GPU").and_then(|s| s.strip_suffix(':')) {
+            current_index = rest.parse::<usize>().ok();
+            current_is_discrete_gpu = false;
+            continue;
+        }
+
+        if let Some(value) = line
+            .strip_prefix("deviceType")
+            .and_then(|s| s.split('=').nth(1))
+        {
+            current_is_discrete_gpu = value.trim() == "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU";
+            continue;
+        }
+
+        if let Some(uuid) = line
+            .strip_prefix("deviceUUID")
+            .and_then(|s| s.split('=').nth(1))
+        {
+            let Some(index) = current_index else {
+                continue;
+            };
+            if !current_is_discrete_gpu {
+                continue;
+            }
+            if let Some(pci) = pci_from_radv_device_uuid(uuid.trim()) {
+                out.insert(pci, index);
+            }
+        }
+    }
+
+    out
+}
+
+fn pci_from_radv_device_uuid(uuid: &str) -> Option<String> {
+    let mut parts = uuid.split('-');
+    let _domain = parts.next()?;
+    let bus_device = parts.next()?;
+    if bus_device.len() != 4 || !bus_device.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(format!(
+        "0000:{}:{}.0",
+        &bus_device[0..2],
+        &bus_device[2..4]
+    ))
 }
 
 /// Reads the AMD junction temperature from `device/hwmon/hwmonN/temp2_input`
@@ -123,6 +231,9 @@ mod tests {
     fn free_vram_saturates() {
         let g = GpuInfo {
             id: "0".into(),
+            pci_bus_id: None,
+            vulkan_device: None,
+            vulkan_index: None,
             total_vram: 100,
             used_vram: 150,
             busy_pct: 0,
@@ -253,5 +364,27 @@ mod tests {
         let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].id, "1");
+    }
+
+    #[test]
+    fn parses_vulkaninfo_summary_device_uuid_to_pci_order() {
+        let summary = r#"
+GPU0:
+    deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    deviceName         = AMD Radeon AI PRO R9700 (RADV GFX1201)
+    deviceUUID         = 00000000-1b00-0000-0000-000000000000
+GPU1:
+    deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    deviceName         = AMD Radeon AI PRO R9700 (RADV GFX1201)
+    deviceUUID         = 00000000-0300-0000-0000-000000000000
+GPU2:
+    deviceType         = PHYSICAL_DEVICE_TYPE_CPU
+    deviceName         = llvmpipe
+    deviceUUID         = 6d657361-3236-2e30-2e35-000000000000
+"#;
+        let map = parse_vulkaninfo_summary(summary);
+        assert_eq!(map.get("0000:1b:00.0"), Some(&0));
+        assert_eq!(map.get("0000:03:00.0"), Some(&1));
+        assert!(!map.contains_key("0000:32:36.0"));
     }
 }

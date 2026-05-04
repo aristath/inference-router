@@ -227,8 +227,11 @@ pub struct ModelConfig {
     // drives the draft) lives here: `draft_max`, `draft_min`,
     // `draft_p_min`, `ctx_checkpoints`, `checkpoint_every_n_tokens`.
 
-    /// `-devd <dev1,dev2,…>` device list when this model is embedded as
-    /// a draft inside another model's spawn. Leave blank to let llama.cpp pick.
+    /// `--device <dev1,dev2,...>` for the target model, and
+    /// `-devd <dev1,dev2,...>` when this model is embedded as a draft inside
+    /// another model's spawn. Accepts llama.cpp device names (`Vulkan1`) or
+    /// PCI ids (`pci:0000:03:00.0`), which are resolved to backend names at
+    /// load time. Leave blank to let llama.cpp pick.
     #[serde(default)]
     pub device: Option<String>,
 

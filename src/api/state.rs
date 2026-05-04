@@ -26,6 +26,9 @@ struct SystemResponse {
 #[derive(Serialize)]
 struct GpuResponse {
     id: String,
+    pci_bus_id: Option<String>,
+    vulkan_device: Option<String>,
+    vulkan_index: Option<usize>,
     total_vram: u64,
     used_vram: u64,
     busy_pct: u8,
@@ -73,6 +76,9 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
             .into_iter()
             .map(|g| GpuResponse {
                 id: g.id,
+                pci_bus_id: g.pci_bus_id,
+                vulkan_device: g.vulkan_device,
+                vulkan_index: g.vulkan_index,
                 total_vram: g.total_vram,
                 used_vram: g.used_vram,
                 busy_pct: g.busy_pct,

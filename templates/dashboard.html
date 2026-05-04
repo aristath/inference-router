@@ -41,7 +41,7 @@
         {% for gpu in gpus %}
         <div class="card" id="gpu-card-{{ gpu.id }}">
             <div style="display: flex; justify-content: space-between; align-items: baseline;">
-                <h2 style="margin: 0;">GPU {{ gpu.id }}</h2>
+                <h2 style="margin: 0;">GPU {{ gpu.id }} <small style="color: #94a3b8;">{{ gpu.label }}</small></h2>
                 <span class="chip-temp {{ gpu.temp_class }}" id="gpu-temp-chip-{{ gpu.id }}"
                       title="GPU junction temperature">
                     <span class="gpu-temp">{{ gpu.temp_c_str }}</span>°C

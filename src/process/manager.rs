@@ -433,6 +433,10 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
                 args.push("--tensor-split".into());
                 args.push(ts.clone());
             }
+            if let Some(ref dev) = model.device {
+                args.push("--device".into());
+                args.push(dev.clone());
+            }
             if let Some(t) = model.threads {
                 args.push("--threads".into());
                 args.push(t.to_string());
@@ -785,6 +789,7 @@ mod tests {
         assert!(!joined.contains("--split-mode"));
         assert!(!joined.contains("--main-gpu"));
         assert!(!joined.contains("--tensor-split"));
+        assert!(!joined.contains("--device"));
     }
 
     #[test]
@@ -846,6 +851,14 @@ mod tests {
         assert!(j.contains("--split-mode row"), "{j}");
         assert!(j.contains("--main-gpu 2"), "{j}");
         assert!(j.contains("--tensor-split 0.5,0.5,0"), "{j}");
+    }
+
+    #[test]
+    fn gguf_argv_emits_target_device_when_set() {
+        let mut m = gguf_model();
+        m.device = Some("Vulkan1,Vulkan2".into());
+        let args = build_command_args(&m, None, 9001);
+        assert_eq!(find_flag(&args, "--device"), Some("Vulkan1,Vulkan2"));
     }
 
     #[test]

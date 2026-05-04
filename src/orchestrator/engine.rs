@@ -531,7 +531,7 @@ impl Orchestrator {
             }
 
             // Snapshot the model + resolve preset → binary path + draft.
-            let (mut model, draft) = {
+            let (mut model, mut draft) = {
                 let data = self.data.lock().await;
                 let mut m = data
                     .models
@@ -563,6 +563,10 @@ impl Orchestrator {
                     };
                 (m, draft)
             };
+            normalize_model_device_for_llama(&mut model, &gpus);
+            if let Some(ref mut d) = draft {
+                normalize_model_device_for_llama(d, &gpus);
+            }
 
             if model.weights_format == WeightsFormat::Gguf {
                 // Honour the model's configured cache_type_{k,v} so the
@@ -622,7 +626,10 @@ impl Orchestrator {
             // their processes exist but haven't yet faulted weights into VRAM,
             // so sysfs still reports the full free figure.
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-            let adjusted_gpus = subtract_reserved_from_gpus(gpus.clone(), already_reserved);
+            let adjusted_gpus = model_visible_gpus(
+                &model,
+                subtract_reserved_from_gpus(gpus.clone(), already_reserved),
+            );
             let mut free: u64 = adjusted_gpus.iter().map(|g| g.free_vram()).sum();
             if model.estimated_vram > free {
                 let snapshot = self.data.lock().await.models.clone();
@@ -639,8 +646,10 @@ impl Orchestrator {
                 }
                 // Re-read VRAM after eviction so the allocator sees the freed space.
                 let gpus_after = self.vram_tracker.refresh();
-                let adjusted_after =
-                    subtract_reserved_from_gpus(gpus_after.clone(), already_reserved);
+                let adjusted_after = model_visible_gpus(
+                    &model,
+                    subtract_reserved_from_gpus(gpus_after.clone(), already_reserved),
+                );
                 free = adjusted_after.iter().map(|g| g.free_vram()).sum();
                 self.data.lock().await.gpus = gpus_after;
             }
@@ -652,12 +661,16 @@ impl Orchestrator {
                 });
             }
 
-            // Auto-allocate across the smallest viable GPU subset, unless the
-            // user pinned an explicit tensor_split.
-            if model.weights_format == WeightsFormat::Gguf && model.tensor_split.is_none() {
+            // Auto-allocate across the smallest viable GPU subset. If the
+            // configured split length no longer matches the selected backend
+            // devices, replan instead of passing a stale positional split.
+            if model.weights_format == WeightsFormat::Gguf {
                 let snapshot = self.data.lock().await.gpus.clone();
-                let adjusted = subtract_reserved_from_gpus(snapshot, already_reserved);
-                if adjusted.len() > 1 && model.estimated_vram > 0 {
+                let adjusted = model_visible_gpus(
+                    &model,
+                    subtract_reserved_from_gpus(snapshot, already_reserved),
+                );
+                if should_plan_tensor_split(&model, adjusted.len()) && model.estimated_vram > 0 {
                     if let Some(split) = plan_tensor_split(&adjusted, model.estimated_vram) {
                         info!(
                             model = id,
@@ -666,6 +679,13 @@ impl Orchestrator {
                             "auto-allocated across minimum GPU subset"
                         );
                         model.tensor_split = Some(split);
+                    } else if model.tensor_split.is_some() {
+                        model.tensor_split = None;
+                        return Err(LoadError::InsufficientVram {
+                            model: id.into(),
+                            needed: model.estimated_vram,
+                            free,
+                        });
                     }
                 }
             }
@@ -770,7 +790,7 @@ impl Orchestrator {
                 self.data.lock().await.gpus = gpus.clone();
             }
 
-            let (mut model, draft) = {
+            let (mut model, mut draft) = {
                 let data = self.data.lock().await;
                 let m = match data.models.get(id) {
                     Some(m) => m.clone(),
@@ -796,21 +816,30 @@ impl Orchestrator {
                     .and_then(|did| data.models.get(did).cloned());
                 (model, draft)
             };
+            normalize_model_device_for_llama(&mut model, &gpus);
+            if let Some(ref mut d) = draft {
+                normalize_model_device_for_llama(d, &gpus);
+            }
 
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-            let adjusted_gpus = subtract_reserved_from_gpus(gpus.clone(), already_reserved);
+            let adjusted_gpus = model_visible_gpus(
+                &model,
+                subtract_reserved_from_gpus(gpus.clone(), already_reserved),
+            );
             let free: u64 = adjusted_gpus.iter().map(|g| g.free_vram()).sum();
             if model.estimated_vram == 0 || free < model.estimated_vram {
                 return;
             }
 
             if model.weights_format == WeightsFormat::Gguf
-                && model.tensor_split.is_none()
-                && adjusted_gpus.len() > 1
+                && should_plan_tensor_split(&model, adjusted_gpus.len())
                 && model.estimated_vram > 0
             {
                 if let Some(split) = plan_tensor_split(&adjusted_gpus, model.estimated_vram) {
                     model.tensor_split = Some(split);
+                } else if model.tensor_split.is_some() {
+                    model.tensor_split = None;
+                    return;
                 }
             }
 
@@ -1124,6 +1153,151 @@ fn subtract_reserved_from_gpus(mut gpus: Vec<GpuInfo>, mut reserved: u64) -> Vec
     gpus
 }
 
+fn should_plan_tensor_split(model: &ModelConfig, device_count: usize) -> bool {
+    device_count > 0
+        && model
+            .tensor_split
+            .as_deref()
+            .map(|split| split.split(',').count() != device_count)
+            .unwrap_or(true)
+}
+
+fn model_visible_gpus(model: &ModelConfig, gpus: Vec<GpuInfo>) -> Vec<GpuInfo> {
+    let Some(devices) = configured_llama_devices(model) else {
+        return gpus;
+    };
+    if devices.is_empty() {
+        return Vec::new();
+    }
+    devices
+        .iter()
+        .filter_map(|device| {
+            gpus.iter()
+                .find(|gpu| gpu_matches_device(gpu, device))
+                .cloned()
+        })
+        .collect()
+}
+
+fn configured_llama_devices(model: &ModelConfig) -> Option<Vec<String>> {
+    configured_llama_device_value(model).map(|device| split_device_list(&device))
+}
+
+fn configured_llama_device_value(model: &ModelConfig) -> Option<String> {
+    let mut configured = model.device.clone();
+    let args = &model.extra_args;
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "--device" || arg == "-dev" {
+            configured = args.get(idx + 1).cloned();
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--device=") {
+            configured = Some(value.into());
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-dev=") {
+            configured = Some(value.into());
+        }
+    }
+    configured
+}
+
+fn split_device_list(device: &str) -> Vec<String> {
+    if device.trim().eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    device
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn normalize_model_device_for_llama(model: &mut ModelConfig, gpus: &[GpuInfo]) {
+    let Some(device) = configured_llama_device_value(model) else {
+        strip_target_device_args(&mut model.extra_args);
+        return;
+    };
+    strip_target_device_args(&mut model.extra_args);
+    if device.trim().eq_ignore_ascii_case("none") {
+        model.device = Some("none".into());
+        return;
+    }
+    let mut mapped = split_device_list(&device)
+        .into_iter()
+        .map(|device| resolve_llama_device(&device, gpus).unwrap_or(device))
+        .enumerate()
+        .collect::<Vec<_>>();
+    mapped.sort_by_key(|(idx, device)| {
+        (
+            device_vulkan_index(device, gpus).unwrap_or(usize::MAX),
+            *idx,
+        )
+    });
+    if !mapped.is_empty() {
+        let mut devices = mapped
+            .into_iter()
+            .map(|(_, device)| device)
+            .collect::<Vec<_>>();
+        devices.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        model.device = Some(devices.join(","));
+    } else {
+        model.device = None;
+    }
+}
+
+fn resolve_llama_device(device: &str, gpus: &[GpuInfo]) -> Option<String> {
+    let pci = device.strip_prefix("pci:").unwrap_or(device);
+    gpus.iter().find_map(|gpu| {
+        if gpu_matches_device(gpu, pci) {
+            gpu.vulkan_device.clone()
+        } else {
+            None
+        }
+    })
+}
+
+fn device_vulkan_index(device: &str, gpus: &[GpuInfo]) -> Option<usize> {
+    gpus.iter()
+        .find(|gpu| gpu_matches_device(gpu, device))
+        .and_then(|gpu| gpu.vulkan_index)
+}
+
+fn gpu_matches_device(gpu: &GpuInfo, device: &str) -> bool {
+    gpu.vulkan_device
+        .as_deref()
+        .map(|name| name.eq_ignore_ascii_case(device))
+        .unwrap_or(false)
+        || gpu
+            .pci_bus_id
+            .as_deref()
+            .map(|pci| {
+                pci.eq_ignore_ascii_case(device)
+                    || format!("pci:{pci}").eq_ignore_ascii_case(device)
+            })
+            .unwrap_or(false)
+}
+
+fn strip_target_device_args(args: &mut Vec<String>) {
+    let mut out = Vec::with_capacity(args.len());
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == "--device" || arg == "-dev" {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with("--device=") || arg.starts_with("-dev=") {
+            idx += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        idx += 1;
+    }
+    *args = out;
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.parse::<usize>().ok()
 }
@@ -1160,6 +1334,85 @@ mod tests {
             model_path: PathBuf::from("/tmp/m.gguf"),
             ..ModelConfig::default()
         }
+    }
+
+    fn gpu(id: &str, pci: &str, vulkan_index: usize) -> GpuInfo {
+        GpuInfo {
+            id: id.into(),
+            pci_bus_id: Some(pci.into()),
+            vulkan_device: Some(format!("Vulkan{vulkan_index}")),
+            vulkan_index: Some(vulkan_index),
+            total_vram: 32 * 1024 * 1024 * 1024,
+            used_vram: 0,
+            busy_pct: 0,
+            temp_c: None,
+        }
+    }
+
+    #[test]
+    fn model_visible_gpus_filters_by_vulkan_or_pci_device() {
+        let gpus = vec![gpu("1", "0000:03:00.0", 1), gpu("4", "0000:1b:00.0", 0)];
+        let mut m = model("a");
+        m.device = Some("pci:0000:1b:00.0".into());
+        normalize_model_device_for_llama(&mut m, &gpus);
+        assert_eq!(m.device.as_deref(), Some("Vulkan0"));
+
+        let selected = model_visible_gpus(&m, gpus);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].pci_bus_id.as_deref(), Some("0000:1b:00.0"));
+    }
+
+    #[test]
+    fn extra_args_device_wins_and_is_normalized_into_structured_device() {
+        let gpus = vec![gpu("1", "0000:03:00.0", 1), gpu("4", "0000:1b:00.0", 0)];
+        let mut m = model("a");
+        m.device = Some("Vulkan1".into());
+        m.extra_args = vec![
+            "--device".into(),
+            "pci:0000:1b:00.0".into(),
+            "--threads".into(),
+            "16".into(),
+        ];
+
+        normalize_model_device_for_llama(&mut m, &gpus);
+
+        assert_eq!(m.device.as_deref(), Some("Vulkan0"));
+        assert_eq!(m.extra_args, vec!["--threads", "16"]);
+        let selected = model_visible_gpus(&m, gpus);
+        assert_eq!(selected[0].vulkan_device.as_deref(), Some("Vulkan0"));
+    }
+
+    #[test]
+    fn device_list_is_canonicalized_to_vulkan_order() {
+        let gpus = vec![
+            gpu("1", "0000:03:00.0", 1),
+            gpu("3", "0000:0a:00.0", 3),
+            gpu("4", "0000:1b:00.0", 0),
+        ];
+        let mut m = model("a");
+        m.device = Some("Vulkan3,pci:0000:1b:00.0,Vulkan1".into());
+
+        normalize_model_device_for_llama(&mut m, &gpus);
+
+        assert_eq!(m.device.as_deref(), Some("Vulkan0,Vulkan1,Vulkan3"));
+        let selected = model_visible_gpus(&m, gpus);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|g| g.vulkan_device.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Vulkan0", "Vulkan1", "Vulkan3"]
+        );
+    }
+
+    #[test]
+    fn should_replan_stale_tensor_split_lengths() {
+        let mut m = model("a");
+        assert!(should_plan_tensor_split(&m, 4));
+        m.tensor_split = Some("0.5,0,0.5".into());
+        assert!(should_plan_tensor_split(&m, 4));
+        m.tensor_split = Some("0.25,0.25,0.25,0.25".into());
+        assert!(!should_plan_tensor_split(&m, 4));
     }
 
     #[tokio::test]
@@ -1511,6 +1764,9 @@ mod tests {
             let mut data = o.data.lock().await;
             data.gpus = vec![GpuInfo {
                 id: "card0".into(),
+                pci_bus_id: None,
+                vulkan_device: None,
+                vulkan_index: None,
                 total_vram: 10 * 1024 * 1024 * 1024,
                 used_vram: 0,
                 busy_pct: 0,
