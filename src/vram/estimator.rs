@@ -91,12 +91,16 @@ pub struct GgufInfo {
     /// Their effective context is capped at `sliding_window` tokens.
     /// Zero for models without SWA.
     pub swa_kv_heads: u64,
-    /// Sum of `n_head_kv` across ALL layers — purely for display.
-    /// `full_kv_heads + swa_kv_heads`. Kept as a separate field so the
-    /// JS form can show it without recomputing.
+    /// Sum of `n_head_kv` across layers that allocate KV — purely for
+    /// display. `full_kv_heads + swa_kv_heads`. Kept as a separate field so
+    /// the JS form can show it without recomputing.
     pub kv_heads_total: u64,
     /// Sliding-window size in tokens. 0 when the model doesn't use SWA.
     pub sliding_window: u32,
+    /// For recurrent/hybrid models that only allocate full KV on every Nth
+    /// layer, this is `<arch>.full_attention_interval`.
+    #[serde(default)]
+    pub full_attention_interval: Option<u32>,
     /// Total bytes across all on-disk shards of this model. Equals the
     /// file size for a single-file GGUF, but sums all sibling shards for
     /// multi-file GGUFs named like `foo.gguf-00001-of-00005.gguf`.
@@ -122,6 +126,8 @@ impl GgufInfo {
         let max_context = map.llm_context_length().map_err(meta_err)? as u32;
         let n_layers = map.llm_block_count().map_err(meta_err)? as u32;
         let n_embd = map.llm_embedding_length().map_err(meta_err)? as u32;
+        let arch = map.general_architecture().ok().map(|s| s.to_string());
+        let arch_ref = arch.as_deref().unwrap_or("");
 
         // Head counts may be scalars OR per-layer integer arrays of any
         // int element type (Step-3.5 uses i32, not u32). We parse both
@@ -137,6 +143,8 @@ impl GgufInfo {
         let key_length = read_optional_u32(&map, &attention_key(&map, "key_length")?)?;
         let key_length_swa = read_optional_u32(&map, &attention_key(&map, "key_length_swa")?)?;
         let sliding_window = read_optional_u32(&map, &attention_key(&map, "sliding_window")?)?;
+        let full_attention_interval =
+            map.get_usize(&format!("{arch_ref}.full_attention_interval")).ok().map(|v| v as u32);
 
         // Which layers use sliding-window attention vs full? Gemma-3/4
         // publish `<arch>.attention.sliding_window_pattern` as a bool
@@ -151,6 +159,7 @@ impl GgufInfo {
             &swa_pattern,
             sliding_window,
             n_layers,
+            full_attention_interval,
         );
         let kv_heads_total = full_kv_heads + swa_kv_heads;
         let n_head_kv_max = kv_heads_per_layer.iter().copied().max().unwrap_or(0) as u32;
@@ -167,6 +176,7 @@ impl GgufInfo {
             swa_kv_heads,
             kv_heads_total,
             sliding_window,
+            full_attention_interval,
             file_size,
         })
     }
@@ -226,6 +236,14 @@ impl GgufInfo {
 
 impl From<&GgufMeta> for GgufInfo {
     fn from(m: &GgufMeta) -> Self {
+        let (full_kv_heads, swa_kv_heads) = normalize_cached_kv_heads(
+            m.full_kv_heads,
+            m.swa_kv_heads,
+            m.sliding_window,
+            m.n_layers,
+            m.n_head_kv,
+            m.full_attention_interval,
+        );
         Self {
             max_context: m.max_context,
             n_layers: m.n_layers,
@@ -234,13 +252,32 @@ impl From<&GgufMeta> for GgufInfo {
             n_head_kv: m.n_head_kv,
             key_length: m.key_length,
             key_length_swa: m.key_length_swa,
-            full_kv_heads: m.full_kv_heads,
-            swa_kv_heads: m.swa_kv_heads,
-            kv_heads_total: m.kv_heads_total,
+            full_kv_heads,
+            swa_kv_heads,
+            kv_heads_total: full_kv_heads + swa_kv_heads,
             sliding_window: m.sliding_window,
+            full_attention_interval: m.full_attention_interval,
             file_size: m.file_size,
         }
     }
+}
+
+fn normalize_cached_kv_heads(
+    full_kv_heads: u64,
+    swa_kv_heads: u64,
+    sliding_window: u32,
+    n_layers: u32,
+    n_head_kv: u32,
+    full_attention_interval: Option<u32>,
+) -> (u64, u64) {
+    if sliding_window == 0 {
+        if let Some(interval) = full_attention_interval.filter(|&v| v > 1) {
+            if n_layers > 0 && n_head_kv > 0 {
+                return ((n_layers / interval) as u64 * n_head_kv as u64, 0);
+            }
+        }
+    }
+    (full_kv_heads, swa_kv_heads)
 }
 
 /// Maps `general.file_type` integer to its canonical quant label string.
@@ -297,6 +334,7 @@ pub struct GgufMeta {
     pub expert_used_count: Option<u32>,
     pub rope_freq_base: Option<f32>,
     pub ssm_inner_size: Option<u32>,
+    #[serde(default)]
     pub full_attention_interval: Option<u32>,
     // Tokenizer
     pub chat_template: Option<String>,
@@ -321,6 +359,8 @@ impl GgufMeta {
         let max_context = map.llm_context_length().map_err(meta_err)? as u32;
         let n_layers = map.llm_block_count().map_err(meta_err)? as u32;
         let n_embd = map.llm_embedding_length().map_err(meta_err)? as u32;
+        let arch = map.general_architecture().ok().map(|s| s.to_string());
+        let arch_ref = arch.as_deref().unwrap_or("");
 
         let head_stats = read_int_field(&map, &attention_key(&map, "head_count")?)?;
         let kv_heads_per_layer =
@@ -329,18 +369,22 @@ impl GgufMeta {
         let key_length = read_optional_u32(&map, &attention_key(&map, "key_length")?)?;
         let key_length_swa = read_optional_u32(&map, &attention_key(&map, "key_length_swa")?)?;
         let sliding_window = read_optional_u32(&map, &attention_key(&map, "sliding_window")?)?;
+        let full_attention_interval =
+            map.get_usize(&format!("{arch_ref}.full_attention_interval")).ok().map(|v| v as u32);
 
         let swa_pattern =
             read_bool_array_field(&map, &attention_key(&map, "sliding_window_pattern")?)?;
 
         let (full_kv_heads, swa_kv_heads) =
-            split_kv_heads(&kv_heads_per_layer, &swa_pattern, sliding_window, n_layers);
+            split_kv_heads(
+                &kv_heads_per_layer,
+                &swa_pattern,
+                sliding_window,
+                n_layers,
+                full_attention_interval,
+            );
         let kv_heads_total = full_kv_heads + swa_kv_heads;
         let n_head_kv_max = kv_heads_per_layer.iter().copied().max().unwrap_or(0) as u32;
-
-        // --- Architecture string (needed for all <arch>. keys) ---
-        let arch = map.general_architecture().ok().map(|s| s.to_string());
-        let arch_ref = arch.as_deref().unwrap_or("");
 
         // --- Identity ---
         let name = meta_read_str(&map, "general.name");
@@ -368,8 +412,6 @@ impl GgufMeta {
         let rope_freq_base = meta_read_f32(&map, &format!("{arch_ref}.rope.freq_base"));
         let ssm_inner_size =
             map.get_usize(&format!("{arch_ref}.ssm.inner_size")).ok().map(|v| v as u32);
-        let full_attention_interval =
-            map.get_usize(&format!("{arch_ref}.full_attention_interval")).ok().map(|v| v as u32);
 
         // --- Tokenizer ---
         let chat_template = meta_read_str(&map, "tokenizer.chat_template");
@@ -554,7 +596,9 @@ fn read_bool_array_field(map: &MetaMap, key: &str) -> Result<Vec<bool>, Estimate
 /// sliding-window sum) using the layer pattern from the GGUF.
 ///
 /// - If the model publishes no `sliding_window` size, every layer is
-///   full-context (swa sum is 0).
+///   full-context (swa sum is 0), unless the architecture publishes
+///   `full_attention_interval`, in which case only those interval layers
+///   allocate full KV.
 /// - If the model has SWA but publishes no per-layer pattern,
 ///   conservatively treat every layer as full-context — safer to
 ///   overestimate than under-estimate VRAM.
@@ -568,9 +612,21 @@ fn split_kv_heads(
     swa_pattern: &[bool],
     sliding_window: u32,
     n_layers: u32,
+    full_attention_interval: Option<u32>,
 ) -> (u64, u64) {
     let total: u64 = kv_per_layer.iter().map(|&v| v as u64).sum();
     if sliding_window == 0 {
+        if let Some(interval) = full_attention_interval.filter(|&v| v > 1) {
+            if kv_per_layer.len() == n_layers as usize {
+                let full = kv_per_layer
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| ((idx + 1) as u32).is_multiple_of(interval))
+                    .map(|(_, &heads)| heads as u64)
+                    .sum();
+                return (full, 0);
+            }
+        }
         return (total, 0);
     }
     if swa_pattern.len() != n_layers as usize || kv_per_layer.len() != n_layers as usize {
@@ -755,6 +811,7 @@ mod tests {
             swa_kv_heads: 0,
             kv_heads_total: n_layers as u64 * n_head_kv as u64,
             sliding_window: 0,
+            full_attention_interval: None,
             file_size,
         }
     }
@@ -833,7 +890,7 @@ mod tests {
             max_context: 0, n_layers: 0, n_embd, n_head, n_head_kv,
             key_length, key_length_swa: 0,
             full_kv_heads: 0, swa_kv_heads: 0, kv_heads_total: 0,
-            sliding_window: 0, file_size: 0,
+            sliding_window: 0, full_attention_interval: None, file_size: 0,
         }
     }
 
@@ -885,6 +942,7 @@ mod tests {
             swa_kv_heads: 800,    // 50 layers × 16 heads
             kv_heads_total: 840,
             sliding_window: 1024,
+            full_attention_interval: None,
             file_size: 0,
         }
     }
@@ -938,12 +996,43 @@ mod tests {
         assert_eq!(kv, ref_bytes);
     }
 
+    #[test]
+    fn qwen35_like_recurrent_model_only_charges_full_attention_layers() {
+        // Qwen3.5/Qwen3.6 publish full_attention_interval = 4: every
+        // 4th layer allocates full KV; the recurrent layers do not.
+        let info = GgufInfo {
+            max_context: 262_144,
+            n_layers: 64,
+            n_embd: 5120,
+            n_head: 40,
+            n_head_kv: 4,
+            key_length: 256,
+            key_length_swa: 0,
+            full_kv_heads: 64, // 16 full-attention layers * 4 KV heads
+            swa_kv_heads: 0,
+            kv_heads_total: 64,
+            sliding_window: 0,
+            full_attention_interval: Some(4),
+            file_size: 0,
+        };
+
+        let kv = info.kv_cache_bytes(262_144, KvPerElement::FP16_BOTH);
+        assert_eq!(kv, 16 * 1024 * 1024 * 1024);
+    }
+
     // ---- split_kv_heads ----
 
     #[test]
     fn split_kv_heads_no_sliding_window_folds_all_into_full() {
-        let (full, swa) = split_kv_heads(&[16, 16, 16], &[true, true, false], 0, 3);
+        let (full, swa) = split_kv_heads(&[16, 16, 16], &[true, true, false], 0, 3, None);
         assert_eq!(full, 48);
+        assert_eq!(swa, 0);
+    }
+
+    #[test]
+    fn split_kv_heads_uses_full_attention_interval_for_recurrent_models() {
+        let (full, swa) = split_kv_heads(&[4, 4, 4, 4, 4, 4, 4, 4], &[], 0, 8, Some(4));
+        assert_eq!(full, 8);
         assert_eq!(swa, 0);
     }
 
@@ -953,7 +1042,7 @@ mod tests {
         // many SWA ones, each with different KV-head counts.
         let kv = vec![4, 16, 16, 16, 16, 16]; // 1 global + 5 SWA
         let pat = vec![false, true, true, true, true, true];
-        let (full, swa) = split_kv_heads(&kv, &pat, 1024, 6);
+        let (full, swa) = split_kv_heads(&kv, &pat, 1024, 6, None);
         assert_eq!(full, 4);
         assert_eq!(swa, 16 * 5);
     }
@@ -962,7 +1051,7 @@ mod tests {
     fn split_kv_heads_falls_back_to_all_full_on_mismatched_lengths() {
         // n_layers = 4 but we only got 3 entries — conservatively
         // treat the whole model as full-context.
-        let (full, swa) = split_kv_heads(&[8, 8, 8], &[true, false, true], 1024, 4);
+        let (full, swa) = split_kv_heads(&[8, 8, 8], &[true, false, true], 1024, 4, None);
         assert_eq!(full, 24);
         assert_eq!(swa, 0);
     }
