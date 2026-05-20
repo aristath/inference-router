@@ -644,6 +644,89 @@
             </div>
 
             <div class="card" style="margin-bottom: 1rem;">
+                <div style="display:flex; justify-content:space-between; align-items:baseline; gap:1rem;">
+                    <h2 style="margin:0;">Loop guards</h2>
+                    <span id="loop-guard-settings-state" class="model-muted"></span>
+                </div>
+                <form id="loop-guard-settings-form" style="margin-top:1rem;">
+                    <div class="settings-grid">
+                        <section class="settings-panel">
+                            <div class="settings-panel-head">
+                                <h3>Streaming output</h3>
+                                <label class="toggle-line">
+                                    <input type="checkbox" id="lg-streaming-enabled">
+                                    Enabled
+                                </label>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="lg-streaming-action">Action</label>
+                                    <select id="lg-streaming-action">
+                                        <option value="heal">heal</option>
+                                        <option value="abort">abort</option>
+                                        <option value="log">log only</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="lg-streaming-max-retries">Max retries</label>
+                                    <input type="number" id="lg-streaming-max-retries" min="0" step="1">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="lg-streaming-repeats">Repeats</label>
+                                    <input type="number" id="lg-streaming-repeats" min="2" step="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="lg-streaming-window">Window bytes</label>
+                                    <input type="number" id="lg-streaming-window" min="64" step="1024">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="lg-streaming-check-ms">Check interval (ms)</label>
+                                    <input type="number" id="lg-streaming-check-ms" min="1" step="50">
+                                </div>
+                                <div class="form-group">
+                                    <label class="toggle-line loop-toggle-pad">
+                                        <input type="checkbox" id="lg-streaming-replay-partial">
+                                        Replay safe partial
+                                    </label>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="settings-panel">
+                            <div class="settings-panel-head">
+                                <h3>Cross-turn tools</h3>
+                                <label class="toggle-line">
+                                    <input type="checkbox" id="lg-tool-enabled">
+                                    Enabled
+                                </label>
+                            </div>
+                            <div class="form-row single-break">
+                                <div class="form-group">
+                                    <label for="lg-tool-repeats">Repeats</label>
+                                    <input type="number" id="lg-tool-repeats" min="2" step="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="lg-tool-window-messages">Window messages</label>
+                                    <input type="number" id="lg-tool-window-messages" min="2" step="1">
+                                </div>
+                            </div>
+                            <small class="field-help">
+                                Applies to the autonomous tail of <code>/chat/completions</code> history, after the last real user/system/developer message.
+                            </small>
+                        </section>
+                    </div>
+                    <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap; padding-top:0.75rem; border-top:1px solid #334155;">
+                        <button type="submit" class="btn btn-primary btn-sm">Save loop guards</button>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="refreshLoopGuardSettings()">Revert</button>
+                    </div>
+                </form>
+            </div>
+
+            <div class="card" style="margin-bottom: 1rem;">
                 <h2>Server</h2>
                 <div class="form-group">
                     <label>Server port</label>
@@ -705,6 +788,17 @@
 .event-level-info { color:#38bdf8; }
 .event-level-warn { color:#fde047; }
 .event-level-error { color:#fca5a5; }
+.settings-grid { display:grid; grid-template-columns:1.35fr 1fr; gap:1rem; }
+.settings-panel { background:#0f172a; border:1px solid #334155; border-radius:8px; padding:1rem; }
+.settings-panel-head { display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:0.85rem; }
+.settings-panel h3 { margin:0; color:#e2e8f0; font-size:1rem; }
+.toggle-line { display:flex; align-items:center; gap:0.45rem; color:#cbd5e1; font-weight:500; white-space:nowrap; }
+.loop-toggle-pad { min-height:2.35rem; align-items:center; }
+@media (max-width: 760px) {
+    .settings-grid { grid-template-columns:1fr; }
+    .settings-panel .form-row,
+    .settings-panel .form-row.single-break { grid-template-columns:1fr; }
+}
 </style>
 
 <script>
@@ -1631,6 +1725,138 @@ function syncPollIntervalField() {
     number.addEventListener('change', () => commit(number.value));
     number.addEventListener('blur', () => commit(number.value));
     syncPollIntervalField();
+})();
+
+// ----- Server loop-guard settings -----
+
+const LOOP_GUARD_DEFAULTS = {
+    loop_guards: {
+        streaming: {
+            enabled: true,
+            window_bytes: 65536,
+            repeats: 10,
+            check_interval_ms: 5000,
+            max_retries: 3,
+            action: 'heal',
+            replay_partial: true,
+        },
+        tool: {
+            enabled: true,
+            repeats: 3,
+            window_messages: 80,
+        },
+    },
+};
+let _currentAppSettings = null;
+
+function loopGuardEl(id) {
+    return document.getElementById(id);
+}
+
+function loopGuardInt(id, fallback, min) {
+    const el = loopGuardEl(id);
+    const n = parseInt(el ? el.value : '', 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, n);
+}
+
+function setLoopGuardSettingsState(text, kind) {
+    const el = loopGuardEl('loop-guard-settings-state');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = kind === 'error' ? '#fca5a5' : (kind === 'ok' ? '#86efac' : '#94a3b8');
+}
+
+function normalizeLoopGuardSettings(settings) {
+    const base = JSON.parse(JSON.stringify(LOOP_GUARD_DEFAULTS));
+    const incoming = settings || {};
+    const guards = incoming.loop_guards || {};
+    base.loop_guards.streaming = Object.assign(base.loop_guards.streaming, guards.streaming || {});
+    base.loop_guards.tool = Object.assign(base.loop_guards.tool, guards.tool || {});
+    return Object.assign({}, incoming, base);
+}
+
+function populateLoopGuardSettings(settings) {
+    const s = normalizeLoopGuardSettings(settings);
+    const streaming = s.loop_guards.streaming;
+    const tool = s.loop_guards.tool;
+    loopGuardEl('lg-streaming-enabled').checked = !!streaming.enabled;
+    loopGuardEl('lg-streaming-action').value = streaming.action || 'heal';
+    loopGuardEl('lg-streaming-max-retries').value = streaming.max_retries;
+    loopGuardEl('lg-streaming-repeats').value = streaming.repeats;
+    loopGuardEl('lg-streaming-window').value = streaming.window_bytes;
+    loopGuardEl('lg-streaming-check-ms').value = streaming.check_interval_ms;
+    loopGuardEl('lg-streaming-replay-partial').checked = !!streaming.replay_partial;
+    loopGuardEl('lg-tool-enabled').checked = !!tool.enabled;
+    loopGuardEl('lg-tool-repeats').value = tool.repeats;
+    loopGuardEl('lg-tool-window-messages').value = tool.window_messages;
+}
+
+async function refreshLoopGuardSettings() {
+    const form = loopGuardEl('loop-guard-settings-form');
+    if (!form) return;
+    setLoopGuardSettingsState('Loading…');
+    try {
+        const r = await fetch('/api/settings');
+        if (!r.ok) throw new Error(r.statusText);
+        _currentAppSettings = normalizeLoopGuardSettings(await r.json());
+        populateLoopGuardSettings(_currentAppSettings);
+        setLoopGuardSettingsState('');
+    } catch (e) {
+        _currentAppSettings = normalizeLoopGuardSettings(null);
+        populateLoopGuardSettings(_currentAppSettings);
+        setLoopGuardSettingsState(`Load failed: ${e}`, 'error');
+    }
+}
+
+function readLoopGuardSettings() {
+    const base = normalizeLoopGuardSettings(_currentAppSettings);
+    base.loop_guards.streaming = {
+        enabled: loopGuardEl('lg-streaming-enabled').checked,
+        window_bytes: loopGuardInt('lg-streaming-window', 65536, 64),
+        repeats: loopGuardInt('lg-streaming-repeats', 10, 2),
+        check_interval_ms: loopGuardInt('lg-streaming-check-ms', 5000, 1),
+        max_retries: loopGuardInt('lg-streaming-max-retries', 3, 0),
+        action: loopGuardEl('lg-streaming-action').value || 'heal',
+        replay_partial: loopGuardEl('lg-streaming-replay-partial').checked,
+    };
+    base.loop_guards.tool = {
+        enabled: loopGuardEl('lg-tool-enabled').checked,
+        repeats: loopGuardInt('lg-tool-repeats', 3, 2),
+        window_messages: loopGuardInt('lg-tool-window-messages', 80, 2),
+    };
+    return base;
+}
+
+(function bindLoopGuardSettingsForm() {
+    const form = loopGuardEl('loop-guard-settings-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const body = readLoopGuardSettings();
+        setLoopGuardSettingsState('Saving…');
+        try {
+            const r = await fetch('/api/settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (!r.ok) {
+                const j = await r.json().catch(() => ({}));
+                throw new Error(j.error || r.statusText);
+            }
+            _currentAppSettings = body;
+            populateLoopGuardSettings(body);
+            setLoopGuardSettingsState('Saved', 'ok');
+            setTimeout(() => {
+                if ((loopGuardEl('loop-guard-settings-state') || {}).textContent === 'Saved') {
+                    setLoopGuardSettingsState('');
+                }
+            }, 1600);
+        } catch (err) {
+            setLoopGuardSettingsState(`Save failed: ${err.message || err}`, 'error');
+        }
+    });
 })();
 
 async function deletePreset(id, name) {

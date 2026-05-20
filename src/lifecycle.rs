@@ -3,16 +3,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use askama::Template;
 use axum::extract::State;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{any, get, post, put};
-use askama::Template;
 use tracing::{error, info};
 
 use crate::api::proxy;
 use crate::api::routes::*;
 use crate::api::state::get_app_state;
-use crate::config::{BinaryPreset, JsonStore, ModelConfig};
+use crate::config::{AppSettings, BinaryPreset, JsonStore, ModelConfig};
 use crate::orchestrator::{AppState, Orchestrator};
 use crate::ui::templates::{DashboardTemplate, GpuDisplay, ModelDisplay, SystemDisplay};
 
@@ -35,8 +35,7 @@ impl Default for AppConfig {
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -48,10 +47,17 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         Arc::new(JsonStore::new(config_dir.join("models.json")));
     let presets_store: Arc<JsonStore<Vec<BinaryPreset>>> =
         Arc::new(JsonStore::new(config_dir.join("presets.json")));
+    let settings_path = config_dir.join("settings.json");
+    let settings_exists = settings_path.exists();
+    let settings_store: Arc<JsonStore<AppSettings>> = Arc::new(JsonStore::new(settings_path));
+    if !settings_exists {
+        settings_store.replace(AppSettings::from_env());
+    }
 
-    let orchestrator = Arc::new(Orchestrator::new(
+    let orchestrator = Arc::new(Orchestrator::new_with_settings_store(
         models_store.clone(),
         presets_store.clone(),
+        settings_store.clone(),
         config.port,
     ));
 
@@ -74,6 +80,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         .route("/", get(index_page))
         // REST API
         .route("/api/status", get(get_app_state))
+        .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/models", get(list_models).post(create_model))
         .route("/api/models/validate", post(validate_model))
         .route("/api/models/{id}", put(update_model).delete(delete_model))
@@ -82,7 +89,10 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         .route("/api/files", get(list_files))
         .route("/api/gguf-info", get(gguf_info))
         .route("/api/presets", get(list_presets).post(create_preset))
-        .route("/api/presets/{id}", put(update_preset).delete(delete_preset))
+        .route(
+            "/api/presets/{id}",
+            put(update_preset).delete(delete_preset),
+        )
         // OpenAI-compatible surface
         .route("/v1/models", get(proxy::list_v1_models))
         .route("/v1/{*rest}", any(proxy::proxy_handler))
@@ -126,8 +136,7 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let terminate = async {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut s = signal(SignalKind::terminate())
-            .expect("install SIGTERM handler");
+        let mut s = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         s.recv().await;
     };
     #[cfg(not(unix))]

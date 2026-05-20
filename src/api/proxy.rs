@@ -111,8 +111,10 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
 
-    let outbound_body = loop_guard::guard_request(parts.uri.path(), &body_bytes)
-        .unwrap_or_else(|| body_bytes.to_vec());
+    let settings = state.settings().await;
+    let outbound_body =
+        loop_guard::guard_request(parts.uri.path(), &body_bytes, &settings.loop_guards.tool)
+            .unwrap_or_else(|| body_bytes.to_vec());
 
     if let Some(session) = StreamSession::new(
         client.clone(),
@@ -121,6 +123,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         parts.headers.clone(),
         parts.uri.path(),
         &outbound_body,
+        &settings.loop_guards.streaming,
     ) {
         return session.into_response(guard).await;
     }

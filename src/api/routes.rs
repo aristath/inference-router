@@ -5,12 +5,24 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::path::Path as StdPath;
 
-use crate::config::{BinaryPreset, CacheType, ModelConfig, WeightsFormat};
+use crate::config::{AppSettings, BinaryPreset, CacheType, ModelConfig, WeightsFormat};
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
 use crate::vram::estimator::GgufMeta;
 
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.list_models().await)
+}
+
+pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.settings().await)
+}
+
+pub async fn update_settings(
+    State(state): State<AppState>,
+    Json(settings): Json<AppSettings>,
+) -> impl IntoResponse {
+    state.update_settings(settings).await;
+    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
 #[derive(Serialize)]
@@ -125,12 +137,18 @@ fn validate_model_path(model: &ModelConfig, errors: &mut Vec<String>) {
         return;
     }
     let Ok(meta) = std::fs::metadata(&model.model_path) else {
-        errors.push(format!("model path '{}' does not exist", model.model_path.display()));
+        errors.push(format!(
+            "model path '{}' does not exist",
+            model.model_path.display()
+        ));
         return;
     };
     match model.weights_format {
         WeightsFormat::Gguf if !meta.is_file() => {
-            errors.push(format!("GGUF model path '{}' is not a file", model.model_path.display()));
+            errors.push(format!(
+                "GGUF model path '{}' is not a file",
+                model.model_path.display()
+            ));
         }
         WeightsFormat::Safetensors if !meta.is_dir() => {
             errors.push(format!(
@@ -384,7 +402,10 @@ pub async fn list_files(Query(req): Query<FileBrowserQuery>) -> impl IntoRespons
         match (a_dir, b_dir) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")),
+            _ => a["name"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["name"].as_str().unwrap_or("")),
         }
     });
     Json(entries).into_response()

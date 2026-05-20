@@ -18,14 +18,15 @@ use tokio::sync::mpsc;
 use tokio::time::{interval_at, Instant};
 use tracing::{error, warn};
 
+use crate::config::{StreamingLoopAction, StreamingLoopSettings, ToolLoopSettings};
 use crate::process::manager::RequestGuard;
 
 use self::detector::Detector;
 use self::endpoint::{ChoiceSnapshot, EndpointKind};
 use self::sse::EventParser;
 
-pub(super) fn guard_request(path: &str, body: &[u8]) -> Option<Vec<u8>> {
-    cross_turn::guard_request(path, body)
+pub(super) fn guard_request(path: &str, body: &[u8], cfg: &ToolLoopSettings) -> Option<Vec<u8>> {
+    cross_turn::guard_request(path, body, cfg)
 }
 
 const HOP_BY_HOP: &[&str] = &[
@@ -39,90 +40,42 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Action {
-    Heal,
-    Abort,
-    Log,
-}
-
 #[derive(Clone, Debug)]
 struct Config {
+    enabled: bool,
     window: usize,
     repeats: usize,
     check_interval: Duration,
     max_retries: usize,
-    action: Action,
+    action: StreamingLoopAction,
     replay_partial: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            enabled: true,
             window: 65_536,
             repeats: 10,
             check_interval: Duration::from_secs(5),
             max_retries: 3,
-            action: Action::Heal,
+            action: StreamingLoopAction::Heal,
             replay_partial: true,
         }
     }
 }
 
 impl Config {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Some(v) = env_usize("INFERENCE_ROUTER_LOOP_WINDOW") {
-            cfg.window = v.max(64);
+    fn from_settings(settings: &StreamingLoopSettings) -> Self {
+        Self {
+            enabled: settings.enabled,
+            window: settings.window_bytes.max(64),
+            repeats: settings.repeats.max(2),
+            check_interval: Duration::from_millis(settings.check_interval_ms.max(1)),
+            max_retries: settings.max_retries,
+            action: settings.action,
+            replay_partial: settings.replay_partial,
         }
-        if let Some(v) = env_usize("INFERENCE_ROUTER_LOOP_REPEATS") {
-            cfg.repeats = v.max(2);
-        }
-        if let Some(v) = env_u64("INFERENCE_ROUTER_LOOP_CHECK_INTERVAL_MS") {
-            cfg.check_interval = Duration::from_millis(v.max(1));
-        }
-        if let Some(v) = env_usize("INFERENCE_ROUTER_LOOP_MAX_RETRIES") {
-            cfg.max_retries = v;
-        }
-        if let Some(v) = env_bool("INFERENCE_ROUTER_LOOP_REPLAY_PARTIAL") {
-            cfg.replay_partial = v;
-        }
-        if let Ok(raw) = std::env::var("INFERENCE_ROUTER_LOOP_ACTION") {
-            cfg.action = match raw.trim().to_ascii_lowercase().as_str() {
-                "" | "heal" => Action::Heal,
-                "abort" => Action::Abort,
-                "log" => Action::Log,
-                other => {
-                    warn!(
-                        value = other,
-                        "invalid INFERENCE_ROUTER_LOOP_ACTION; using heal"
-                    );
-                    Action::Heal
-                }
-            };
-        }
-        cfg
-    }
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok()?.trim().parse().ok()
-}
-
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.trim().parse().ok()
-}
-
-fn env_bool(name: &str) -> Option<bool> {
-    match std::env::var(name)
-        .ok()?
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
     }
 }
 
@@ -145,7 +98,12 @@ impl StreamSession {
         headers: HeaderMap,
         path: &str,
         body: &[u8],
+        cfg: &StreamingLoopSettings,
     ) -> Option<Self> {
+        let cfg = Config::from_settings(cfg);
+        if !cfg.enabled {
+            return None;
+        }
         let spec = EndpointKind::detect(path)?;
         let req_doc: Value = serde_json::from_slice(body).ok()?;
         let streaming = req_doc
@@ -156,7 +114,7 @@ impl StreamSession {
             return None;
         }
         Some(Self {
-            cfg: Config::from_env(),
+            cfg,
             client,
             method,
             upstream_url,
@@ -251,11 +209,11 @@ impl StreamSession {
                     );
 
                     match self.cfg.action {
-                        Action::Log | Action::Abort => {
+                        StreamingLoopAction::Log | StreamingLoopAction::Abort => {
                             self.write_final_halt_delta(&tx, attempt + 1, period).await;
                             return;
                         }
-                        Action::Heal => {
+                        StreamingLoopAction::Heal => {
                             if attempt >= self.cfg.max_retries {
                                 warn!(
                                     endpoint = self.spec.name(),
@@ -350,7 +308,7 @@ impl StreamSession {
                     if period == 0 {
                         continue;
                     }
-                    if self.cfg.action == Action::Log {
+                    if self.cfg.action == StreamingLoopAction::Log {
                         if !log_mode_fired {
                             log_mode_fired = true;
                             warn!(

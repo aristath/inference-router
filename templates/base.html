@@ -251,6 +251,7 @@
         openModal('settings-modal');
         if (typeof refreshPresetList === 'function') await refreshPresetList();
         if (typeof syncPollIntervalField === 'function') syncPollIntervalField();
+        if (typeof refreshLoopGuardSettings === 'function') await refreshLoopGuardSettings();
     }
     </script>
     <script>

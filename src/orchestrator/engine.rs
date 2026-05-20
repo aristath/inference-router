@@ -1,4 +1,6 @@
-use crate::config::{BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat};
+use crate::config::{
+    AppSettings, BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat,
+};
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
@@ -54,10 +56,14 @@ pub struct Orchestrator {
     pub load_guards: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub store: Arc<JsonStore<Vec<ModelConfig>>>,
     pub presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
+    pub settings_store: Option<Arc<JsonStore<AppSettings>>>,
     pub dirty: Arc<AtomicBool>,
     /// Set when presets change so reconcile persists presets.json.
     pub presets_dirty: Arc<AtomicBool>,
+    /// Set when app settings change so reconcile persists settings.json.
+    pub settings_dirty: Arc<AtomicBool>,
     pub server_port: u16,
+    pub settings: Arc<Mutex<AppSettings>>,
     pub max_body_bytes: usize,
     pub max_instances_per_model: usize,
     pub vram_wait_timeout: std::time::Duration,
@@ -65,9 +71,42 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
+    #[allow(dead_code)]
     pub fn new(
         store: Arc<JsonStore<Vec<ModelConfig>>>,
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
+        server_port: u16,
+    ) -> Self {
+        Self::new_inner(
+            store,
+            presets_store,
+            None,
+            AppSettings::from_env(),
+            server_port,
+        )
+    }
+
+    pub fn new_with_settings_store(
+        store: Arc<JsonStore<Vec<ModelConfig>>>,
+        presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
+        settings_store: Arc<JsonStore<AppSettings>>,
+        server_port: u16,
+    ) -> Self {
+        let settings = settings_store.snapshot();
+        Self::new_inner(
+            store,
+            presets_store,
+            Some(settings_store),
+            settings.sanitized(),
+            server_port,
+        )
+    }
+
+    fn new_inner(
+        store: Arc<JsonStore<Vec<ModelConfig>>>,
+        presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
+        settings_store: Option<Arc<JsonStore<AppSettings>>>,
+        settings: AppSettings,
         server_port: u16,
     ) -> Self {
         let max_body_bytes =
@@ -124,9 +163,12 @@ impl Orchestrator {
             load_guards: Arc::new(Mutex::new(HashMap::new())),
             store,
             presets_store,
+            settings_store,
             dirty: Arc::new(AtomicBool::new(migrated_any)),
             presets_dirty: Arc::new(AtomicBool::new(false)),
+            settings_dirty: Arc::new(AtomicBool::new(false)),
             server_port,
+            settings: Arc::new(Mutex::new(settings)),
             max_body_bytes,
             max_instances_per_model,
             vram_wait_timeout,
@@ -200,6 +242,17 @@ impl Orchestrator {
         let mut v: Vec<BinaryPreset> = self.data.lock().await.presets.values().cloned().collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
+    }
+
+    // ----- App settings -----
+
+    pub async fn settings(&self) -> AppSettings {
+        self.settings.lock().await.clone()
+    }
+
+    pub async fn update_settings(&self, settings: AppSettings) {
+        *self.settings.lock().await = settings.sanitized();
+        self.settings_dirty.store(true, Ordering::Relaxed);
     }
 
     pub async fn add_preset(&self, preset: BinaryPreset) -> Result<(), MutationError> {
@@ -1021,6 +1074,26 @@ impl Orchestrator {
                 }
             }
         }
+
+        if self.settings_dirty.swap(false, Ordering::Relaxed) {
+            if let Some(store) = self.settings_store.clone() {
+                let snapshot = self.settings.lock().await.clone();
+                store.replace(snapshot);
+                match tokio::task::spawn_blocking(move || store.save()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        error!(error = %e, "failed to persist settings.json");
+                        self.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        error!(error = %e, "settings.json persistence task failed");
+                        self.settings_dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+            } else {
+                self.settings_dirty.store(false, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -1830,5 +1903,37 @@ mod tests {
         o.reconcile().await;
         let second_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(first_mtime, second_mtime);
+    }
+
+    #[tokio::test]
+    async fn reconcile_persists_settings_when_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(
+            tmp.path().join("models.json"),
+        ));
+        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
+            tmp.path().join("presets.json"),
+        ));
+        let settings = Arc::new(JsonStore::<AppSettings>::new(settings_path.clone()));
+        let o = Arc::new(Orchestrator::new_with_settings_store(
+            store, presets, settings, 8080,
+        ));
+
+        let mut next = o.settings().await;
+        next.loop_guards.streaming.repeats = 7;
+        next.loop_guards.streaming.action = crate::config::StreamingLoopAction::Log;
+        next.loop_guards.tool.window_messages = 24;
+        o.update_settings(next).await;
+        o.reconcile().await;
+
+        let saved: AppSettings =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(saved.loop_guards.streaming.repeats, 7);
+        assert_eq!(
+            saved.loop_guards.streaming.action,
+            crate::config::StreamingLoopAction::Log,
+        );
+        assert_eq!(saved.loop_guards.tool.window_messages, 24);
     }
 }

@@ -3,55 +3,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use tracing::warn;
 
-#[derive(Clone, Debug)]
-struct Config {
-    enabled: bool,
-    repeats: usize,
-    window_messages: usize,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            repeats: 3,
-            window_messages: 80,
-        }
-    }
-}
-
-impl Config {
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Some(v) = env_bool("INFERENCE_ROUTER_TOOL_LOOP_ENABLED") {
-            cfg.enabled = v;
-        }
-        if let Some(v) = env_usize("INFERENCE_ROUTER_TOOL_LOOP_REPEATS") {
-            cfg.repeats = v.max(2);
-        }
-        if let Some(v) = env_usize("INFERENCE_ROUTER_TOOL_LOOP_WINDOW_MESSAGES") {
-            cfg.window_messages = v.max(2);
-        }
-        cfg
-    }
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok()?.trim().parse().ok()
-}
-
-fn env_bool(name: &str) -> Option<bool> {
-    match std::env::var(name)
-        .ok()?
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
+use crate::config::ToolLoopSettings;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ToolCall {
@@ -73,20 +25,19 @@ struct Detection {
     block: Vec<ToolEvent>,
 }
 
-pub(super) fn guard_request(path: &str, body: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn guard_request(path: &str, body: &[u8], cfg: &ToolLoopSettings) -> Option<Vec<u8>> {
     if !path.ends_with("/chat/completions") {
         return None;
     }
 
-    let cfg = Config::from_env();
     if !cfg.enabled {
         return None;
     }
 
     let mut doc: Value = serde_json::from_slice(body).ok()?;
     let messages = doc.get("messages").and_then(Value::as_array)?;
-    let events = collect_tool_events(messages, cfg.window_messages);
-    let detection = detect_repeated_suffix(&events, cfg.repeats)?;
+    let events = collect_tool_events(messages, cfg.window_messages.max(2));
+    let detection = detect_repeated_suffix(&events, cfg.repeats.max(2))?;
 
     warn!(
         tools = %tool_sequence(&detection.block),
@@ -474,8 +425,12 @@ mod tests {
             "model": "fake",
             "messages": messages,
         });
-        let guarded =
-            guard_request("/v1/chat/completions", &serde_json::to_vec(&body).unwrap()).unwrap();
+        let guarded = guard_request(
+            "/v1/chat/completions",
+            &serde_json::to_vec(&body).unwrap(),
+            &ToolLoopSettings::default(),
+        )
+        .unwrap();
         let guarded: Value = serde_json::from_slice(&guarded).unwrap();
         let messages = guarded["messages"].as_array().unwrap();
         let last = messages.last().unwrap();
@@ -488,6 +443,11 @@ mod tests {
     #[test]
     fn ignores_non_chat_paths() {
         let body = json!({"model":"fake","messages":[]});
-        assert!(guard_request("/v1/completions", &serde_json::to_vec(&body).unwrap()).is_none());
+        assert!(guard_request(
+            "/v1/completions",
+            &serde_json::to_vec(&body).unwrap(),
+            &ToolLoopSettings::default(),
+        )
+        .is_none());
     }
 }

@@ -60,6 +60,7 @@ Environment:
 - `INFERENCE_ROUTER_MAX_INSTANCES_PER_MODEL` — maximum concurrent backend processes per model. Defaults to `1`; raise it if you explicitly want replica scale-out while requests are busy.
 - `INFERENCE_ROUTER_VRAM_WAIT_MS` — how long a load waits for active requests to release VRAM before failing. Defaults to `300000` (5 minutes); set `0` to fail immediately.
 - `INFERENCE_ROUTER_BACKEND_PORT_RANGE` — optional inclusive range for backend processes, e.g. `9100-9199`. Defaults to OS-assigned ephemeral ports.
+- `INFERENCE_ROUTER_LOOP_*` / `INFERENCE_ROUTER_TOOL_LOOP_*` — initial loop-guard defaults when `settings.json` does not exist yet. After that, use Settings → Loop guards in the UI.
 
 The port is `8080`, hardcoded in `AppConfig::default()` (see `src/lifecycle.rs`).
 
@@ -68,6 +69,7 @@ The port is `8080`, hardcoded in `AppConfig::default()` (see `src/lifecycle.rs`)
 State files under `~/.config/inference-router/`:
 
 - **`presets.json`** — named binary paths. Lets you rebuild llama.cpp once and have every model pick up the new binary.
+- **`settings.json`** — server-level app settings, including streaming and cross-turn loop guard controls exposed in the Settings modal.
 - **`models.json`** — one entry per model. Key fields:
   - `binary_preset` (optional): preset id to resolve `binary` from at spawn time.
   - `profile` (optional): workspace label such as `coding`, `long-context`, or `vision` for dashboard filtering.
