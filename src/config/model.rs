@@ -225,7 +225,9 @@ pub struct ModelConfig {
     // `cache_type_{k,v}`, and `device` to emit `-md / -ngld /
     // -ctkd / -ctvd / -devd`. Spec-decode policy (how hard this model drives
     // the draft) lives here: `draft_max`, `draft_min`, `draft_p_min`,
-    // `ctx_checkpoints`, `checkpoint_every_n_tokens`.
+    // `ctx_checkpoints`, `checkpoint_every_n_tokens`. MTP speculative
+    // decoding uses the target model's own draft heads and is controlled by
+    // `mtp_tokens`.
 
     /// `--device <dev1,dev2,...>` for the target model, and
     /// `-devd <dev1,dev2,...>` when this model is embedded as a draft inside
@@ -240,13 +242,18 @@ pub struct ModelConfig {
     #[serde(default)]
     pub draft_model_id: Option<String>,
 
-    /// `--draft-max N`. Max draft tokens per step. llama.cpp default 16.
+    /// `--spec-type draft-mtp` + `--spec-draft-n-max N`. Embedded MTP draft
+    /// tokens for models with MTP heads. `None` / `0` disables MTP.
+    #[serde(default)]
+    pub mtp_tokens: Option<u32>,
+
+    /// `--spec-draft-n-max N`. Max external draft tokens per step.
     #[serde(default)]
     pub draft_max: Option<u32>,
-    /// `--draft-min N`. Min draft tokens before submitting to target.
+    /// `--spec-draft-n-min N`. Min draft tokens before submitting to target.
     #[serde(default)]
     pub draft_min: Option<u32>,
-    /// `--draft-p-min P`. Probability floor for greedy draft sampling.
+    /// `--spec-draft-p-min P`. Probability floor for greedy draft sampling.
     #[serde(default)]
     pub draft_p_min: Option<f32>,
     /// `--ctx-checkpoints N`. Context-state snapshot slots. Required > 0
@@ -309,6 +316,7 @@ impl Default for ModelConfig {
             chat_template_kwargs: None,
             device: None,
             draft_model_id: None,
+            mtp_tokens: None,
             draft_max: None,
             draft_min: None,
             draft_p_min: None,
@@ -346,6 +354,9 @@ impl ModelConfig {
         let mut changed = false;
         let mut out: Vec<String> = Vec::with_capacity(self.extra_args.len());
         let args = std::mem::take(&mut self.extra_args);
+        let has_mtp_spec_type = args.windows(2).any(|w| {
+            w[0] == "--spec-type" && w[1] == "draft-mtp"
+        }) || args.iter().any(|a| a == "--spec-type=draft-mtp");
         let mut i = 0;
         while i < args.len() {
             let flag = args[i].as_str();
@@ -414,6 +425,26 @@ impl ModelConfig {
                 // are intentionally left alone — they reference a draft
                 // model that now has to be a first-class entry in
                 // models.json, and we can't synthesise that from a path.
+                ("--spec-type", Some(v)) => {
+                    if v == "draft-mtp" && self.draft_model_id.is_none() {
+                        consumed = 2;
+                    }
+                }
+                _ if flag == "--spec-type=draft-mtp" && self.draft_model_id.is_none() => {
+                    consumed = 1;
+                }
+                ("--spec-draft-n-max", Some(v)) => {
+                    if let Ok(n) = v.parse::<u32>() {
+                        if has_mtp_spec_type && self.draft_model_id.is_none() {
+                            if self.mtp_tokens.is_none() {
+                                self.mtp_tokens = Some(n);
+                            }
+                        } else if self.draft_max.is_none() {
+                            self.draft_max = Some(n);
+                        }
+                        consumed = 2;
+                    }
+                }
                 ("--draft-max" | "--draft" | "--draft-n", Some(v)) => {
                     if let Ok(n) = v.parse::<u32>() {
                         if self.draft_max.is_none() {
@@ -422,7 +453,7 @@ impl ModelConfig {
                         consumed = 2;
                     }
                 }
-                ("--draft-min" | "--draft-n-min", Some(v)) => {
+                ("--spec-draft-n-min" | "--draft-min" | "--draft-n-min", Some(v)) => {
                     if let Ok(n) = v.parse::<u32>() {
                         if self.draft_min.is_none() {
                             self.draft_min = Some(n);
@@ -430,7 +461,7 @@ impl ModelConfig {
                         consumed = 2;
                     }
                 }
-                ("--draft-p-min", Some(v)) => {
+                ("--spec-draft-p-min" | "--draft-p-min", Some(v)) => {
                     if let Ok(f) = v.parse::<f32>() {
                         if self.draft_p_min.is_none() {
                             self.draft_p_min = Some(f);
@@ -464,6 +495,10 @@ impl ModelConfig {
                 changed = true;
                 i += consumed;
             }
+        }
+        if has_mtp_spec_type && self.draft_model_id.is_none() && self.mtp_tokens.is_none() {
+            self.mtp_tokens = Some(3);
+            changed = true;
         }
         self.extra_args = out;
         changed
@@ -500,6 +535,7 @@ mod tests {
             reasoning_format: Some(ReasoningFormat::Auto),
             reasoning_budget: Some(-1),
             chat_template_kwargs: Some(r#"{"enable_thinking":true}"#.into()),
+            mtp_tokens: Some(4),
             ..ModelConfig::default()
         }
     }
@@ -561,6 +597,7 @@ mod tests {
         // Spec-decode fields default to off/unset.
         assert_eq!(parsed.device, None);
         assert_eq!(parsed.draft_model_id, None);
+        assert_eq!(parsed.mtp_tokens, None);
         assert_eq!(parsed.draft_max, None);
         assert_eq!(parsed.draft_min, None);
         assert_eq!(parsed.draft_p_min, None);
@@ -744,9 +781,9 @@ mod tests {
     fn migrate_extracts_spec_decode_policy_flags() {
         let mut m = bare();
         m.extra_args = vec![
-            "--draft-max".into(), "16".into(),
-            "--draft-min".into(), "1".into(),
-            "--draft-p-min".into(), "0.75".into(),
+            "--spec-draft-n-max".into(), "16".into(),
+            "--spec-draft-n-min".into(), "1".into(),
+            "--spec-draft-p-min".into(), "0.75".into(),
             "--ctx-checkpoints".into(), "4".into(),
             "--checkpoint-every-n-tokens".into(), "-1".into(),
         ];
@@ -756,6 +793,28 @@ mod tests {
         assert_eq!(m.draft_p_min, Some(0.75));
         assert_eq!(m.ctx_checkpoints, Some(4));
         assert_eq!(m.checkpoint_every_n_tokens, Some(-1));
+        assert!(m.extra_args.is_empty());
+    }
+
+    #[test]
+    fn migrate_extracts_mtp_spec_decode_flags() {
+        let mut m = bare();
+        m.extra_args = vec![
+            "--spec-draft-n-max".into(), "4".into(),
+            "--spec-type=draft-mtp".into(),
+        ];
+        assert!(m.migrate_extra_args());
+        assert_eq!(m.mtp_tokens, Some(4));
+        assert_eq!(m.draft_max, None);
+        assert!(m.extra_args.is_empty());
+    }
+
+    #[test]
+    fn migrate_mtp_spec_type_without_count_preserves_llama_default() {
+        let mut m = bare();
+        m.extra_args = vec!["--spec-type".into(), "draft-mtp".into()];
+        assert!(m.migrate_extra_args());
+        assert_eq!(m.mtp_tokens, Some(3));
         assert!(m.extra_args.is_empty());
     }
 

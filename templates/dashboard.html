@@ -530,29 +530,40 @@
                     <!-- ── Speculative decoding ── -->
                     <div class="tab-panel" id="tab-spec">
                         <p style="color:#94a3b8; margin-bottom:0.75rem; font-size:1rem;">
-                            Pick any model as a speculative-decoding draft. Same-family smaller models get high acceptance rates.
+                            Use an embedded MTP head or pick another model as an external speculative-decoding draft.
                         </p>
+                        <div class="form-group">
+                            <label for="mtp_tokens_slider">
+                                MTP draft tokens
+                                <span id="mtp_tokens_display" style="color:#38bdf8; font-weight:normal; margin-left:0.5rem;"></span>
+                            </label>
+                            <div class="slider-container">
+                                <input type="range" id="mtp_tokens_slider" min="0" max="10" step="1" value="0">
+                                <input type="hidden" id="mtp_tokens" name="mtp_tokens" value="">
+                            </div>
+                            <small class="field-help">0 = disabled. For MTP-capable models, emits <code>--spec-type draft-mtp</code> and <code>--spec-draft-n-max N</code> when Draft model is none.</small>
+                        </div>
                         <div class="form-group">
                             <label for="draft_model_id">Draft model</label>
                             <select id="draft_model_id" name="draft_model_id">
-                                <option value="">none (standard decoding)</option>
+                                <option value="">none (standard or MTP)</option>
                             </select>
                             <small class="field-help">Any model can serve as a draft. Sorted smallest → largest.</small>
                         </div>
                         <div class="form-row">
                             <div class="form-group">
-                                <label for="draft_max">Draft max (<code>--draft-max</code>)</label>
-                                <input type="number" id="draft_max" name="draft_max" min="0" placeholder="16 (default)">
+                                <label for="draft_max">Draft max (<code>--spec-draft-n-max</code>)</label>
+                                <input type="number" id="draft_max" name="draft_max" min="0" placeholder="3 (default)">
                             </div>
                             <div class="form-group">
-                                <label for="draft_min">Draft min (<code>--draft-min</code>)</label>
+                                <label for="draft_min">Draft min (<code>--spec-draft-n-min</code>)</label>
                                 <input type="number" id="draft_min" name="draft_min" min="0" placeholder="0 (default)">
                             </div>
                         </div>
                         <div class="form-row">
                             <div class="form-group">
-                                <label for="draft_p_min">Draft p-min (<code>--draft-p-min</code>)</label>
-                                <input type="number" id="draft_p_min" name="draft_p_min" min="0" max="1" step="0.01" placeholder="0.75 (default)">
+                                <label for="draft_p_min">Draft p-min (<code>--spec-draft-p-min</code>)</label>
+                                <input type="number" id="draft_p_min" name="draft_p_min" min="0" max="1" step="0.01" placeholder="0 (default)">
                             </div>
                             <div class="form-group">
                                 <label for="ctx_checkpoints">Context checkpoints (<code>--ctx-checkpoints</code>)</label>
@@ -820,6 +831,7 @@ const MODEL_DEFAULTS = {
     chat_template_kwargs: null,
     device: null,
     draft_model_id: null,
+    mtp_tokens: null,
     draft_max: null, draft_min: null, draft_p_min: null,
     ctx_checkpoints: null, checkpoint_every_n_tokens: null,
     extra_args: [],
@@ -1010,6 +1022,7 @@ function updateTabBadges() {
     ].filter(Boolean).length;
 
     const spec = [
+        !!v('mtp_tokens'),
         !!v('draft_model_id'),
         !!v('draft_max'),
         !!v('draft_min'),
@@ -1210,6 +1223,7 @@ function populateModelForm(m, mode) {
     // Spec-decode fields.
     f.device.value = m.device ?? '';
     f.draft_model_id.value = m.draft_model_id ?? '';
+    setOptionalSlider('mtp_tokens', m.mtp_tokens);
     f.draft_max.value = m.draft_max == null ? '' : String(m.draft_max);
     f.draft_min.value = m.draft_min == null ? '' : String(m.draft_min);
     f.draft_p_min.value = m.draft_p_min == null ? '' : String(m.draft_p_min);
@@ -1375,6 +1389,7 @@ document.getElementById('model-table-container')?.addEventListener('click', (e) 
     [
         { slider: 'n_gpu_layers_slider', hidden: 'n_gpu_layers', display: 'ngl_display', suffix: '' },
         { slider: 'parallel_slots_slider', hidden: 'parallel_slots', display: 'parallel_slots_display', suffix: ' slots' },
+        { slider: 'mtp_tokens_slider', hidden: 'mtp_tokens', display: 'mtp_tokens_display', suffix: ' tokens', zeroLabel: '(disabled)' },
     ].forEach(spec => {
         const slider = document.getElementById(spec.slider);
         const hidden = document.getElementById(spec.hidden);
@@ -1384,7 +1399,7 @@ document.getElementById('model-table-container')?.addEventListener('click', (e) 
             const v = parseInt(slider.value, 10);
             if (v === 0) {
                 hidden.value = '';
-                if (disp) disp.textContent = '(default)';
+                if (disp) disp.textContent = spec.zeroLabel || '(default)';
             } else {
                 hidden.value = String(v);
                 if (disp) disp.textContent = `${v}${spec.suffix}${spec.slider === 'n_gpu_layers_slider' && slider.max ? ` of ${slider.max}` : ''}`;
@@ -1928,6 +1943,7 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         chat_template_kwargs: toOptStr(f.chat_template_kwargs.value),
         device: toOptStr(f.device.value),
         draft_model_id: toOptStr(f.draft_model_id.value),
+        mtp_tokens: toOptInt(f.mtp_tokens.value),
         draft_max: toOptInt(f.draft_max.value),
         draft_min: toOptInt(f.draft_min.value),
         draft_p_min: toOptFloat(f.draft_p_min.value),

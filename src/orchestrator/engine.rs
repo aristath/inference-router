@@ -1200,6 +1200,7 @@ fn spawn_config_changed(old: &ModelConfig, new: &ModelConfig) -> bool {
         || old.chat_template_kwargs != new.chat_template_kwargs
         || old.device != new.device
         || old.draft_model_id != new.draft_model_id
+        || old.mtp_tokens != new.mtp_tokens
         || old.draft_max != new.draft_max
         || old.draft_min != new.draft_min
         || old.draft_p_min != new.draft_p_min

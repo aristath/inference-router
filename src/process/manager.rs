@@ -462,6 +462,15 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
                 args.push(path.to_string_lossy().into_owned());
             }
 
+            if draft.is_none() && model.draft_model_id.is_none() {
+                if let Some(n) = model.mtp_tokens.filter(|n| *n > 0) {
+                    args.push("--spec-type".into());
+                    args.push("draft-mtp".into());
+                    args.push("--spec-draft-n-max".into());
+                    args.push(n.to_string());
+                }
+            }
+
             if let Some(d) = draft {
                 args.push("-md".into());
                 args.push(d.model_path.to_string_lossy().into_owned());
@@ -976,6 +985,37 @@ mod tests {
         let args = build_command_args(&t, Some(&d), 9001);
         let joined = args.join(" ");
         assert!(!joined.contains("-devd"), "{joined}");
+    }
+
+    #[test]
+    fn mtp_argv_emits_spec_type_and_token_count() {
+        let mut t = gguf_model();
+        t.mtp_tokens = Some(4);
+        let args = build_command_args(&t, None, 9001);
+        assert_eq!(find_flag(&args, "--spec-type"), Some("draft-mtp"));
+        assert_eq!(find_flag(&args, "--spec-draft-n-max"), Some("4"));
+    }
+
+    #[test]
+    fn mtp_argv_omitted_when_zero() {
+        let mut t = gguf_model();
+        t.mtp_tokens = Some(0);
+        let args = build_command_args(&t, None, 9001);
+        let joined = args.join(" ");
+        assert!(!joined.contains("--spec-type"), "{joined}");
+        assert!(!joined.contains("--spec-draft-n-max"), "{joined}");
+    }
+
+    #[test]
+    fn mtp_argv_does_not_mix_with_external_draft() {
+        let mut t = gguf_model();
+        t.draft_model_id = Some("draft".into());
+        t.draft_max = Some(8);
+        t.mtp_tokens = Some(4);
+        let args = build_command_args(&t, Some(&draft_model()), 9001);
+        assert_eq!(find_flag(&args, "--spec-draft-n-max"), Some("8"));
+        let joined = args.join(" ");
+        assert!(!joined.contains("--spec-type draft-mtp"), "{joined}");
     }
 
     #[test]

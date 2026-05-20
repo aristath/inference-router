@@ -76,6 +76,7 @@ State files under `~/.config/inference-router/`:
   - `binary`, `model_path`, `port`, `context`: mandatory.
   - `weights_format`: `gguf` (llama.cpp argv style) or `safetensors` (vLLM style).
   - llama.cpp knobs: `flash_attn`, `n_gpu_layers`, `mlock`, `no_mmap`, `parallel_slots`, `cache_type_{k,v}`, `split_mode` (`none | layer | row | tensor`), `main_gpu`, `tensor_split`.
+  - Speculative decoding: `mtp_tokens` for embedded MTP heads, or `draft_model_id` plus `draft_{max,min,p_min}` for an external draft model.
   - `extra_args`: arbitrary argv array — escape hatch for flags not modelled.
   - Sampling: `temperature`, `top_p`, `top_k`, `min_p`.
 
