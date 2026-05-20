@@ -112,15 +112,20 @@ pub struct ModelDisplay {
     pub name: String,
     pub profile: String,
     pub format_str: String,
+    pub context_tokens: u32,
     pub context_str: String,
-    /// Raw bytes for grouping/sorting (not rendered directly).
+    /// Raw bytes for sorting (not rendered directly).
     pub file_size_bytes: u64,
     pub file_size_gib_str: String,
+    pub required_vram_bytes: u64,
     pub required_vram_gib_str: String,
     pub state_display: String,
     pub state_class: String,
-    /// Architecture string from gguf_meta (e.g. "llama", "qwen2"). Empty when unknown.
-    pub architecture: String,
+    pub state_sort_key: u8,
+    pub is_loaded: bool,
+    pub loaded_sort_key: u8,
+    pub primary_action_sort: String,
+    pub architecture_display: String,
     pub quant_label: String,
     pub size_label: String,
 }
@@ -133,6 +138,18 @@ impl ModelDisplay {
             ModelState::Running => ("Running".into(), "running".into()),
             ModelState::Error(msg) => (format!("Error: {}", msg), "error".into()),
         };
+        let state_sort_key = match &m.state {
+            ModelState::Running => 0,
+            ModelState::Loading => 1,
+            ModelState::Idle => 2,
+            ModelState::Error(_) => 3,
+        };
+        let is_loaded = matches!(m.state, ModelState::Running | ModelState::Loading);
+        let primary_action_sort = match &m.state {
+            ModelState::Running => "stop",
+            ModelState::Idle | ModelState::Error(_) => "load",
+            ModelState::Loading => "edit",
+        };
         let format_str = match m.weights_format {
             WeightsFormat::Gguf => "GGUF".into(),
             WeightsFormat::Safetensors => "Safetensors".into(),
@@ -140,13 +157,24 @@ impl ModelDisplay {
 
         let (file_size_bytes, required_vram_bytes) = compute_sizes(m);
 
-        let architecture = m.gguf_meta.as_ref()
+        let architecture = m
+            .gguf_meta
+            .as_ref()
             .and_then(|g| g.architecture.clone())
             .unwrap_or_default();
-        let quant_label = m.gguf_meta.as_ref()
+        let architecture_display = if architecture.is_empty() {
+            "Other".into()
+        } else {
+            capitalize_first(&architecture)
+        };
+        let quant_label = m
+            .gguf_meta
+            .as_ref()
             .and_then(|g| g.quant_label.clone())
             .unwrap_or_default();
-        let size_label = m.gguf_meta.as_ref()
+        let size_label = m
+            .gguf_meta
+            .as_ref()
             .and_then(|g| g.size_label.clone())
             .unwrap_or_default();
 
@@ -155,26 +183,23 @@ impl ModelDisplay {
             name: m.name.clone(),
             profile: m.profile.clone().unwrap_or_default(),
             format_str,
+            context_tokens: m.context,
             context_str: format_context(m.context),
             file_size_bytes,
             file_size_gib_str: gib_or_dash(file_size_bytes),
+            required_vram_bytes,
             required_vram_gib_str: gib_or_dash(required_vram_bytes),
             state_display,
             state_class,
-            architecture,
+            state_sort_key,
+            is_loaded,
+            loaded_sort_key: if is_loaded { 0 } else { 1 },
+            primary_action_sort: primary_action_sort.into(),
+            architecture_display,
             quant_label,
             size_label,
         }
     }
-}
-
-/// Architecture-grouped collection of models for the dashboard card grid.
-#[derive(Debug, Clone)]
-pub struct ModelGroup {
-    /// Display name for the group heading (capitalized, e.g. "Llama", "Qwen2").
-    pub display_name: String,
-    /// Models sorted by file size ascending.
-    pub models: Vec<ModelDisplay>,
 }
 
 fn format_context(ctx: u32) -> String {
@@ -182,6 +207,14 @@ fn format_context(ctx: u32) -> String {
         format!("{}K ctx", ctx / 1024)
     } else {
         format!("{} ctx", ctx)
+    }
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
     }
 }
 
@@ -263,6 +296,6 @@ pub struct DashboardTemplate {
     pub title: String,
     pub system: SystemDisplay,
     pub gpus: Vec<GpuDisplay>,
-    pub groups: Vec<ModelGroup>,
+    pub models: Vec<ModelDisplay>,
     pub server_port: u16,
 }

@@ -95,7 +95,7 @@
             <button type="button" class="btn btn-primary" onclick="openAddModelModal()">+ Add Model</button>
         </div>
 
-        {% if groups.is_empty() %}
+        {% if models.is_empty() %}
         <div class="card">
             <div class="empty-state">
                 <p>No models configured.</p>
@@ -103,55 +103,116 @@
             </div>
         </div>
         {% else %}
-        <div id="model-groups">
-            {% for group in groups %}
-            <div class="model-group">
-                <h3 class="model-group-heading">{{ group.display_name }}</h3>
-                <div class="model-cards">
-                    {% for model in group.models %}
-                    <div class="model-card" id="model-card-{{ model.id }}" data-name="{{ model.name }}" data-profile="{{ model.profile }}">
-                        <div class="model-card-header">
-                            <span class="model-card-name">{{ model.name }}</span>
-                            <span class="badge badge-{{ model.state_class }}" id="model-status-{{ model.id }}">{{ model.state_display }}</span>
-                        </div>
-                        <div class="model-card-chips">
-                            {% if !model.size_label.is_empty() %}
-                            <span class="model-chip size">{{ model.size_label }}</span>
-                            {% endif %}
-                            {% if !model.profile.is_empty() %}
+        <div class="model-table-wrap" id="model-table-container">
+            <table class="model-table" id="model-table">
+                <thead>
+                    <tr>
+                        <th class="sortable" scope="col" data-sort-key="state" data-sort-type="number" aria-sort="none">State</th>
+                        <th class="sortable" scope="col" data-sort-key="name" data-sort-type="text" aria-sort="none">Name</th>
+                        <th class="sortable" scope="col" data-sort-key="profile" data-sort-type="text" aria-sort="none">Profile</th>
+                        <th class="sortable" scope="col" data-sort-key="architecture" data-sort-type="text" aria-sort="none">Arch</th>
+                        <th class="sortable" scope="col" data-sort-key="size" data-sort-type="text" aria-sort="none">Size</th>
+                        <th class="sortable" scope="col" data-sort-key="quant" data-sort-type="text" aria-sort="none">Quant</th>
+                        <th class="sortable" scope="col" data-sort-key="format" data-sort-type="text" aria-sort="none">Format</th>
+                        <th class="sortable" scope="col" data-sort-key="context" data-sort-type="number" aria-sort="none">Context</th>
+                        <th class="sortable" scope="col" data-sort-key="file-size" data-sort-type="number" aria-sort="none">File</th>
+                        <th class="sortable" scope="col" data-sort-key="vram" data-sort-type="number" aria-sort="none">VRAM</th>
+                        <th class="sortable" scope="col" data-sort-key="activity" data-sort-type="number" aria-sort="none">Activity</th>
+                        <th class="sortable" scope="col" data-sort-key="actions" data-sort-type="text" aria-sort="none">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for model in models %}
+                    <tr class="model-row{% if model.is_loaded %} is-loaded{% endif %}"
+                        id="model-row-{{ model.id }}"
+                        data-model-id="{{ model.id }}"
+                        data-name="{{ model.name }}"
+                        data-profile="{{ model.profile }}"
+                        data-architecture="{{ model.architecture_display }}"
+                        data-quant="{{ model.quant_label }}"
+                        data-size-label="{{ model.size_label }}"
+                        data-format="{{ model.format_str }}"
+                        data-state="{{ model.state_class }}"
+                        data-loaded-priority="{{ model.loaded_sort_key }}"
+                        data-sort-state="{{ model.state_sort_key }}"
+                        data-sort-name="{{ model.name }}"
+                        data-sort-profile="{{ model.profile }}"
+                        data-sort-architecture="{{ model.architecture_display }}"
+                        data-sort-size="{{ model.size_label }}"
+                        data-sort-quant="{{ model.quant_label }}"
+                        data-sort-format="{{ model.format_str }}"
+                        data-sort-context="{{ model.context_tokens }}"
+                        data-sort-file-size="{% if !model.file_size_gib_str.eq("—") %}{{ model.file_size_bytes }}{% endif %}"
+                        data-sort-vram="{% if !model.required_vram_gib_str.eq("—") %}{{ model.required_vram_bytes }}{% endif %}"
+                        data-sort-activity="0"
+                        data-sort-actions="{{ model.primary_action_sort }}">
+                        <td><span class="badge badge-{{ model.state_class }}" id="model-status-{{ model.id }}">{{ model.state_display }}</span></td>
+                        <td class="model-name-cell">
+                            <span class="model-row-name">{{ model.name }}</span>
+                            <code class="model-row-id">{{ model.id }}</code>
+                        </td>
+                        <td>
+                            {% if model.profile.is_empty() %}
+                            <span class="model-muted">—</span>
+                            {% else %}
                             <span class="model-chip profile">{{ model.profile }}</span>
                             {% endif %}
-                            {% if !model.quant_label.is_empty() %}
+                        </td>
+                        <td>{{ model.architecture_display }}</td>
+                        <td>
+                            {% if model.size_label.is_empty() %}
+                            <span class="model-muted">—</span>
+                            {% else %}
+                            <span class="model-chip size">{{ model.size_label }}</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if model.quant_label.is_empty() %}
+                            <span class="model-muted">—</span>
+                            {% else %}
                             <span class="model-chip quant">{{ model.quant_label }}</span>
                             {% endif %}
-                            <span class="model-chip">{{ model.format_str }}</span>
-                        </div>
-                        <div class="model-card-stats">
-                            <span>{{ model.context_str }}</span>
-                            {% if !model.file_size_gib_str.eq("—") %}
-                            <span>{{ model.file_size_gib_str }} GiB</span>
+                        </td>
+                        <td><span class="model-chip">{{ model.format_str }}</span></td>
+                        <td>{{ model.context_str }}</td>
+                        <td>
+                            {% if model.file_size_gib_str.eq("—") %}
+                            <span class="model-muted">—</span>
+                            {% else %}
+                            {{ model.file_size_gib_str }} GiB
                             {% endif %}
-                            {% if !model.required_vram_gib_str.eq("—") %}
-                            <span title="Estimated VRAM">{{ model.required_vram_gib_str }} GiB VRAM</span>
+                        </td>
+                        <td>
+                            {% if model.required_vram_gib_str.eq("—") %}
+                            <span class="model-muted">—</span>
+                            {% else %}
+                            {{ model.required_vram_gib_str }} GiB
                             {% endif %}
+                        </td>
+                        <td class="model-activity-cell">
                             <span class="model-runtime" id="model-active-{{ model.id }}" style="display:none;"></span>
                             <span class="model-runtime" id="model-pending-{{ model.id }}" style="display:none;"></span>
-                        </div>
-                        <div class="model-card-actions">
-                            {% if model.state_class == "idle" || model.state_class == "error" %}
-                            <button type="button" class="btn btn-success btn-sm" data-model-action="load" data-model-id="{{ model.id }}">Load</button>
-                            {% endif %}
-                            {% if model.state_class == "running" %}
-                            <button type="button" class="btn btn-danger btn-sm" data-model-action="stop" data-model-id="{{ model.id }}">Stop</button>
-                            {% endif %}
-                            <button type="button" class="btn btn-secondary btn-sm" data-model-action="edit" data-model-id="{{ model.id }}">Edit</button>
-                            <button type="button" class="btn btn-danger btn-sm" data-model-action="delete" data-model-id="{{ model.id }}" data-model-name="{{ model.name }}">Delete</button>
-                        </div>
-                    </div>
+                            <span class="model-muted" data-model-activity-empty>—</span>
+                        </td>
+                        <td>
+                            <div class="model-table-actions" data-model-actions>
+                                {% if model.state_class == "idle" || model.state_class == "error" %}
+                                <button type="button" class="btn btn-success btn-sm" data-model-action="load" data-model-id="{{ model.id }}">Load</button>
+                                {% endif %}
+                                {% if model.state_class == "running" %}
+                                <button type="button" class="btn btn-danger btn-sm" data-model-action="stop" data-model-id="{{ model.id }}">Stop</button>
+                                {% endif %}
+                                <button type="button" class="btn btn-secondary btn-sm" data-model-action="edit" data-model-id="{{ model.id }}">Edit</button>
+                                <button type="button" class="btn btn-danger btn-sm" data-model-action="delete" data-model-id="{{ model.id }}" data-model-name="{{ model.name }}">Delete</button>
+                            </div>
+                        </td>
+                    </tr>
                     {% endfor %}
-                </div>
-            </div>
-            {% endfor %}
+                    <tr class="model-filter-empty" id="model-filter-empty" hidden>
+                        <td colspan="12">No models match this filter.</td>
+                    </tr>
+                </tbody>
+            </table>
         </div>
         {% endif %}
     </div>
@@ -616,22 +677,29 @@
 .browser-item.is-dir { color:#38bdf8; }
 .browser-item.is-file { color:#94a3b8; }
 .browser-item.is-gguf { color:#34d399; }
-/* ── Model card grid ── */
-.model-group { margin-bottom: 1.75rem; }
-.model-group + .model-group { border-top: 1px solid #334155; padding-top: 1.5rem; }
-.model-group-heading { font-size: 1.1rem; font-weight: 700; color: #94a3b8; margin: 0 0 0.75rem 0; letter-spacing: 0.04em; }
-.model-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.65rem; }
-.model-card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 0.85rem 0.95rem; display: flex; flex-direction: column; gap: 0.45rem; }
-.model-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem; }
-.model-card-name { font-weight: 600; font-size: 0.95rem; color: #e2e8f0; flex: 1; line-height: 1.35; word-break: break-word; }
-.model-card-chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }
-.model-chip { font-size: 0.75rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: #0f172a; border: 1px solid #334155; color: #64748b; }
+/* ── Model table ── */
+.model-table-wrap { background:#1e293b; border:1px solid #334155; border-radius:8px; overflow:auto; box-shadow:0 16px 36px rgba(0,0,0,0.18); }
+.model-table { min-width:1180px; }
+.model-table th { position:sticky; top:0; z-index:1; background:#1e293b; padding:0.65rem 0.75rem; font-size:0.78rem; white-space:nowrap; }
+.model-table td { padding:0.65rem 0.75rem; font-size:0.88rem; vertical-align:middle; }
+.model-table tbody tr { transition:background 0.15s; }
+.model-table tbody tr:hover { background:#172033; }
+.model-table tbody tr.is-loaded { background:#10241f; }
+.model-table tbody tr.is-loaded:hover { background:#143129; }
+.model-table tbody tr.is-loaded td:first-child { box-shadow:inset 3px 0 0 #22c55e; }
+.model-name-cell { min-width:17rem; }
+.model-row-name { display:block; color:#e2e8f0; font-weight:600; line-height:1.35; word-break:break-word; }
+.model-row-id { display:block; width:max-content; max-width:18rem; margin-top:0.15rem; padding:0; background:transparent; color:#64748b; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.model-muted { color:#64748b; }
+.model-chip { font-size: 0.75rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: #0f172a; border: 1px solid #334155; color: #64748b; white-space: nowrap; }
 .model-chip.quant { color: #38bdf8; border-color: #1e40af; }
 .model-chip.size  { color: #a78bfa; border-color: #4c1d95; }
 .model-chip.profile { color: #34d399; border-color: #065f46; }
-.model-card-stats { font-size: 0.85rem; color: #475569; display: flex; gap: 0.6rem; flex-wrap: wrap; }
-.model-runtime { color: #94a3b8; }
-.model-card-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.1rem; }
+.model-runtime { display:inline-flex; align-items:center; color:#94a3b8; margin-right:0.45rem; white-space:nowrap; }
+.model-table-actions { display:flex; gap:0.35rem; flex-wrap:nowrap; }
+.model-table .btn-sm { font-size:0.82rem; padding:0.28rem 0.55rem; }
+.model-table .badge { font-size:0.78rem; white-space:nowrap; }
+.model-filter-empty td { text-align:center; color:#94a3b8; padding:1.5rem; }
 .event-log { display:flex; flex-direction:column; gap:0.35rem; max-height:18rem; overflow:auto; font-size:0.82rem; }
 .event-row { display:grid; grid-template-columns:4.5rem 3.5rem 1fr; gap:0.45rem; color:#94a3b8; }
 .event-level-info { color:#38bdf8; }
@@ -1099,7 +1167,61 @@ function setOptionalSlider(name, value) {
     slider.dispatchEvent(new Event('input'));
 }
 
-// ----- Row actions -----
+// ----- Row actions and live row state -----
+function modelStateLabel(state, message) {
+    const cls = state || 'idle';
+    const label = cls.charAt(0).toUpperCase() + cls.slice(1);
+    return message ? `${label}: ${message}` : label;
+}
+
+function modelStateSortKey(state) {
+    if (state === 'running') return 0;
+    if (state === 'loading') return 1;
+    if (state === 'idle') return 2;
+    if (state === 'error') return 3;
+    return 4;
+}
+
+function loadedPriorityForState(state) {
+    return (state === 'running' || state === 'loading') ? 0 : 1;
+}
+
+function primaryActionForState(state) {
+    if (state === 'running') return 'stop';
+    if (state === 'idle' || state === 'error') return 'load';
+    return 'edit';
+}
+
+function makeModelActionButton(label, klass, action, id, name) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `btn ${klass} btn-sm`;
+    btn.dataset.modelAction = action;
+    btn.dataset.modelId = id;
+    if (name) btn.dataset.modelName = name;
+    btn.textContent = label;
+    return btn;
+}
+
+function updateModelActionsForState(row, model) {
+    const cell = row ? row.querySelector('[data-model-actions]') : null;
+    if (!cell || !model) return;
+    const id = row.dataset.modelId || model.id || '';
+    const name = row.dataset.name || model.name || id;
+    const wanted = primaryActionForState(model.state || 'idle');
+    if (cell.dataset.primaryAction === wanted) return;
+
+    cell.innerHTML = '';
+    cell.dataset.primaryAction = wanted;
+    if (wanted === 'load') {
+        cell.appendChild(makeModelActionButton('Load', 'btn-success', 'load', id));
+    } else if (wanted === 'stop') {
+        cell.appendChild(makeModelActionButton('Stop', 'btn-danger', 'stop', id));
+    }
+    cell.appendChild(makeModelActionButton('Edit', 'btn-secondary', 'edit', id));
+    cell.appendChild(makeModelActionButton('Delete', 'btn-danger', 'delete', id, name));
+}
+
 async function loadModel(id) {
     const r = await fetch(`/api/models/${encodeURIComponent(id)}/load`, { method: 'POST' });
     if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Load failed: ' + (j.error || r.statusText)); }
@@ -1117,7 +1239,7 @@ async function deleteModel(id, name) {
     else location.reload();
 }
 
-document.getElementById('model-groups')?.addEventListener('click', (e) => {
+document.getElementById('model-table-container')?.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-model-action]');
     if (!btn) return;
     const id = btn.dataset.modelId || '';
@@ -1292,26 +1414,112 @@ document.getElementById('model-groups')?.addEventListener('click', (e) => {
     });
 })();
 
-// ===== Model cards: filter =====
+// ===== Model table: sort and filter =====
 
-(function wireModelFilter() {
-    const filter = document.getElementById('model-filter');
-    if (!filter) return;
+const modelTableSort = { key: 'name', direction: 'asc', type: 'text' };
 
-    function applyFilter() {
-        const needle = filter.value.trim().toLowerCase();
-        document.querySelectorAll('.model-group').forEach(group => {
-            let anyVisible = false;
-            group.querySelectorAll('.model-card').forEach(card => {
-                const haystack = `${card.dataset.name || ''} ${card.dataset.profile || ''}`.toLowerCase();
-                const show = !needle || haystack.includes(needle);
-                card.style.display = show ? '' : 'none';
-                if (show) anyVisible = true;
-            });
-            group.style.display = anyVisible ? '' : 'none';
-        });
+function modelRows() {
+    return Array.from(document.querySelectorAll('#model-table tbody tr.model-row'));
+}
+
+function sortValue(row, key, type) {
+    const raw = row.getAttribute(`data-sort-${key}`) || '';
+    if (type === 'number') {
+        const num = Number(raw);
+        return { empty: raw === '' || !Number.isFinite(num), value: num };
     }
-    filter.addEventListener('input', applyFilter);
+    return { empty: raw.trim() === '', value: raw.toLocaleLowerCase() };
+}
+
+function compareSortValues(a, b, type, direction) {
+    if (a.empty !== b.empty) return a.empty ? 1 : -1;
+    if (a.empty && b.empty) return 0;
+    const dir = direction === 'desc' ? -1 : 1;
+    if (type === 'number') return (a.value - b.value) * dir;
+    return a.value.localeCompare(b.value) * dir;
+}
+
+function applyModelTableSort() {
+    const table = document.getElementById('model-table');
+    const tbody = table ? table.tBodies[0] : null;
+    if (!tbody) return;
+
+    const rows = modelRows();
+    rows.sort((a, b) => {
+        const loaded = Number(a.dataset.loadedPriority || '1') - Number(b.dataset.loadedPriority || '1');
+        if (loaded !== 0) return loaded;
+
+        const cmp = compareSortValues(
+            sortValue(a, modelTableSort.key, modelTableSort.type),
+            sortValue(b, modelTableSort.key, modelTableSort.type),
+            modelTableSort.type,
+            modelTableSort.direction,
+        );
+        if (cmp !== 0) return cmp;
+
+        return (a.dataset.sortName || '').localeCompare(b.dataset.sortName || '')
+            || (a.dataset.modelId || '').localeCompare(b.dataset.modelId || '');
+    });
+
+    rows.forEach(row => tbody.appendChild(row));
+    const empty = document.getElementById('model-filter-empty');
+    if (empty) tbody.appendChild(empty);
+
+    document.querySelectorAll('#model-table th.sortable').forEach(th => {
+        const active = th.dataset.sortKey === modelTableSort.key;
+        th.classList.toggle('sort-asc', active && modelTableSort.direction === 'asc');
+        th.classList.toggle('sort-desc', active && modelTableSort.direction === 'desc');
+        th.setAttribute('aria-sort', active ? (modelTableSort.direction === 'asc' ? 'ascending' : 'descending') : 'none');
+    });
+}
+
+function applyModelFilter() {
+    const filter = document.getElementById('model-filter');
+    const needle = filter ? filter.value.trim().toLowerCase() : '';
+    let visible = 0;
+    modelRows().forEach(row => {
+        const haystack = [
+            row.dataset.modelId,
+            row.dataset.name,
+            row.dataset.profile,
+            row.dataset.architecture,
+            row.dataset.sizeLabel,
+            row.dataset.quant,
+            row.dataset.format,
+            row.dataset.state,
+        ].join(' ').toLowerCase();
+        const show = !needle || haystack.includes(needle);
+        row.hidden = !show;
+        if (show) visible += 1;
+    });
+    const empty = document.getElementById('model-filter-empty');
+    if (empty) empty.hidden = visible !== 0 || !needle;
+}
+
+(function wireModelTable() {
+    const table = document.getElementById('model-table');
+    const filter = document.getElementById('model-filter');
+    if (!table) return;
+
+    table.querySelectorAll('th.sortable').forEach(th => {
+        th.addEventListener('click', () => {
+            const key = th.dataset.sortKey || 'name';
+            const type = th.dataset.sortType || 'text';
+            if (modelTableSort.key === key) {
+                modelTableSort.direction = modelTableSort.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                modelTableSort.key = key;
+                modelTableSort.type = type;
+                modelTableSort.direction = 'asc';
+            }
+            applyModelTableSort();
+            applyModelFilter();
+        });
+    });
+
+    if (filter) filter.addEventListener('input', applyModelFilter);
+    applyModelTableSort();
+    applyModelFilter();
 })();
 
 // ===== Preset management (Settings modal) =====

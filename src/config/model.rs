@@ -221,11 +221,11 @@ pub struct ModelConfig {
 
     // ===== Speculative decoding =====
     // A model can reference another model by id as its draft. The argv
-    // builder pulls the draft's `model_path`, `context`, `n_gpu_layers`,
-    // `cache_type_{k,v}`, and `device` to emit `-md / -cd / -ngld /
-    // -ctkd / -ctvd / -devd`. Spec-decode policy (how hard this model
-    // drives the draft) lives here: `draft_max`, `draft_min`,
-    // `draft_p_min`, `ctx_checkpoints`, `checkpoint_every_n_tokens`.
+    // builder pulls the draft's `model_path`, `n_gpu_layers`,
+    // `cache_type_{k,v}`, and `device` to emit `-md / -ngld /
+    // -ctkd / -ctvd / -devd`. Spec-decode policy (how hard this model drives
+    // the draft) lives here: `draft_max`, `draft_min`, `draft_p_min`,
+    // `ctx_checkpoints`, `checkpoint_every_n_tokens`.
 
     /// `--device <dev1,dev2,...>` for the target model, and
     /// `-devd <dev1,dev2,...>` when this model is embedded as a draft inside
@@ -410,7 +410,7 @@ impl ModelConfig {
                     consumed = 2;
                 }
                 // Speculative decoding policy flags. The draft *path*
-                // flags (`-md`, `-ngld`, `-devd`, `-cd`, `-ctkd`, `-ctvd`)
+                // flags (`-md`, `-ngld`, `-devd`, `-ctkd`, `-ctvd`)
                 // are intentionally left alone — they reference a draft
                 // model that now has to be a first-class entry in
                 // models.json, and we can't synthesise that from a path.
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn migrate_leaves_draft_path_flags_alone() {
-        // `-md`, `-ngld`, `-devd`, `-cd`, `-ctkd`, `-ctvd` can't be
+        // `-md`, `-ngld`, `-devd`, `-ctkd`, `-ctvd` can't be
         // auto-migrated because they reference a draft GGUF by path —
         // but the new model requires drafts to be ModelConfig entries
         // (addressable by id). Preserve them in extra_args so the user

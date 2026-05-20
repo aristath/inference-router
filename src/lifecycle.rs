@@ -14,7 +14,7 @@ use crate::api::routes::*;
 use crate::api::state::get_app_state;
 use crate::config::{BinaryPreset, JsonStore, ModelConfig};
 use crate::orchestrator::{AppState, Orchestrator};
-use crate::ui::templates::{DashboardTemplate, GpuDisplay, ModelDisplay, ModelGroup, SystemDisplay};
+use crate::ui::templates::{DashboardTemplate, GpuDisplay, ModelDisplay, SystemDisplay};
 
 const DEFAULT_CONFIG_DIR: &str = "~/.config/inference-router";
 
@@ -144,42 +144,20 @@ async fn index_page(State(state): State<AppState>) -> impl IntoResponse {
     let models = state.list_models().await;
     let sys = state.system_stats();
 
-    let displays: Vec<ModelDisplay> = models.iter().map(ModelDisplay::from_model).collect();
-
-    // Group by architecture; unknown arch → "Other" (sorted last).
-    let mut arch_groups: std::collections::HashMap<String, Vec<ModelDisplay>> = Default::default();
-    for m in displays {
-        let key = if m.architecture.is_empty() { "Other".to_string() } else { m.architecture.clone() };
-        arch_groups.entry(key).or_default().push(m);
-    }
-    let mut groups: Vec<ModelGroup> = arch_groups
-        .into_iter()
-        .map(|(arch, mut ms)| {
-            ms.sort_by_key(|m| m.file_size_bytes);
-            let display_name = capitalize_first(&arch);
-            ModelGroup { display_name, models: ms }
-        })
-        .collect();
-    groups.sort_by(|a, b| {
-        if a.display_name == "Other" { return std::cmp::Ordering::Greater; }
-        if b.display_name == "Other" { return std::cmp::Ordering::Less; }
-        a.display_name.cmp(&b.display_name)
+    let mut displays: Vec<ModelDisplay> = models.iter().map(ModelDisplay::from_model).collect();
+    displays.sort_by(|a, b| {
+        a.loaded_sort_key
+            .cmp(&b.loaded_sort_key)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id))
     });
 
     let tpl = DashboardTemplate {
         title: "Dashboard".into(),
         system: SystemDisplay::from_stats(sys),
         gpus: gpus.iter().map(GpuDisplay::from_gpu).collect(),
-        groups,
+        models: displays,
         server_port: state.server_port,
     };
     Html(tpl.render().unwrap())
-}
-
-fn capitalize_first(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
 }

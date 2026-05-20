@@ -473,8 +473,6 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
                     args.push("-devd".into());
                     args.push(dev.clone());
                 }
-                args.push("-cd".into());
-                args.push(d.context.to_string());
                 if let Some(k) = d.cache_type_k {
                     args.push("-ctkd".into());
                     args.push(k.as_arg().into());
@@ -924,7 +922,6 @@ mod tests {
         assert_eq!(find_flag(&args, "-md"), Some("/models/draft.gguf"));
         assert_eq!(find_flag(&args, "-ngld"), Some("99"));
         assert_eq!(find_flag(&args, "-devd"), Some("Vulkan1"));
-        assert_eq!(find_flag(&args, "-cd"), Some("16384"));
         assert_eq!(find_flag(&args, "-ctkd"), Some("q8_0"));
         assert_eq!(find_flag(&args, "-ctvd"), Some("q8_0"));
         assert_eq!(find_flag(&args, "--spec-draft-n-max"), Some("16"));
@@ -962,11 +959,12 @@ mod tests {
     }
 
     #[test]
-    fn spec_decode_argv_always_pins_draft_context() {
+    fn spec_decode_argv_does_not_emit_removed_draft_context_flag() {
         let mut t = gguf_model();
         t.draft_model_id = Some("draft".into());
         let args = build_command_args(&t, Some(&draft_model()), 9001);
-        assert_eq!(find_flag(&args, "-cd"), Some("16384"));
+        let joined = args.join(" ");
+        assert!(!joined.contains("-cd"), "{joined}");
     }
 
     #[test]

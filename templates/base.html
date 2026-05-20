@@ -342,27 +342,57 @@
                 // Temperature chip
                 setTempChip('gpu-temp-chip-' + gpu.id, gpu.temp_c);
             });
+            let modelRowsChanged = false;
             (data.models || []).forEach(model => {
                 const el = document.getElementById('model-status-' + model.id);
+                let cls = model.state || 'idle';
                 if (el) {
-                    const cls = model.state; // "idle" | "loading" | "running" | "error"
                     el.className = 'badge badge-' + cls;
-                    const label = cls.charAt(0).toUpperCase() + cls.slice(1);
-                    el.textContent = model.state_message ? `${label}: ${model.state_message}` : label;
+                    el.textContent = (typeof modelStateLabel === 'function')
+                        ? modelStateLabel(cls, model.state_message)
+                        : (model.state_message
+                            ? `${cls.charAt(0).toUpperCase() + cls.slice(1)}: ${model.state_message}`
+                            : cls.charAt(0).toUpperCase() + cls.slice(1));
+                }
+                const row = document.getElementById('model-row-' + model.id);
+                if (row) {
+                    const loadedPriority = (typeof loadedPriorityForState === 'function')
+                        ? loadedPriorityForState(cls)
+                        : ((cls === 'running' || cls === 'loading') ? 0 : 1);
+                    const stateSort = (typeof modelStateSortKey === 'function') ? modelStateSortKey(cls) : 4;
+                    const actionSort = (typeof primaryActionForState === 'function') ? primaryActionForState(cls) : cls;
+                    row.dataset.state = cls;
+                    row.dataset.loadedPriority = String(loadedPriority);
+                    row.dataset.sortState = String(stateSort);
+                    row.dataset.sortActions = actionSort;
+                    row.classList.toggle('is-loaded', loadedPriority === 0);
+                    if (typeof updateModelActionsForState === 'function') {
+                        updateModelActionsForState(row, model);
+                    }
+                    modelRowsChanged = true;
                 }
                 const active = document.getElementById('model-active-' + model.id);
+                const activeCount = model.active_requests || 0;
                 if (active) {
-                    const n = model.active_requests || 0;
-                    active.textContent = n === 1 ? '1 active' : `${n} active`;
-                    active.style.display = n > 0 ? '' : 'none';
+                    active.textContent = activeCount === 1 ? '1 active' : `${activeCount} active`;
+                    active.style.display = activeCount > 0 ? '' : 'none';
                 }
                 const pending = document.getElementById('model-pending-' + model.id);
+                const pendingCount = model.pending_instances || 0;
                 if (pending) {
-                    const n = model.pending_instances || 0;
-                    pending.textContent = n === 1 ? '1 loading' : `${n} loading`;
-                    pending.style.display = n > 0 ? '' : 'none';
+                    pending.textContent = pendingCount === 1 ? '1 loading' : `${pendingCount} loading`;
+                    pending.style.display = pendingCount > 0 ? '' : 'none';
+                }
+                if (row) {
+                    row.dataset.sortActivity = String(activeCount + pendingCount);
+                    const empty = row.querySelector('[data-model-activity-empty]');
+                    if (empty) empty.style.display = activeCount + pendingCount > 0 ? 'none' : '';
                 }
             });
+            if (modelRowsChanged && typeof applyModelTableSort === 'function') {
+                applyModelTableSort();
+                if (typeof applyModelFilter === 'function') applyModelFilter();
+            }
             updateEventLog(data.events || []);
         }
         // Polling interval is a per-browser UI preference, stored in
