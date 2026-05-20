@@ -231,6 +231,37 @@ async fn spawn_stalling_fake_llama() -> (u16, oneshot::Receiver<()>) {
     (port, drop_rx)
 }
 
+async fn spawn_capturing_fake_llama() -> (u16, Arc<tokio::sync::Mutex<Option<serde_json::Value>>>) {
+    let seen = Arc::new(tokio::sync::Mutex::new(None));
+    let handler_seen = seen.clone();
+    let app = axum::Router::new()
+        .route("/health", get(fake_health))
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let seen = handler_seen.clone();
+                async move {
+                    *seen.lock().await = Some(body);
+                    (
+                        [("content-type", "application/json")],
+                        JSON_RESPONSE.to_string(),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (port, seen)
+}
+
 /// Builds an Orchestrator + axum Router with a "loaded" model pointed at the
 /// given upstream port. No real spawn — we synthesize `Running` state.
 async fn build_proxy_app(upstream_port: u16) -> axum::Router {
@@ -404,6 +435,78 @@ async fn proxy_cancels_monitored_upstream_when_client_drops_response() {
         .await
         .expect("upstream body should be dropped promptly after client disconnect")
         .expect("upstream drop notification should be delivered");
+}
+
+#[tokio::test]
+async fn proxy_injects_cross_turn_tool_loop_corrective() {
+    let _env_lock = loop_env_lock().lock().await;
+    let _env = EnvVarGuard::set(&[("INFERENCE_ROUTER_TOOL_LOOP_REPEATS", "2")]);
+
+    let (upstream, seen_body) = spawn_capturing_fake_llama().await;
+    let app = build_proxy_app(upstream).await;
+    let proxy_port = start_proxy_server(app).await;
+
+    let body = serde_json::json!({
+        "model": "fake",
+        "messages": [
+            {"role": "user", "content": "fix it"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "edit_file",
+                        "arguments": "{\"path\":\"apps/avatar-kiosk/server.mjs\",\"oldString\":\"x\",\"newString\":\"x\"}"
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "No changes to apply: oldString and newString are identical."
+            },
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "edit_file",
+                        "arguments": "{\"path\":\"apps/avatar-kiosk/server.mjs\",\"oldString\":\"x\",\"newString\":\"x\"}"
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "No changes to apply: oldString and newString are identical."
+            }
+        ]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            proxy_port
+        ))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 200);
+    let upstream_body = seen_body.lock().await.clone().unwrap();
+    let messages = upstream_body["messages"].as_array().unwrap();
+    let last = messages.last().unwrap();
+    assert_eq!(last["role"], "user");
+    let content = last["content"].as_str().unwrap();
+    assert!(content.contains("automated proxy notice"));
+    assert!(content.contains("edit_file"));
+    assert!(content.contains("oldString and newString are identical"));
 }
 
 #[tokio::test]

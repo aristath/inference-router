@@ -1,3 +1,4 @@
+mod cross_turn;
 mod detector;
 mod endpoint;
 mod sse;
@@ -22,6 +23,10 @@ use crate::process::manager::RequestGuard;
 use self::detector::Detector;
 use self::endpoint::{ChoiceSnapshot, EndpointKind};
 use self::sse::EventParser;
+
+pub(super) fn guard_request(path: &str, body: &[u8]) -> Option<Vec<u8>> {
+    cross_turn::guard_request(path, body)
+}
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",

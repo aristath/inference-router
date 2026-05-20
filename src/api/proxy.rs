@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use tracing::{error, warn};
 
 use crate::api::body_peek;
-use crate::api::loop_guard::StreamSession;
+use crate::api::loop_guard::{self, StreamSession};
 use crate::orchestrator::AppState;
 use crate::process::manager::RequestGuard;
 
@@ -111,20 +111,23 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
 
+    let outbound_body = loop_guard::guard_request(parts.uri.path(), &body_bytes)
+        .unwrap_or_else(|| body_bytes.to_vec());
+
     if let Some(session) = StreamSession::new(
         client.clone(),
         upstream_method.clone(),
         upstream_url.clone(),
         parts.headers.clone(),
         parts.uri.path(),
-        &body_bytes,
+        &outbound_body,
     ) {
         return session.into_response(guard).await;
     }
 
     let mut builder = client
         .request(upstream_method, &upstream_url)
-        .body(body_bytes.to_vec());
+        .body(outbound_body);
 
     for (name, value) in parts.headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
