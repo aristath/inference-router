@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 use tracing::{error, warn};
 
 use crate::api::body_peek;
+use crate::api::loop_guard::StreamSession;
 use crate::orchestrator::AppState;
 use crate::process::manager::RequestGuard;
 
@@ -35,17 +36,17 @@ struct GuardedStream<S> {
 
 impl<S: Stream + Unpin> Stream for GuardedStream<S> {
     type Item = <S as Stream>::Item;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<<S as Stream>::Item>> {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<<S as Stream>::Item>> {
         Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 
 /// Byte-level passthrough handler for `/v1/*`. Peeks `model` from the JSON
 /// body, calls `ensure_loaded`, then proxies request/response unchanged.
-pub async fn proxy_handler(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response {
+pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -109,6 +110,18 @@ pub async fn proxy_handler(
     let client = reqwest::Client::new();
     let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
+
+    if let Some(session) = StreamSession::new(
+        client.clone(),
+        upstream_method.clone(),
+        upstream_url.clone(),
+        parts.headers.clone(),
+        parts.uri.path(),
+        &body_bytes,
+    ) {
+        return session.into_response(guard).await;
+    }
+
     let mut builder = client
         .request(upstream_method, &upstream_url)
         .body(body_bytes.to_vec());
@@ -152,12 +165,19 @@ pub async fn proxy_handler(
 
     // Wrap the byte stream so the guard stays alive until the body is fully
     // consumed or the connection is dropped.
-    let stream = GuardedStream { inner: upstream.bytes_stream(), _guard: guard };
+    let stream = GuardedStream {
+        inner: upstream.bytes_stream(),
+        _guard: guard,
+    };
     match resp_builder.body(Body::from_stream(stream)) {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "failed to build proxy response");
-            (StatusCode::INTERNAL_SERVER_ERROR, "proxy response build failed").into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "proxy response build failed",
+            )
+                .into_response()
         }
     }
 }
