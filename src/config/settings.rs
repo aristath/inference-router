@@ -77,7 +77,7 @@ impl Default for StreamingLoopSettings {
 
 impl StreamingLoopSettings {
     pub fn sanitize(&mut self) {
-        self.window_bytes = self.window_bytes.max(64);
+        self.window_bytes = self.window_bytes.max(1024);
         self.repeats = self.repeats.max(2);
         self.check_interval_ms = self.check_interval_ms.max(1);
     }
@@ -88,7 +88,7 @@ impl StreamingLoopSettings {
             cfg.enabled = v;
         }
         if let Some(v) = env_usize("INFERENCE_ROUTER_LOOP_WINDOW") {
-            cfg.window_bytes = v.max(64);
+            cfg.window_bytes = v.max(1024);
         }
         if let Some(v) = env_usize("INFERENCE_ROUTER_LOOP_REPEATS") {
             cfg.repeats = v.max(2);
@@ -208,7 +208,7 @@ mod tests {
         settings.loop_guards.tool.window_messages = 0;
 
         let settings = settings.sanitized();
-        assert_eq!(settings.loop_guards.streaming.window_bytes, 64);
+        assert_eq!(settings.loop_guards.streaming.window_bytes, 1024);
         assert_eq!(settings.loop_guards.streaming.repeats, 2);
         assert_eq!(settings.loop_guards.streaming.check_interval_ms, 1);
         assert_eq!(settings.loop_guards.tool.repeats, 2);

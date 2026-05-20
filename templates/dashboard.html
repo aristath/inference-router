@@ -690,7 +690,7 @@
                                 </div>
                                 <div class="form-group">
                                     <label for="lg-streaming-window">Window bytes</label>
-                                    <input type="number" id="lg-streaming-window" min="64" step="1024">
+                                    <input type="number" id="lg-streaming-window" min="1024" step="1024">
                                 </div>
                             </div>
                             <div class="form-row">
@@ -1828,7 +1828,7 @@ function readLoopGuardSettings() {
     const base = normalizeLoopGuardSettings(_currentAppSettings);
     base.loop_guards.streaming = {
         enabled: loopGuardEl('lg-streaming-enabled').checked,
-        window_bytes: loopGuardInt('lg-streaming-window', 65536, 64),
+        window_bytes: loopGuardInt('lg-streaming-window', 65536, 1024),
         repeats: loopGuardInt('lg-streaming-repeats', 10, 2),
         check_interval_ms: loopGuardInt('lg-streaming-check-ms', 5000, 1),
         max_retries: loopGuardInt('lg-streaming-max-retries', 3, 0),

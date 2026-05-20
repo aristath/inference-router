@@ -69,7 +69,7 @@ impl Config {
     fn from_settings(settings: &StreamingLoopSettings) -> Self {
         Self {
             enabled: settings.enabled,
-            window: settings.window_bytes.max(64),
+            window: settings.window_bytes.max(1024),
             repeats: settings.repeats.max(2),
             check_interval: Duration::from_millis(settings.check_interval_ms.max(1)),
             max_retries: settings.max_retries,
