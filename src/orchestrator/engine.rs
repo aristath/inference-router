@@ -2,15 +2,15 @@ use crate::config::{
     AppSettings, BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat,
 };
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
-use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
+use crate::orchestrator::eviction::{EvictionAction, decide_eviction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
 use crate::system::stats::{SystemStats, SystemTracker};
 use crate::vram::estimator::VramEstimate;
 use crate::vram::tracker::{GpuInfo, VRAMTracker};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -1109,7 +1109,9 @@ pub enum LoadError {
     #[error("model '{0}' not found")]
     ModelNotFound(String),
 
-    #[error("binary preset '{0}' not found — edit the model and pick an existing preset or a custom path")]
+    #[error(
+        "binary preset '{0}' not found — edit the model and pick an existing preset or a custom path"
+    )]
     PresetNotFound(String),
 
     #[error("model references draft '{id}', but no model '{id}' exists (target: '{target}')")]
@@ -1325,7 +1327,9 @@ fn resolve_llama_device(device: &str, gpus: &[GpuInfo]) -> Option<String> {
     let pci = device.strip_prefix("pci:").unwrap_or(device);
     gpus.iter().find_map(|gpu| {
         if gpu_matches_device(gpu, pci) {
-            gpu.vulkan_device.clone()
+            gpu.vulkan_device
+                .clone()
+                .or_else(|| gpu.cuda_device.clone())
         } else {
             None
         }
@@ -1343,6 +1347,11 @@ fn gpu_matches_device(gpu: &GpuInfo, device: &str) -> bool {
         .as_deref()
         .map(|name| name.eq_ignore_ascii_case(device))
         .unwrap_or(false)
+        || gpu
+            .cuda_device
+            .as_deref()
+            .map(|name| name.eq_ignore_ascii_case(device))
+            .unwrap_or(false)
         || gpu
             .pci_bus_id
             .as_deref()
@@ -1416,6 +1425,8 @@ mod tests {
             pci_bus_id: Some(pci.into()),
             vulkan_device: Some(format!("Vulkan{vulkan_index}")),
             vulkan_index: Some(vulkan_index),
+            cuda_device: None,
+            cuda_index: None,
             total_vram: 32 * 1024 * 1024 * 1024,
             used_vram: 0,
             busy_pct: 0,
@@ -1477,6 +1488,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Vulkan0", "Vulkan1", "Vulkan3"]
         );
+    }
+
+    #[test]
+    fn model_visible_gpus_filters_by_cuda_device() {
+        let gpus = vec![GpuInfo {
+            id: "cuda0".into(),
+            pci_bus_id: Some("0000:1c:00.0".into()),
+            vulkan_device: None,
+            vulkan_index: None,
+            cuda_device: Some("CUDA0".into()),
+            cuda_index: Some(0),
+            total_vram: 24 * 1024 * 1024 * 1024,
+            used_vram: 0,
+            busy_pct: 0,
+            temp_c: None,
+        }];
+        let mut m = model("cuda-target");
+        m.device = Some("CUDA0".into());
+
+        normalize_model_device_for_llama(&mut m, &gpus);
+
+        assert_eq!(m.device.as_deref(), Some("CUDA0"));
+        let selected = model_visible_gpus(&m, gpus);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].cuda_device.as_deref(), Some("CUDA0"));
     }
 
     #[test]
@@ -1841,6 +1877,8 @@ mod tests {
                 pci_bus_id: None,
                 vulkan_device: None,
                 vulkan_index: None,
+                cuda_device: None,
+                cuda_index: None,
                 total_vram: 10 * 1024 * 1024 * 1024,
                 used_vram: 0,
                 busy_pct: 0,

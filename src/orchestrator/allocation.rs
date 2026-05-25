@@ -92,6 +92,8 @@ mod tests {
             pci_bus_id: None,
             vulkan_device: None,
             vulkan_index: None,
+            cuda_device: None,
+            cuda_index: None,
             total_vram: free + 1_000_000_000,
             used_vram: 1_000_000_000,
             busy_pct: 0,

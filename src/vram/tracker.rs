@@ -18,6 +18,10 @@ pub struct GpuInfo {
     pub vulkan_device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vulkan_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_index: Option<usize>,
     pub total_vram: u64,
     pub used_vram: u64,
     /// GPU compute utilization 0..=100, from
@@ -45,7 +49,10 @@ impl VRAMTracker {
     /// and writeback sub-nodes like `card1-DP-1`) and returns their VRAM stats,
     /// sorted by card id.
     pub fn refresh(&self) -> Vec<GpuInfo> {
-        self.refresh_from("/sys/class/drm")
+        let mut gpus = self.refresh_from("/sys/class/drm");
+        append_nvidia_gpus(&mut gpus);
+        gpus.sort_by(|a, b| a.id.cmp(&b.id));
+        gpus
     }
 
     /// Same as `refresh` but with an injectable sysfs root for tests.
@@ -95,6 +102,8 @@ impl VRAMTracker {
                 pci_bus_id,
                 vulkan_device,
                 vulkan_index,
+                cuda_device: None,
+                cuda_index: None,
                 total_vram: total,
                 used_vram: used,
                 busy_pct,
@@ -105,6 +114,71 @@ impl VRAMTracker {
         gpus.sort_by(|a, b| a.id.cmp(&b.id));
         gpus
     }
+}
+
+fn append_nvidia_gpus(gpus: &mut Vec<GpuInfo>) {
+    for gpu in nvidia_smi_gpus() {
+        if gpu.pci_bus_id.as_deref().is_some_and(|pci| {
+            gpus.iter()
+                .any(|existing| existing.pci_bus_id.as_deref() == Some(pci))
+        }) {
+            continue;
+        }
+        gpus.push(gpu);
+    }
+}
+
+fn nvidia_smi_gpus() -> Vec<GpuInfo> {
+    let Ok(output) = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,pci.bus_id,memory.total,memory.used,utilization.gpu,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_nvidia_smi(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_nvidia_smi(output: &str) -> Vec<GpuInfo> {
+    output.lines().filter_map(parse_nvidia_smi_line).collect()
+}
+
+fn parse_nvidia_smi_line(line: &str) -> Option<GpuInfo> {
+    let parts = line.split(',').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return None;
+    }
+    let cuda_index = parts[0].parse::<usize>().ok()?;
+    let pci_bus_id = normalize_pci_bus_id(parts[1]);
+    let total_mib = parts[2].parse::<u64>().ok()?;
+    if total_mib.saturating_mul(1024 * 1024) < MIN_USABLE_GPU_VRAM_BYTES {
+        return None;
+    }
+    let used_mib = parts[3].parse::<u64>().ok()?;
+    let busy_pct = parts[4]
+        .parse::<u64>()
+        .ok()
+        .map(|v| v.min(100) as u8)
+        .unwrap_or(0);
+    let temp_c = parts[5].parse::<f32>().ok();
+
+    Some(GpuInfo {
+        id: format!("cuda{cuda_index}"),
+        pci_bus_id,
+        vulkan_device: None,
+        vulkan_index: None,
+        cuda_device: Some(format!("CUDA{cuda_index}")),
+        cuda_index: Some(cuda_index),
+        total_vram: total_mib.saturating_mul(1024 * 1024),
+        used_vram: used_mib.saturating_mul(1024 * 1024),
+        busy_pct,
+        temp_c,
+    })
 }
 
 fn read_u64(path: &Path) -> Option<u64> {
@@ -134,6 +208,24 @@ fn is_pci_bus_id(s: &str) -> bool {
             .iter()
             .enumerate()
             .all(|(idx, b)| matches!(idx, 4 | 7 | 10) || b.is_ascii_hexdigit())
+}
+
+fn normalize_pci_bus_id(raw: &str) -> Option<String> {
+    let s = raw.trim().to_ascii_lowercase();
+    if is_pci_bus_id(&s) {
+        return Some(s);
+    }
+
+    let mut parts = s.split(':');
+    let domain = parts.next()?;
+    let bus = parts.next()?;
+    let device_func = parts.next()?;
+    if parts.next().is_some() || domain.len() < 4 {
+        return None;
+    }
+    let domain = &domain[domain.len() - 4..];
+    let normalized = format!("{domain}:{bus}:{device_func}");
+    is_pci_bus_id(&normalized).then_some(normalized)
 }
 
 fn vulkan_devices_by_pci() -> &'static HashMap<String, usize> {
@@ -234,6 +326,8 @@ mod tests {
             pci_bus_id: None,
             vulkan_device: None,
             vulkan_index: None,
+            cuda_device: None,
+            cuda_index: None,
             total_vram: 100,
             used_vram: 150,
             busy_pct: 0,
@@ -297,6 +391,21 @@ mod tests {
         fs::write(dev.join("gpu_busy_percent"), "250").unwrap();
         let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
         assert_eq!(gpus[0].busy_pct, 100);
+    }
+
+    #[test]
+    fn parses_nvidia_smi_gpu_rows() {
+        let gpus = parse_nvidia_smi("0, 00000000:1C:00.0, 24576, 31, 12, 42\n");
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].id, "cuda0");
+        assert_eq!(gpus[0].pci_bus_id.as_deref(), Some("0000:1c:00.0"));
+        assert_eq!(gpus[0].cuda_device.as_deref(), Some("CUDA0"));
+        assert_eq!(gpus[0].cuda_index, Some(0));
+        assert_eq!(gpus[0].total_vram, 24576 * 1024 * 1024);
+        assert_eq!(gpus[0].used_vram, 31 * 1024 * 1024);
+        assert_eq!(gpus[0].busy_pct, 12);
+        assert_eq!(gpus[0].temp_c, Some(42.0));
     }
 
     #[test]
