@@ -1,7 +1,7 @@
 use crate::config::CacheType;
 use ggus::{
-    GGufMetaDataValueType as Ty, GGufMetaError, GGufMetaMap, GGufMetaMapExt,
-    GGufMetaValueArray, GGufReader,
+    GGufMetaDataValueType as Ty, GGufMetaError, GGufMetaMap, GGufMetaMapExt, GGufMetaValueArray,
+    GGufReader,
 };
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -36,10 +36,16 @@ impl KvPerElement {
     /// `--cache-type-{k,v}` are unset. Exposed mainly for tests and as
     /// a documented worst-case baseline.
     #[allow(dead_code)] // used by tests and available for callers
-    pub const FP16_BOTH: Self = Self { k: (2, 1), v: (2, 1) };
+    pub const FP16_BOTH: Self = Self {
+        k: (2, 1),
+        v: (2, 1),
+    };
 
     pub fn from_types(k: CacheType, v: CacheType) -> Self {
-        Self { k: k.bytes_per_element(), v: v.bytes_per_element() }
+        Self {
+            k: k.bytes_per_element(),
+            v: v.bytes_per_element(),
+        }
     }
 }
 
@@ -51,7 +57,11 @@ impl VramEstimate {
     /// head counts, and mixed-quantization caches.
     pub fn compute(file_size: u64, kv_cache_bytes: u64) -> Self {
         let total = (file_size + kv_cache_bytes).saturating_mul(11) / 10;
-        Self { weight_vram: file_size, kv_cache_vram: kv_cache_bytes, total_vram: total }
+        Self {
+            weight_vram: file_size,
+            kv_cache_vram: kv_cache_bytes,
+            total_vram: total,
+        }
     }
 }
 
@@ -113,9 +123,8 @@ impl GgufInfo {
         // Multi-file GGUFs point at shard 1/N; the rest of the weights
         // live in sibling files. Sum them all so VRAM estimates reflect
         // the full model, not just the first shard.
-        let file_size = sharded_total_size(path).unwrap_or_else(|| {
-            file.metadata().map(|m| m.len()).unwrap_or(0)
-        });
+        let file_size = sharded_total_size(path)
+            .unwrap_or_else(|| file.metadata().map(|m| m.len()).unwrap_or(0));
         // Safety: we only read from the mmap for the duration of this call;
         // the file is not mutated concurrently in our workflow.
         let mmap = unsafe { Mmap::map(&file) }?;
@@ -143,8 +152,10 @@ impl GgufInfo {
         let key_length = read_optional_u32(&map, &attention_key(&map, "key_length")?)?;
         let key_length_swa = read_optional_u32(&map, &attention_key(&map, "key_length_swa")?)?;
         let sliding_window = read_optional_u32(&map, &attention_key(&map, "sliding_window")?)?;
-        let full_attention_interval =
-            map.get_usize(&format!("{arch_ref}.full_attention_interval")).ok().map(|v| v as u32);
+        let full_attention_interval = map
+            .get_usize(&format!("{arch_ref}.full_attention_interval"))
+            .ok()
+            .map(|v| v as u32);
 
         // Which layers use sliding-window attention vs full? Gemma-3/4
         // publish `<arch>.attention.sliding_window_pattern` as a bool
@@ -283,15 +294,40 @@ fn normalize_cached_kv_heads(
 /// Maps `general.file_type` integer to its canonical quant label string.
 pub fn file_type_label(ft: u32) -> &'static str {
     match ft {
-        0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 4 => "Q4_1_F16",
-        7 => "Q8_0", 8 => "Q5_0", 9 => "Q5_1",
-        10 => "Q2_K", 11 => "Q3_K_S", 12 => "Q3_K_M", 13 => "Q3_K_L",
-        14 => "Q4_K_S", 15 => "Q4_K_M", 16 => "Q5_K_S", 17 => "Q5_K_M",
-        18 => "Q6_K", 19 => "IQ2_XXS", 20 => "IQ2_XS", 21 => "Q2_K_S",
-        22 => "IQ3_XS", 23 => "IQ3_XXS", 24 => "IQ1_S", 25 => "IQ4_NL",
-        26 => "IQ3_S", 27 => "IQ3_M", 28 => "IQ2_S", 29 => "IQ2_M",
-        30 => "IQ4_XS", 31 => "IQ1_M", 32 => "BF16",
-        33 => "Q4_0_4_4", 34 => "Q4_0_4_8", 35 => "Q4_0_8_8",
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        4 => "Q4_1_F16",
+        7 => "Q8_0",
+        8 => "Q5_0",
+        9 => "Q5_1",
+        10 => "Q2_K",
+        11 => "Q3_K_S",
+        12 => "Q3_K_M",
+        13 => "Q3_K_L",
+        14 => "Q4_K_S",
+        15 => "Q4_K_M",
+        16 => "Q5_K_S",
+        17 => "Q5_K_M",
+        18 => "Q6_K",
+        19 => "IQ2_XXS",
+        20 => "IQ2_XS",
+        21 => "Q2_K_S",
+        22 => "IQ3_XS",
+        23 => "IQ3_XXS",
+        24 => "IQ1_S",
+        25 => "IQ4_NL",
+        26 => "IQ3_S",
+        27 => "IQ3_M",
+        28 => "IQ2_S",
+        29 => "IQ2_M",
+        30 => "IQ4_XS",
+        31 => "IQ1_M",
+        32 => "BF16",
+        33 => "Q4_0_4_4",
+        34 => "Q4_0_4_8",
+        35 => "Q4_0_8_8",
         _ => "Unknown",
     }
 }
@@ -348,9 +384,8 @@ pub struct GgufMeta {
 impl GgufMeta {
     pub fn read(path: &Path) -> Result<Self, EstimateError> {
         let file = File::open(path)?;
-        let file_size = sharded_total_size(path).unwrap_or_else(|| {
-            file.metadata().map(|m| m.len()).unwrap_or(0)
-        });
+        let file_size = sharded_total_size(path)
+            .unwrap_or_else(|| file.metadata().map(|m| m.len()).unwrap_or(0));
         let mmap = unsafe { Mmap::map(&file) }?;
         let kvs = read_metadata_kvs(&mmap)?;
         let map = MetaMap(kvs);
@@ -369,20 +404,21 @@ impl GgufMeta {
         let key_length = read_optional_u32(&map, &attention_key(&map, "key_length")?)?;
         let key_length_swa = read_optional_u32(&map, &attention_key(&map, "key_length_swa")?)?;
         let sliding_window = read_optional_u32(&map, &attention_key(&map, "sliding_window")?)?;
-        let full_attention_interval =
-            map.get_usize(&format!("{arch_ref}.full_attention_interval")).ok().map(|v| v as u32);
+        let full_attention_interval = map
+            .get_usize(&format!("{arch_ref}.full_attention_interval"))
+            .ok()
+            .map(|v| v as u32);
 
         let swa_pattern =
             read_bool_array_field(&map, &attention_key(&map, "sliding_window_pattern")?)?;
 
-        let (full_kv_heads, swa_kv_heads) =
-            split_kv_heads(
-                &kv_heads_per_layer,
-                &swa_pattern,
-                sliding_window,
-                n_layers,
-                full_attention_interval,
-            );
+        let (full_kv_heads, swa_kv_heads) = split_kv_heads(
+            &kv_heads_per_layer,
+            &swa_pattern,
+            sliding_window,
+            n_layers,
+            full_attention_interval,
+        );
         let kv_heads_total = full_kv_heads + swa_kv_heads;
         let n_head_kv_max = kv_heads_per_layer.iter().copied().max().unwrap_or(0) as u32;
 
@@ -403,31 +439,42 @@ impl GgufMeta {
         let base_model_repo = meta_read_str(&map, "general.base_model.0.repo_url");
 
         // --- Architecture detail ---
-        let feed_forward_length =
-            map.get_usize(&format!("{arch_ref}.feed_forward_length")).ok().map(|v| v as u32);
-        let expert_count =
-            map.get_usize(&format!("{arch_ref}.expert_count")).ok().map(|v| v as u32);
-        let expert_used_count =
-            map.get_usize(&format!("{arch_ref}.expert_used_count")).ok().map(|v| v as u32);
+        let feed_forward_length = map
+            .get_usize(&format!("{arch_ref}.feed_forward_length"))
+            .ok()
+            .map(|v| v as u32);
+        let expert_count = map
+            .get_usize(&format!("{arch_ref}.expert_count"))
+            .ok()
+            .map(|v| v as u32);
+        let expert_used_count = map
+            .get_usize(&format!("{arch_ref}.expert_used_count"))
+            .ok()
+            .map(|v| v as u32);
         let rope_freq_base = meta_read_f32(&map, &format!("{arch_ref}.rope.freq_base"));
-        let ssm_inner_size =
-            map.get_usize(&format!("{arch_ref}.ssm.inner_size")).ok().map(|v| v as u32);
+        let ssm_inner_size = map
+            .get_usize(&format!("{arch_ref}.ssm.inner_size"))
+            .ok()
+            .map(|v| v as u32);
 
         // --- Tokenizer ---
         let chat_template = meta_read_str(&map, "tokenizer.chat_template");
-        let bos_token_id =
-            map.get_usize("tokenizer.ggml.bos_token_id").ok().map(|v| v as u32);
-        let eos_token_id =
-            map.get_usize("tokenizer.ggml.eos_token_id").ok().map(|v| v as u32);
+        let bos_token_id = map
+            .get_usize("tokenizer.ggml.bos_token_id")
+            .ok()
+            .map(|v| v as u32);
+        let eos_token_id = map
+            .get_usize("tokenizer.ggml.eos_token_id")
+            .ok()
+            .map(|v| v as u32);
 
         // --- Derived suggestions ---
         let quant_lower = quant_label.as_deref().unwrap_or("").to_ascii_lowercase();
         let base_slug = {
-            let raw = basename.as_deref()
+            let raw = basename
+                .as_deref()
                 .or(name.as_deref())
-                .unwrap_or_else(|| {
-                    path.file_stem().and_then(|s| s.to_str()).unwrap_or("model")
-                });
+                .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("model"));
             slug(raw)
         };
         let suggested_id = if quant_lower.is_empty() {
@@ -435,9 +482,7 @@ impl GgufMeta {
         } else {
             format!("{base_slug}-{quant_lower}")
         };
-        let display_name = name.as_deref()
-            .or(basename.as_deref())
-            .unwrap_or("Model");
+        let display_name = name.as_deref().or(basename.as_deref()).unwrap_or("Model");
         let suggested_name = if quant_label.as_deref().is_none_or(|q| q == "Unknown") {
             display_name.to_owned()
         } else {
@@ -445,20 +490,41 @@ impl GgufMeta {
         };
 
         Ok(Self {
-            max_context, n_layers, n_embd,
+            max_context,
+            n_layers,
+            n_embd,
             n_head: head_stats.max,
             n_head_kv: n_head_kv_max,
-            key_length, key_length_swa,
-            full_kv_heads, swa_kv_heads, kv_heads_total,
-            sliding_window, file_size,
+            key_length,
+            key_length_swa,
+            full_kv_heads,
+            swa_kv_heads,
+            kv_heads_total,
+            sliding_window,
+            file_size,
             architecture: arch,
-            name, basename, size_label, file_type, quant_label,
-            quantized_by, license, tags,
-            base_model_name, base_model_org, base_model_repo,
-            feed_forward_length, expert_count, expert_used_count,
-            rope_freq_base, ssm_inner_size, full_attention_interval,
-            chat_template, bos_token_id, eos_token_id,
-            suggested_id, suggested_name,
+            name,
+            basename,
+            size_label,
+            file_type,
+            quant_label,
+            quantized_by,
+            license,
+            tags,
+            base_model_name,
+            base_model_org,
+            base_model_repo,
+            feed_forward_length,
+            expert_count,
+            expert_used_count,
+            rope_freq_base,
+            ssm_inner_size,
+            full_attention_interval,
+            chat_template,
+            bos_token_id,
+            eos_token_id,
+            suggested_id,
+            suggested_name,
         })
     }
 }
@@ -495,7 +561,9 @@ fn meta_read_str(map: &MetaMap, key: &str) -> Option<String> {
     }
     let len = u64::from_le_bytes(bytes[..8].try_into().ok()?) as usize;
     let end = 8usize.checked_add(len)?;
-    std::str::from_utf8(bytes.get(8..end)?).ok().map(|s| s.to_owned())
+    std::str::from_utf8(bytes.get(8..end)?)
+        .ok()
+        .map(|s| s.to_owned())
 }
 
 /// Read an optional f32 from the GGUF metadata map.
@@ -530,8 +598,7 @@ fn meta_read_str_array(map: &MetaMap, key: &str) -> Vec<String> {
         if pos + 8 > bytes.len() {
             break;
         }
-        let str_len =
-            u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap_or([0; 8])) as usize;
+        let str_len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap_or([0; 8])) as usize;
         pos += 8;
         if pos + str_len > bytes.len() {
             break;
@@ -566,7 +633,10 @@ fn read_int_field_per_layer(
     };
     if ty == Ty::Array {
         let (values, _len) = read_int_array(bytes)?;
-        Ok(values.into_iter().map(|v| v.min(u32::MAX as u64) as u32).collect())
+        Ok(values
+            .into_iter()
+            .map(|v| v.min(u32::MAX as u64) as u32)
+            .collect())
     } else {
         let scalar = map.get_usize(key).map_err(meta_err)? as u32;
         Ok(vec![scalar; n_layers as usize])
@@ -671,7 +741,9 @@ fn read_int_field(map: &MetaMap, key: &str) -> Result<IntFieldStats, EstimateErr
     if ty == Ty::Array {
         let (values, _len) = read_int_array(bytes)?;
         let max = values.iter().copied().max().unwrap_or(0);
-        Ok(IntFieldStats { max: max.min(u32::MAX as u64) as u32 })
+        Ok(IntFieldStats {
+            max: max.min(u32::MAX as u64) as u32,
+        })
     } else {
         // Scalar: let ggus's get_usize handle sign extension / width.
         let v = map.get_usize(key).map_err(meta_err)?;
@@ -690,10 +762,7 @@ fn read_int_array(bytes: &[u8]) -> Result<(Vec<u64>, u64), EstimateError> {
     macro_rules! collect_as {
         ($t:ty, $lift:expr) => {{
             let arr = GGufMetaValueArray::<$t>::new(r, len_usize);
-            let vals: Vec<u64> = arr
-                .filter_map(Result::ok)
-                .map(|v| $lift(v))
-                .collect();
+            let vals: Vec<u64> = arr.filter_map(Result::ok).map(|v| $lift(v)).collect();
             Ok((vals, len))
         }};
     }
@@ -701,7 +770,11 @@ fn read_int_array(bytes: &[u8]) -> Result<(Vec<u64>, u64), EstimateError> {
     // Negative values (e.g. a `-1` sentinel in i32 arrays) collapse to 0
     // — they're not valid head counts. Positive values cast losslessly.
     let neg_to_zero = |v: i64| -> u64 {
-        if v < 0 { 0 } else { v as u64 }
+        if v < 0 {
+            0
+        } else {
+            v as u64
+        }
     };
 
     match elem_ty {
@@ -733,7 +806,10 @@ fn sharded_total_size(path: &Path) -> Option<u64> {
     let width = idx_str.len();
     idx_str.parse::<u32>().ok()?;
 
-    let parent: PathBuf = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let parent: PathBuf = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
     let mut sum = 0u64;
     for i in 1..=total {
         let shard = parent.join(format!("{stem}-{i:0width$}-of-{total:0width$}.gguf"));
@@ -752,7 +828,9 @@ fn read_metadata_kvs(data: &[u8]) -> Result<HashMap<String, (Ty, Vec<u8>)>, Esti
         return Err(EstimateError::Gguf("bad magic".into()));
     }
     if !header.is_native_endian() {
-        return Err(EstimateError::Gguf("non-native endian not supported".into()));
+        return Err(EstimateError::Gguf(
+            "non-native endian not supported".into(),
+        ));
     }
 
     let mut map = HashMap::with_capacity(header.metadata_kv_count as usize);
@@ -887,10 +965,19 @@ mod tests {
 
     fn info_head_dim(n_embd: u32, n_head: u32, n_head_kv: u32, key_length: u32) -> GgufInfo {
         GgufInfo {
-            max_context: 0, n_layers: 0, n_embd, n_head, n_head_kv,
-            key_length, key_length_swa: 0,
-            full_kv_heads: 0, swa_kv_heads: 0, kv_heads_total: 0,
-            sliding_window: 0, full_attention_interval: None, file_size: 0,
+            max_context: 0,
+            n_layers: 0,
+            n_embd,
+            n_head,
+            n_head_kv,
+            key_length,
+            key_length_swa: 0,
+            full_kv_heads: 0,
+            swa_kv_heads: 0,
+            kv_heads_total: 0,
+            sliding_window: 0,
+            full_attention_interval: None,
+            file_size: 0,
         }
     }
 
@@ -938,8 +1025,8 @@ mod tests {
             n_head_kv: 16,
             key_length: 512,
             key_length_swa: 256,
-            full_kv_heads: 40,    // 10 layers × 4 heads
-            swa_kv_heads: 800,    // 50 layers × 16 heads
+            full_kv_heads: 40, // 10 layers × 4 heads
+            swa_kv_heads: 800, // 50 layers × 16 heads
             kv_heads_total: 840,
             sliding_window: 1024,
             full_attention_interval: None,
@@ -1157,5 +1244,4 @@ mod tests {
         let err = GgufInfo::read(tmp.path()).unwrap_err();
         assert!(matches!(err, EstimateError::Gguf(_)));
     }
-
 }

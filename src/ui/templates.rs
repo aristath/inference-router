@@ -19,8 +19,8 @@ pub struct GpuDisplay {
     pub usage_class: String,
     pub busy_pct_str: String,
     pub busy_class: String,
-    pub temp_c_str: String,    // "43" or "—"
-    pub temp_class: String,    // "green" | "yellow" | "red" | "muted"
+    pub temp_c_str: String, // "43" or "—"
+    pub temp_class: String, // "green" | "yellow" | "red" | "muted"
 }
 
 impl GpuDisplay {
@@ -77,7 +77,11 @@ impl SystemDisplay {
     pub fn from_stats(s: SystemStats) -> Self {
         let ram_used_gib = s.ram_used as f64 / 1_073_741_824.0;
         let ram_total_gib = s.ram_total as f64 / 1_073_741_824.0;
-        let ram_pct = if s.ram_total > 0 { s.ram_used as f64 / s.ram_total as f64 * 100.0 } else { 0.0 };
+        let ram_pct = if s.ram_total > 0 {
+            s.ram_used as f64 / s.ram_total as f64 * 100.0
+        } else {
+            0.0
+        };
         let (cpu_temp_c_str, cpu_temp_class) = match s.cpu_temp_c {
             Some(t) => (format!("{:.0}", t), temp_class(t)),
             None => ("—".into(), "muted".into()),
@@ -96,13 +100,27 @@ impl SystemDisplay {
 }
 
 fn bar_class(pct: f64) -> String {
-    if pct > 90.0 { "red" } else if pct > 70.0 { "yellow" } else { "green" }.into()
+    if pct > 90.0 {
+        "red"
+    } else if pct > 70.0 {
+        "yellow"
+    } else {
+        "green"
+    }
+    .into()
 }
 
 /// Rough green/yellow/red temperature bands for CPU and GPU junction temps.
 /// 0–70 green, 70–85 yellow, >85 red.
 fn temp_class(celsius: f32) -> String {
-    if celsius > 85.0 { "red" } else if celsius > 70.0 { "yellow" } else { "green" }.into()
+    if celsius > 85.0 {
+        "red"
+    } else if celsius > 70.0 {
+        "yellow"
+    } else {
+        "green"
+    }
+    .into()
 }
 
 /// Pre-formatted model data for templates.
@@ -246,19 +264,19 @@ fn compute_sizes(m: &ModelConfig) -> (u64, u64) {
                 .or_else(|| GgufInfo::read(&m.model_path).ok());
             match info {
                 Some(info) => {
-                // Honour the model's configured KV cache quantization so
-                // q8_0/q4_0 shrink the Required VRAM column, matching
-                // what llama-server actually allocates at run time.
-                // Unset falls back to f16, which is also llama.cpp's
-                // default.
-                let kv_bytes = KvPerElement::from_types(
-                    m.cache_type_k.unwrap_or(CacheType::F16),
-                    m.cache_type_v.unwrap_or(CacheType::F16),
-                );
-                let kv = info.kv_cache_bytes(m.context, kv_bytes);
-                let estimate = VramEstimate::compute(info.file_size, kv);
-                (info.file_size, estimate.total_vram)
-            }
+                    // Honour the model's configured KV cache quantization so
+                    // q8_0/q4_0 shrink the Required VRAM column, matching
+                    // what llama-server actually allocates at run time.
+                    // Unset falls back to f16, which is also llama.cpp's
+                    // default.
+                    let kv_bytes = KvPerElement::from_types(
+                        m.cache_type_k.unwrap_or(CacheType::F16),
+                        m.cache_type_v.unwrap_or(CacheType::F16),
+                    );
+                    let kv = info.kv_cache_bytes(m.context, kv_bytes);
+                    let estimate = VramEstimate::compute(info.file_size, kv);
+                    (info.file_size, estimate.total_vram)
+                }
                 // Header unreadable (missing file, non-GGUF, etc.) — show a
                 // dash (the gib_or_dash formatter handles 0).
                 None => (0, 0),
@@ -274,11 +292,15 @@ fn compute_sizes(m: &ModelConfig) -> (u64, u64) {
 /// Sum of regular files inside a safetensors model directory. Returns 0
 /// for missing or non-directory paths so the UI shows a dash.
 fn safetensors_dir_size(path: &std::path::Path) -> u64 {
-    let Ok(meta) = std::fs::metadata(path) else { return 0 };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
     if !meta.is_dir() {
         return 0;
     }
-    let Ok(rd) = std::fs::read_dir(path) else { return 0 };
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return 0;
+    };
     let mut total = 0u64;
     for entry in rd.flatten() {
         if let Ok(em) = entry.metadata() {

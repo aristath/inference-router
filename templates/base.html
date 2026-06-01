@@ -43,6 +43,10 @@
             transition: all 0.15s;
         }
         header.topbar .icon-btn:hover { background: #334155; color: #e2e8f0; }
+        header.topbar .icon-btn:disabled {
+            opacity: 0.55;
+            cursor: wait;
+        }
         .container { padding: 1.5rem 2rem; }
         .dashboard-grid {
             display: grid;
@@ -218,6 +222,7 @@
     <header class="topbar">
         <div class="brand"><span class="dot"></span> Inference Router</div>
         <div class="actions">
+            <button type="button" class="icon-btn" id="restart-service-btn" title="Restart service" onclick="restartService()">↻</button>
             <button type="button" class="icon-btn" title="Settings" onclick="openSettingsModal()">⚙</button>
         </div>
     </header>
@@ -252,6 +257,28 @@
         if (typeof refreshPresetList === 'function') await refreshPresetList();
         if (typeof syncPollIntervalField === 'function') syncPollIntervalField();
         if (typeof refreshLoopGuardSettings === 'function') await refreshLoopGuardSettings();
+    }
+    async function restartService() {
+        if (!confirm('Restart inference-router service?')) return;
+        const btn = document.getElementById('restart-service-btn');
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = '...';
+        }
+        try {
+            const res = await fetch('/api/service/restart', { method: 'POST' });
+            if (!res.ok) {
+                const body = await res.json().catch(() => ({}));
+                throw new Error(body.error || res.statusText);
+            }
+            window.setTimeout(() => location.reload(), 2500);
+        } catch (e) {
+            alert('Restart failed: ' + (e && e.message ? e.message : e));
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = '↻';
+            }
+        }
     }
     </script>
     <script>

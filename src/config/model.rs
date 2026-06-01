@@ -5,12 +5,24 @@ use std::path::PathBuf;
 // keep them in one place so `ModelConfig`, `ModelRequest`, and any future
 // DTO all share a single source of truth (visible via `pub` for serde
 // `#[serde(default = "...")]` callers in other modules).
-pub fn default_temperature() -> f32 { 0.6 }
-pub fn default_top_p() -> f32 { 0.95 }
-pub fn default_top_k() -> i32 { 40 }
-pub fn default_min_p() -> f32 { 0.0 }
-pub fn default_presence_penalty() -> f32 { 0.0 }
-pub fn default_repeat_penalty() -> f32 { 1.0 }
+pub fn default_temperature() -> f32 {
+    0.6
+}
+pub fn default_top_p() -> f32 {
+    0.95
+}
+pub fn default_top_k() -> i32 {
+    40
+}
+pub fn default_min_p() -> f32 {
+    0.0
+}
+pub fn default_presence_penalty() -> f32 {
+    0.0
+}
+pub fn default_repeat_penalty() -> f32 {
+    1.0
+}
 
 /// Weights file format. Drives the argv style used when spawning the backend.
 ///
@@ -228,7 +240,6 @@ pub struct ModelConfig {
     // `ctx_checkpoints`, `checkpoint_every_n_tokens`. MTP speculative
     // decoding uses the target model's own draft heads and is controlled by
     // `mtp_tokens`.
-
     /// `--device <dev1,dev2,...>` for the target model, and
     /// `-devd <dev1,dev2,...>` when this model is embedded as a draft inside
     /// another model's spawn. Accepts llama.cpp device names (`Vulkan1`) or
@@ -354,9 +365,10 @@ impl ModelConfig {
         let mut changed = false;
         let mut out: Vec<String> = Vec::with_capacity(self.extra_args.len());
         let args = std::mem::take(&mut self.extra_args);
-        let has_mtp_spec_type = args.windows(2).any(|w| {
-            w[0] == "--spec-type" && w[1] == "draft-mtp"
-        }) || args.iter().any(|a| a == "--spec-type=draft-mtp");
+        let has_mtp_spec_type = args
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp")
+            || args.iter().any(|a| a == "--spec-type=draft-mtp");
         let mut i = 0;
         while i < args.len() {
             let flag = args[i].as_str();
@@ -503,7 +515,6 @@ impl ModelConfig {
         self.extra_args = out;
         changed
     }
-
 }
 
 #[cfg(test)]
@@ -607,9 +618,18 @@ mod tests {
 
     #[test]
     fn reasoning_format_serializes_kebab_case() {
-        assert_eq!(serde_json::to_string(&ReasoningFormat::None).unwrap(), "\"none\"");
-        assert_eq!(serde_json::to_string(&ReasoningFormat::Auto).unwrap(), "\"auto\"");
-        assert_eq!(serde_json::to_string(&ReasoningFormat::Deepseek).unwrap(), "\"deepseek\"");
+        assert_eq!(
+            serde_json::to_string(&ReasoningFormat::None).unwrap(),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningFormat::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningFormat::Deepseek).unwrap(),
+            "\"deepseek\""
+        );
         assert_eq!(
             serde_json::to_string(&ReasoningFormat::DeepseekLegacy).unwrap(),
             "\"deepseek-legacy\"",
@@ -618,9 +638,18 @@ mod tests {
 
     #[test]
     fn reasoning_format_from_cli_covers_all_values() {
-        assert_eq!(ReasoningFormat::from_cli("none"), Some(ReasoningFormat::None));
-        assert_eq!(ReasoningFormat::from_cli("auto"), Some(ReasoningFormat::Auto));
-        assert_eq!(ReasoningFormat::from_cli("deepseek"), Some(ReasoningFormat::Deepseek));
+        assert_eq!(
+            ReasoningFormat::from_cli("none"),
+            Some(ReasoningFormat::None)
+        );
+        assert_eq!(
+            ReasoningFormat::from_cli("auto"),
+            Some(ReasoningFormat::Auto)
+        );
+        assert_eq!(
+            ReasoningFormat::from_cli("deepseek"),
+            Some(ReasoningFormat::Deepseek)
+        );
         assert_eq!(
             ReasoningFormat::from_cli("deepseek-legacy"),
             Some(ReasoningFormat::DeepseekLegacy),
@@ -644,14 +673,22 @@ mod tests {
     fn migrate_extracts_all_seven_flags() {
         let mut m = bare();
         m.extra_args = vec![
-            "--threads".into(), "16".into(),
-            "--reasoning-format".into(), "auto".into(),
-            "--cache-ram".into(), "0".into(),
-            "--presence-penalty".into(), "1.5".into(),
-            "--repeat-penalty".into(), "1.0".into(),
-            "--reasoning-budget".into(), "0".into(),
-            "--chat-template-kwargs".into(), r#"{"enable_thinking":false}"#.into(),
-            "--mmproj".into(), "/models/mmproj.gguf".into(),
+            "--threads".into(),
+            "16".into(),
+            "--reasoning-format".into(),
+            "auto".into(),
+            "--cache-ram".into(),
+            "0".into(),
+            "--presence-penalty".into(),
+            "1.5".into(),
+            "--repeat-penalty".into(),
+            "1.0".into(),
+            "--reasoning-budget".into(),
+            "0".into(),
+            "--chat-template-kwargs".into(),
+            r#"{"enable_thinking":false}"#.into(),
+            "--mmproj".into(),
+            "/models/mmproj.gguf".into(),
         ];
         assert!(m.migrate_extra_args());
         assert_eq!(m.threads, Some(16));
@@ -660,8 +697,14 @@ mod tests {
         assert_eq!(m.presence_penalty, 1.5);
         assert_eq!(m.repeat_penalty, 1.0);
         assert_eq!(m.reasoning_budget, Some(0));
-        assert_eq!(m.chat_template_kwargs.as_deref(), Some(r#"{"enable_thinking":false}"#));
-        assert_eq!(m.mmproj_path.as_deref(), Some(std::path::Path::new("/models/mmproj.gguf")));
+        assert_eq!(
+            m.chat_template_kwargs.as_deref(),
+            Some(r#"{"enable_thinking":false}"#)
+        );
+        assert_eq!(
+            m.mmproj_path.as_deref(),
+            Some(std::path::Path::new("/models/mmproj.gguf"))
+        );
         assert!(m.extra_args.is_empty());
     }
 
@@ -669,8 +712,10 @@ mod tests {
     fn migrate_preserves_unknown_flags() {
         let mut m = bare();
         m.extra_args = vec![
-            "--override-kv".into(), "foo=bar".into(),
-            "--threads".into(), "16".into(),
+            "--override-kv".into(),
+            "foo=bar".into(),
+            "--threads".into(),
+            "16".into(),
             "--custom-flag".into(),
         ];
         assert!(m.migrate_extra_args());
@@ -735,12 +780,18 @@ mod tests {
         // Taken verbatim from the user's models.json.
         let mut m = bare();
         m.extra_args = vec![
-            "--threads".into(), "16".into(),
-            "--reasoning-format".into(), "auto".into(),
-            "--cache-ram".into(), "0".into(),
-            "--presence-penalty".into(), "1.5".into(),
-            "--repeat-penalty".into(), "1.0".into(),
-            "--chat-template-kwargs".into(), r#"{"enable_thinking":false}"#.into(),
+            "--threads".into(),
+            "16".into(),
+            "--reasoning-format".into(),
+            "auto".into(),
+            "--cache-ram".into(),
+            "0".into(),
+            "--presence-penalty".into(),
+            "1.5".into(),
+            "--repeat-penalty".into(),
+            "1.0".into(),
+            "--chat-template-kwargs".into(),
+            r#"{"enable_thinking":false}"#.into(),
         ];
         assert!(m.migrate_extra_args());
         assert!(m.extra_args.is_empty());
@@ -749,13 +800,19 @@ mod tests {
         assert_eq!(m.cache_ram_mib, Some(0));
         assert_eq!(m.presence_penalty, 1.5);
         assert_eq!(m.repeat_penalty, 1.0);
-        assert_eq!(m.chat_template_kwargs.as_deref(), Some(r#"{"enable_thinking":false}"#));
+        assert_eq!(
+            m.chat_template_kwargs.as_deref(),
+            Some(r#"{"enable_thinking":false}"#)
+        );
     }
 
     #[test]
     fn split_mode_serializes_lowercase() {
         assert_eq!(serde_json::to_string(&SplitMode::None).unwrap(), "\"none\"");
-        assert_eq!(serde_json::to_string(&SplitMode::Layer).unwrap(), "\"layer\"");
+        assert_eq!(
+            serde_json::to_string(&SplitMode::Layer).unwrap(),
+            "\"layer\""
+        );
         assert_eq!(serde_json::to_string(&SplitMode::Row).unwrap(), "\"row\"");
     }
 
@@ -781,11 +838,16 @@ mod tests {
     fn migrate_extracts_spec_decode_policy_flags() {
         let mut m = bare();
         m.extra_args = vec![
-            "--spec-draft-n-max".into(), "16".into(),
-            "--spec-draft-n-min".into(), "1".into(),
-            "--spec-draft-p-min".into(), "0.75".into(),
-            "--ctx-checkpoints".into(), "4".into(),
-            "--checkpoint-every-n-tokens".into(), "-1".into(),
+            "--spec-draft-n-max".into(),
+            "16".into(),
+            "--spec-draft-n-min".into(),
+            "1".into(),
+            "--spec-draft-p-min".into(),
+            "0.75".into(),
+            "--ctx-checkpoints".into(),
+            "4".into(),
+            "--checkpoint-every-n-tokens".into(),
+            "-1".into(),
         ];
         assert!(m.migrate_extra_args());
         assert_eq!(m.draft_max, Some(16));
@@ -800,7 +862,8 @@ mod tests {
     fn migrate_extracts_mtp_spec_decode_flags() {
         let mut m = bare();
         m.extra_args = vec![
-            "--spec-draft-n-max".into(), "4".into(),
+            "--spec-draft-n-max".into(),
+            "4".into(),
             "--spec-type=draft-mtp".into(),
         ];
         assert!(m.migrate_extra_args());
@@ -827,9 +890,12 @@ mod tests {
         // can see what needs to be reconstructed as a draft entry.
         let mut m = bare();
         m.extra_args = vec![
-            "-md".into(), "/m/draft.gguf".into(),
-            "-ngld".into(), "99".into(),
-            "-devd".into(), "Vulkan1".into(),
+            "-md".into(),
+            "/m/draft.gguf".into(),
+            "-ngld".into(),
+            "99".into(),
+            "-devd".into(),
+            "Vulkan1".into(),
         ];
         assert!(!m.migrate_extra_args());
         assert_eq!(

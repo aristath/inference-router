@@ -50,15 +50,27 @@ impl SystemTracker {
         self.sample_from("/proc/stat", "/proc/meminfo", "/sys/class/hwmon")
     }
 
-    pub fn sample_from(&self, stat_path: &str, meminfo_path: &str, hwmon_root: &str) -> SystemStats {
+    pub fn sample_from(
+        &self,
+        stat_path: &str,
+        meminfo_path: &str,
+        hwmon_root: &str,
+    ) -> SystemStats {
         let cpu_pct = self.sample_cpu(stat_path);
         let (ram_used, ram_total) = read_meminfo(meminfo_path);
         let cpu_temp_c = self.read_cpu_temp(hwmon_root);
-        SystemStats { cpu_pct, ram_used, ram_total, cpu_temp_c }
+        SystemStats {
+            cpu_pct,
+            ram_used,
+            ram_total,
+            cpu_temp_c,
+        }
     }
 
     fn sample_cpu(&self, stat_path: &str) -> f32 {
-        let Some(sample) = read_cpu_sample(stat_path) else { return 0.0 };
+        let Some(sample) = read_cpu_sample(stat_path) else {
+            return 0.0;
+        };
         let mut slot = self.prev_cpu.lock().unwrap();
         let pct = match *slot {
             Some(prev) => {
@@ -112,7 +124,9 @@ fn read_cpu_sample(path: &str) -> Option<CpuSample> {
 }
 
 fn read_meminfo(path: &str) -> (u64, u64) {
-    let Ok(content) = fs::read_to_string(path) else { return (0, 0) };
+    let Ok(content) = fs::read_to_string(path) else {
+        return (0, 0);
+    };
     let mut total_kb = 0u64;
     let mut avail_kb = 0u64;
     for line in content.lines() {
@@ -151,7 +165,9 @@ fn resolve_cpu_temp_path(root: &str) -> Option<std::path::PathBuf> {
     for pref in &["k10temp", "coretemp"] {
         for entry in &entries {
             let name_file = entry.path().join("name");
-            let Ok(name) = fs::read_to_string(&name_file) else { continue };
+            let Ok(name) = fs::read_to_string(&name_file) else {
+                continue;
+            };
             if name.trim() == *pref {
                 let temp1 = entry.path().join("temp1_input");
                 if temp1.exists() {
@@ -164,7 +180,9 @@ fn resolve_cpu_temp_path(root: &str) -> Option<std::path::PathBuf> {
     // Fallback: any hwmon with a temp1_input that *looks* CPU-ish.
     for entry in &entries {
         let name_file = entry.path().join("name");
-        let Ok(name) = fs::read_to_string(&name_file) else { continue };
+        let Ok(name) = fs::read_to_string(&name_file) else {
+            continue;
+        };
         let n = name.trim();
         if n.contains("cpu") || n.contains("pkg") || n.contains("zenpower") {
             let temp1 = entry.path().join("temp1_input");
@@ -191,11 +209,7 @@ mod tests {
         let stat = tmp.path().join("stat");
         fs::write(&stat, "cpu  100 0 50 1000 0 0 0 0 0 0\n").unwrap();
         let tracker = SystemTracker::default();
-        let s = tracker.sample_from(
-            stat.to_str().unwrap(),
-            "/nonexistent",
-            "/nonexistent",
-        );
+        let s = tracker.sample_from(stat.to_str().unwrap(), "/nonexistent", "/nonexistent");
         assert_eq!(s.cpu_pct, 0.0);
     }
 
@@ -224,7 +238,11 @@ mod tests {
     fn meminfo_parses_used_and_total() {
         let tmp = tempfile::tempdir().unwrap();
         let mem = tmp.path().join("meminfo");
-        fs::write(&mem, "MemTotal:       1000 kB\nMemFree:  100 kB\nMemAvailable:   400 kB\nBuffers: 0 kB\n").unwrap();
+        fs::write(
+            &mem,
+            "MemTotal:       1000 kB\nMemFree:  100 kB\nMemAvailable:   400 kB\nBuffers: 0 kB\n",
+        )
+        .unwrap();
         let tracker = SystemTracker::default();
         let s = tracker.sample_from("/nonexistent", mem.to_str().unwrap(), "/nonexistent");
         assert_eq!(s.ram_total, 1000 * 1024);

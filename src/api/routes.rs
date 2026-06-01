@@ -4,6 +4,8 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::path::Path as StdPath;
+use std::time::Duration;
+use tokio::process::Command;
 
 use crate::config::{AppSettings, BinaryPreset, CacheType, ModelConfig, WeightsFormat};
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
@@ -339,6 +341,31 @@ pub async fn stop_model(
         )
             .into_response(),
     }
+}
+
+pub async fn restart_service() -> impl IntoResponse {
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        match Command::new("systemctl")
+            .args(["--user", "restart", "inference-router.service"])
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                tracing::error!(?status, "failed to restart inference-router.service");
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to spawn systemctl restart");
+            }
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"ok": true, "message": "restart scheduled"})),
+    )
+        .into_response()
 }
 
 // ===== File-browser + GGUF metadata =====

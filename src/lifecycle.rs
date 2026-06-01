@@ -86,6 +86,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         .route("/api/models/{id}", put(update_model).delete(delete_model))
         .route("/api/models/{id}/load", post(load_model))
         .route("/api/models/{id}/stop", post(stop_model))
+        .route("/api/service/restart", post(restart_service))
         .route("/api/files", get(list_files))
         .route("/api/gguf-info", get(gguf_info))
         .route("/api/presets", get(list_presets).post(create_preset))

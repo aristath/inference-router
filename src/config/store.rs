@@ -143,7 +143,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = create_test_store(&dir);
 
-        store.with_mut(|items| items.push(TestItem { id: "a".into(), value: 1 }));
+        store.with_mut(|items| {
+            items.push(TestItem {
+                id: "a".into(),
+                value: 1,
+            })
+        });
         store.save().unwrap();
 
         assert!(dir.path().join("items.json").exists());
@@ -155,8 +160,14 @@ mod tests {
         let path = dir.path().join("items.json");
 
         let items = vec![
-            TestItem { id: "a".into(), value: 1 },
-            TestItem { id: "b".into(), value: 2 },
+            TestItem {
+                id: "a".into(),
+                value: 1,
+            },
+            TestItem {
+                id: "b".into(),
+                value: 2,
+            },
         ];
         let json = serde_json::to_string_pretty(&items).unwrap();
         fs::write(&path, json).unwrap();
@@ -182,7 +193,12 @@ mod tests {
         let path = dir.path().join("items.json");
         let store: JsonStore<Vec<TestItem>> = JsonStore::new(path.clone());
 
-        store.with_mut(|items| items.push(TestItem { id: "x".into(), value: 42 }));
+        store.with_mut(|items| {
+            items.push(TestItem {
+                id: "x".into(),
+                value: 42,
+            })
+        });
         store.save().unwrap();
 
         let store2: JsonStore<Vec<TestItem>> = JsonStore::new(path);
@@ -198,7 +214,12 @@ mod tests {
         let path = dir.path().join("items.json");
         let store: JsonStore<Vec<TestItem>> = JsonStore::new(path.clone());
 
-        store.with_mut(|items| items.push(TestItem { id: "initial".into(), value: 0 }));
+        store.with_mut(|items| {
+            items.push(TestItem {
+                id: "initial".into(),
+                value: 0,
+            })
+        });
         store.save().unwrap();
 
         store.with_mut(|items| items[0].value = 100);
@@ -217,7 +238,12 @@ mod tests {
         let path = dir.path().join("items.json");
         let store: JsonStore<Vec<TestItem>> = JsonStore::new(path.clone());
 
-        store.with_mut(|items| items.push(TestItem { id: "fmt".into(), value: 1 }));
+        store.with_mut(|items| {
+            items.push(TestItem {
+                id: "fmt".into(),
+                value: 1,
+            })
+        });
         store.save().unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();

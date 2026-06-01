@@ -71,7 +71,10 @@ pub fn decide_eviction(
         freed += c.estimated_vram;
     }
     if freed < deficit {
-        debug!(deficit, freed, "not enough candidates to satisfy VRAM deficit");
+        debug!(
+            deficit,
+            freed, "not enough candidates to satisfy VRAM deficit"
+        );
     }
     actions
 }
@@ -128,7 +131,10 @@ mod tests {
         models.insert("run".into(), running("run", 5_000_000_000, 100.0));
         let idle_models = HashSet::from(["run".to_string()]);
         let actions = decide_eviction(&models, 4_000_000_000, 10_000_000_000, &idle_models);
-        let ids: Vec<&str> = actions.iter().map(|EvictionAction::Evict(id)| id.as_str()).collect();
+        let ids: Vec<&str> = actions
+            .iter()
+            .map(|EvictionAction::Evict(id)| id.as_str())
+            .collect();
         assert_eq!(ids, vec!["run"]);
     }
 
@@ -143,7 +149,10 @@ mod tests {
         models.insert("unknown".into(), unknown);
         let idle = HashSet::from(["unknown".to_string()]);
         let actions = decide_eviction(&models, 1_000_000_000, 10_000_000_000, &idle);
-        assert!(actions.is_empty(), "must not evict model with unknown VRAM: {actions:?}");
+        assert!(
+            actions.is_empty(),
+            "must not evict model with unknown VRAM: {actions:?}"
+        );
     }
 
     #[test]

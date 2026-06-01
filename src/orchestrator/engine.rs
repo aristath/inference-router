@@ -2,20 +2,20 @@ use crate::config::{
     AppSettings, BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat,
 };
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
-use crate::orchestrator::eviction::{EvictionAction, decide_eviction};
+use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
 use crate::system::stats::{SystemStats, SystemTracker};
 use crate::vram::estimator::VramEstimate;
 use crate::vram::tracker::{GpuInfo, VRAMTracker};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
-pub const DEFAULT_MAX_INSTANCES_PER_MODEL: usize = 1;
+pub const DEFAULT_MAX_INSTANCES_PER_MODEL: usize = usize::MAX;
 pub const DEFAULT_VRAM_WAIT_MS: u64 = 300_000;
 const MAX_EVENTS: usize = 200;
 
@@ -426,8 +426,7 @@ impl Orchestrator {
     ///
     /// Fast path: if an idle instance already exists, returns immediately.
     /// Scale-up path: if all instances are busy and VRAM permits, a new
-    /// instance is spawned in the background; the current request is served
-    /// by an existing (busy) instance — no cold-start penalty.
+    /// instance is spawned and returned for the current request.
     /// First-spawn path: serialized via a per-model load_guard so concurrent
     /// callers collapse into one spawn. The work runs in a detached task so
     /// caller cancellation (client disconnect) can't leave the model stuck
@@ -439,33 +438,9 @@ impl Orchestrator {
         }
 
         // All instances busy (or none). Check if instances exist at all.
-        let (instance_count, total_instance_count) = {
-            let pm = self.process_manager.lock().await;
-            (pm.instance_count(id), pm.total_instance_count(id))
-        };
+        let instance_count = self.process_manager.lock().await.instance_count(id);
         if instance_count > 0 {
-            let (estimated_vram, free_vram, model_exists) = {
-                let data = self.data.lock().await;
-                let m = data.models.get(id);
-                let est = m.map(|m| m.estimated_vram).unwrap_or(0);
-                let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-                let adjusted = subtract_reserved_from_gpus(data.gpus.clone(), already_reserved);
-                let free: u64 = adjusted.iter().map(|g| g.free_vram()).sum();
-                (est, free, m.is_some())
-            };
-            if !model_exists {
-                return Err(LoadError::ModelNotFound(id.into()));
-            }
-            if total_instance_count < self.max_instances_per_model
-                && estimated_vram > 0
-                && free_vram >= estimated_vram
-            {
-                // Kick off a background spawn; serve this request on an existing instance.
-                let me = self.clone();
-                let id_owned = id.to_string();
-                tokio::spawn(async move { me.spawn_additional_instance(&id_owned).await });
-            }
-            if let Some(guard) = self.process_manager.lock().await.acquire_any_instance(id) {
+            if let Some(guard) = self.scale_or_reuse_busy_instance(id, false).await? {
                 return Ok(guard);
             }
             // Instance pool drained between our checks (all died) — fall through to spawn.
@@ -486,15 +461,18 @@ impl Orchestrator {
             let _lock = load_guard.lock().await;
 
             // Re-check after acquiring the lock — another task may have spawned already.
-            // If that instance is already serving the request that started it, reuse it
-            // instead of spawning a duplicate backend while max_instances_per_model is 1.
             if let Some(g) = me
                 .process_manager
                 .lock()
                 .await
-                .acquire_any_instance(&id_owned)
+                .acquire_idle_instance(&id_owned)
             {
                 return Ok(g);
+            }
+            if me.process_manager.lock().await.instance_count(&id_owned) > 0 {
+                if let Some(g) = me.scale_or_reuse_busy_instance(&id_owned, true).await? {
+                    return Ok(g);
+                }
             }
 
             {
@@ -559,6 +537,42 @@ impl Orchestrator {
                 ))
             }
         }
+    }
+
+    async fn scale_or_reuse_busy_instance(
+        &self,
+        id: &str,
+        after_initial_load: bool,
+    ) -> Result<Option<RequestGuard>, LoadError> {
+        match self.try_spawn_additional_instance(id).await {
+            Ok(Some(guard)) => return Ok(Some(guard)),
+            Ok(None) => {}
+            Err(e) if is_configuration_load_error(&e) => {
+                return Err(e);
+            }
+            Err(e) => {
+                if after_initial_load {
+                    warn!(
+                        model = id,
+                        error = %e,
+                        "failed to spawn additional instance after initial load; reusing existing busy instance",
+                    );
+                } else {
+                    warn!(
+                        model = id,
+                        error = %e,
+                        "failed to spawn additional instance; reusing existing busy instance",
+                    );
+                }
+                self.record_event(
+                    "warn",
+                    format!("failed to scale {id}: {e}; reusing busy instance"),
+                )
+                .await;
+            }
+        }
+
+        Ok(self.process_manager.lock().await.acquire_any_instance(id))
     }
 
     /// Inner load path.
@@ -820,22 +834,28 @@ impl Orchestrator {
         }
     }
 
-    /// Spawn an additional instance of `id` in the background. Called when all
-    /// existing instances are busy and VRAM headroom permits a new one.
-    /// Serialized via the admission lock; aborts silently if an idle instance
-    /// appears by the time admission is acquired (another spawn beat us to it).
-    async fn spawn_additional_instance(&self, id: &str) {
+    /// Try to spawn an additional instance for the request that triggered
+    /// scale-out. Returns `Ok(None)` when scaling is not currently possible
+    /// (cap reached, no estimate, or insufficient free VRAM) so the caller can
+    /// fall back to an existing busy instance.
+    ///
+    /// Serialized via the admission lock; if an idle instance appears by the
+    /// time admission is acquired, that idle instance is returned instead.
+    async fn try_spawn_additional_instance(
+        &self,
+        id: &str,
+    ) -> Result<Option<RequestGuard>, LoadError> {
         let (mut pending, pid, port, vram_reservation) = {
             let _admit = self.admission.lock().await;
 
             // Re-check: did an idle instance appear while we waited?
-            if !self.process_manager.lock().await.all_busy(id) {
-                return;
+            if let Some(guard) = self.process_manager.lock().await.acquire_idle_instance(id) {
+                return Ok(Some(guard));
             }
             if self.process_manager.lock().await.total_instance_count(id)
                 >= self.max_instances_per_model
             {
-                return;
+                return Ok(None);
             }
 
             let gpus = self.vram_tracker.refresh();
@@ -845,28 +865,30 @@ impl Orchestrator {
 
             let (mut model, mut draft) = {
                 let data = self.data.lock().await;
-                let m = match data.models.get(id) {
-                    Some(m) => m.clone(),
-                    None => return,
-                };
+                let m = data
+                    .models
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| LoadError::ModelNotFound(id.into()))?;
                 let mut model = m;
                 if let Some(ref preset_id) = model.binary_preset {
                     match data.presets.get(preset_id) {
                         Some(p) => model.binary = p.binary.clone(),
-                        None => {
-                            warn!(
-                                model = id,
-                                preset = preset_id,
-                                "preset not found for extra instance"
-                            );
-                            return;
-                        }
+                        None => return Err(LoadError::PresetNotFound(preset_id.clone())),
                     }
                 }
-                let draft = model
-                    .draft_model_id
-                    .as_ref()
-                    .and_then(|did| data.models.get(did).cloned());
+                let draft =
+                    if let Some(ref did) = model.draft_model_id {
+                        let d = data.models.get(did).cloned().ok_or_else(|| {
+                            LoadError::DraftNotFound {
+                                id: did.clone(),
+                                target: id.into(),
+                            }
+                        })?;
+                        Some(d)
+                    } else {
+                        None
+                    };
                 (model, draft)
             };
             normalize_model_device_for_llama(&mut model, &gpus);
@@ -881,7 +903,7 @@ impl Orchestrator {
             );
             let free: u64 = adjusted_gpus.iter().map(|g| g.free_vram()).sum();
             if model.estimated_vram == 0 || free < model.estimated_vram {
-                return;
+                return Ok(None);
             }
 
             if model.weights_format == WeightsFormat::Gguf
@@ -892,7 +914,7 @@ impl Orchestrator {
                     model.tensor_split = Some(split);
                 } else if model.tensor_split.is_some() {
                     model.tensor_split = None;
-                    return;
+                    return Ok(None);
                 }
             }
 
@@ -904,8 +926,7 @@ impl Orchestrator {
             {
                 Ok(p) => p,
                 Err(e) => {
-                    warn!(model = id, error = %e, "failed to spawn extra instance");
-                    return;
+                    return Err(LoadError::SpawnFailed(e));
                 }
             };
             let pid = pending.pid;
@@ -933,12 +954,20 @@ impl Orchestrator {
                     self.reserved_vram
                         .fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
                 }
-                // Drop the guard immediately — no user request is attached.
-                drop(self.process_manager.lock().await.register(pending));
+                let guard = self.process_manager.lock().await.register(pending);
+                {
+                    let mut data = self.data.lock().await;
+                    if let Some(m) = data.models.get_mut(id) {
+                        m.state = ModelState::Running;
+                        m.pid = Some(pid);
+                        m.last_used = Some(unix_now());
+                    }
+                }
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "extra instance ready");
                 self.record_event("info", format!("extra {id} instance ready on port {port}"))
                     .await;
+                Ok(Some(guard))
             }
             Err(e) => {
                 if vram_reservation > 0 {
@@ -952,6 +981,9 @@ impl Orchestrator {
                     format!("extra {id} instance failed health check: {e}"),
                 )
                 .await;
+                Err(LoadError::SpawnFailed(
+                    crate::process::manager::SpawnError::HealthCheckFailed(e),
+                ))
             }
         }
     }
@@ -1393,6 +1425,15 @@ fn bytes_to_gib(bytes: u64) -> f64 {
     bytes as f64 / 1_073_741_824.0
 }
 
+fn is_configuration_load_error(e: &LoadError) -> bool {
+    matches!(
+        e,
+        LoadError::ModelNotFound(_)
+            | LoadError::PresetNotFound(_)
+            | LoadError::DraftNotFound { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1417,6 +1458,11 @@ mod tests {
             model_path: PathBuf::from("/tmp/m.gguf"),
             ..ModelConfig::default()
         }
+    }
+
+    #[test]
+    fn default_instance_cap_is_vram_limited() {
+        assert_eq!(DEFAULT_MAX_INSTANCES_PER_MODEL, usize::MAX);
     }
 
     fn gpu(id: &str, pci: &str, vulkan_index: usize) -> GpuInfo {

@@ -134,7 +134,13 @@ impl ProcessManager {
             let _ = kv_tx.send(total_kv_bytes);
         });
 
-        Ok(PendingChild { pid, port, model_id: model.id.clone(), child, kv_bytes_rx: kv_rx })
+        Ok(PendingChild {
+            pid,
+            port,
+            model_id: model.id.clone(),
+            child,
+            kv_bytes_rx: kv_rx,
+        })
     }
 
     /// Install a healthy child into the running table. Returns a `RequestGuard`
@@ -143,17 +149,27 @@ impl ProcessManager {
         let active = Arc::new(AtomicUsize::new(1));
         let port = pending.port;
         self.release_pending(&pending.model_id, pending.port);
-        self.instances.entry(pending.model_id.clone()).or_default().push(InstanceInfo {
-            pid: pending.pid,
+        self.instances
+            .entry(pending.model_id.clone())
+            .or_default()
+            .push(InstanceInfo {
+                pid: pending.pid,
+                port,
+                active: active.clone(),
+            });
+        self.running.insert(
+            pending.pid,
+            RunningChild {
+                port,
+                model_id: pending.model_id,
+                child: pending.child,
+            },
+        );
+        RequestGuard {
             port,
-            active: active.clone(),
-        });
-        self.running.insert(pending.pid, RunningChild {
-            port,
-            model_id: pending.model_id,
-            child: pending.child,
-        });
-        RequestGuard { port, active, request_done: self.request_done.clone() }
+            active,
+            request_done: self.request_done.clone(),
+        }
     }
 
     /// Drop tracking for a pending child that failed health checks. Consuming
@@ -179,13 +195,17 @@ impl ProcessManager {
         None
     }
 
-    /// Find any instance — idle first, then any busy one. Returns `None` only
-    /// if there are no instances at all.
+    /// Find any instance — idle first, then the least-busy live instance.
+    /// Returns `None` only if there are no instances at all.
     pub fn acquire_any_instance(&self, model_id: &str) -> Option<RequestGuard> {
         if let Some(g) = self.acquire_idle_instance(model_id) {
             return Some(g);
         }
-        let inst = self.instances.get(model_id)?.first()?;
+        let inst = self
+            .instances
+            .get(model_id)?
+            .iter()
+            .min_by_key(|inst| inst.active.load(Ordering::Relaxed))?;
         inst.active.fetch_add(1, Ordering::Relaxed);
         Some(RequestGuard {
             port: inst.port,
@@ -201,8 +221,7 @@ impl ProcessManager {
 
     /// Number of live plus health-checking instances for a model.
     pub fn total_instance_count(&self, model_id: &str) -> usize {
-        self.instance_count(model_id)
-            + self.pending_instances.get(model_id).copied().unwrap_or(0)
+        self.instance_count(model_id) + self.pending_instances.get(model_id).copied().unwrap_or(0)
     }
 
     pub fn has_active_requests(&self) -> bool {
@@ -219,15 +238,17 @@ impl ProcessManager {
     pub fn model_runtimes(&self) -> HashMap<String, ModelRuntime> {
         let mut runtimes = HashMap::new();
         for (model_id, insts) in &self.instances {
-            let entry = runtimes.entry(model_id.clone()).or_insert_with(ModelRuntime::default);
+            let entry = runtimes
+                .entry(model_id.clone())
+                .or_insert_with(ModelRuntime::default);
             entry.instances = insts.len();
-            entry.active = insts
-                .iter()
-                .map(|i| i.active.load(Ordering::Relaxed))
-                .sum();
+            entry.active = insts.iter().map(|i| i.active.load(Ordering::Relaxed)).sum();
         }
         for (model_id, pending) in &self.pending_instances {
-            runtimes.entry(model_id.clone()).or_insert_with(ModelRuntime::default).pending = *pending;
+            runtimes
+                .entry(model_id.clone())
+                .or_insert_with(ModelRuntime::default)
+                .pending = *pending;
         }
         runtimes
     }
@@ -240,22 +261,10 @@ impl ProcessManager {
         self.instances
             .iter()
             .filter(|(_, insts)| {
-                !insts.is_empty()
-                    && insts
-                        .iter()
-                        .all(|i| i.active.load(Ordering::Relaxed) == 0)
+                !insts.is_empty() && insts.iter().all(|i| i.active.load(Ordering::Relaxed) == 0)
             })
             .map(|(id, _)| id.clone())
             .collect()
-    }
-
-    /// True when every instance for the model has active > 0 (or none exist).
-    pub fn all_busy(&self, model_id: &str) -> bool {
-        match self.instances.get(model_id) {
-            None => true,
-            Some(v) if v.is_empty() => true,
-            Some(v) => v.iter().all(|i| i.active.load(Ordering::Relaxed) > 0),
-        }
     }
 
     /// Returns (model_id, pid) for every instance whose process has died.
@@ -273,14 +282,18 @@ impl ProcessManager {
 
     /// Returns all pids for instances of `model_id` (used by stop_model_inner).
     pub fn pids_for_model(&self, model_id: &str) -> Vec<i32> {
-        self.instances.get(model_id)
+        self.instances
+            .get(model_id)
             .map(|v| v.iter().map(|i| i.pid).collect())
             .unwrap_or_default()
     }
 
     pub async fn stop(&mut self, pid: i32) {
         let Some(rc) = self.running.remove(&pid) else {
-            warn!(pid, "stopping process not in running table; skipping signal");
+            warn!(
+                pid,
+                "stopping process not in running table; skipping signal"
+            );
             return;
         };
         self.remove_instance(&rc.model_id, pid);
@@ -291,14 +304,20 @@ impl ProcessManager {
             warn!(pid, "process didn't exit after SIGTERM, sending SIGKILL");
             let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGKILL);
         }
-        info!(pid, port = rc.port, model = rc.model_id, "inference server stopped");
+        info!(
+            pid,
+            port = rc.port,
+            model = rc.model_id,
+            "inference server stopped"
+        );
     }
 
     pub fn forget(&mut self, pid: i32) {
         let model_id = self.running.remove(&pid).map(|rc| rc.model_id).or_else(|| {
             // Not in running (e.g. test instances or already-reaped processes):
             // search the instances map by pid so we can still clean up.
-            self.instances.iter()
+            self.instances
+                .iter()
                 .find(|(_, insts)| insts.iter().any(|i| i.pid == pid))
                 .map(|(id, _)| id.clone())
         });
@@ -332,11 +351,10 @@ impl ProcessManager {
     #[allow(dead_code)]
     pub fn register_test_instance(&mut self, model_id: &str, pid: i32, port: u16) {
         let active = Arc::new(AtomicUsize::new(0));
-        self.instances.entry(model_id.into()).or_default().push(InstanceInfo {
-            pid,
-            port,
-            active,
-        });
+        self.instances
+            .entry(model_id.into())
+            .or_default()
+            .push(InstanceInfo { pid, port, active });
     }
 
     /// Convenience wrapper for integration tests (pid is irrelevant there).
@@ -355,19 +373,20 @@ impl ProcessManager {
 impl PendingChild {
     pub async fn wait_for_health(&mut self, timeout: Duration) -> Result<u64, HealthCheckError> {
         wait_for_health_or_exit(&mut self.child, self.port, timeout).await?;
-        let kv_bytes = tokio::time::timeout(
-            Duration::from_millis(200),
-            &mut self.kv_bytes_rx,
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or(0);
+        let kv_bytes = tokio::time::timeout(Duration::from_millis(200), &mut self.kv_bytes_rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
         Ok(kv_bytes)
     }
 }
 
-pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port: u16) -> Vec<String> {
+pub fn build_command_args(
+    model: &ModelConfig,
+    draft: Option<&ModelConfig>,
+    port: u16,
+) -> Vec<String> {
     let mut args = Vec::new();
     match model.weights_format {
         WeightsFormat::Gguf => {
@@ -393,7 +412,11 @@ pub fn build_command_args(model: &ModelConfig, draft: Option<&ModelConfig>, port
             args.push(model.repeat_penalty.to_string());
 
             args.push("--flash-attn".into());
-            args.push(if model.flash_attn { "on".into() } else { "off".into() });
+            args.push(if model.flash_attn {
+                "on".into()
+            } else {
+                "off".into()
+            });
             if let Some(n) = model.n_gpu_layers {
                 args.push("-ngl".into());
                 args.push(n.to_string());
@@ -540,11 +563,17 @@ async fn wait_for_health_or_exit(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return Err(HealthCheckError::ChildExited(status.code(), status.to_string()));
+                return Err(HealthCheckError::ChildExited(
+                    status.code(),
+                    status.to_string(),
+                ));
             }
             Ok(None) => {}
             Err(e) => {
-                return Err(HealthCheckError::ChildExited(None, format!("try_wait: {e}")));
+                return Err(HealthCheckError::ChildExited(
+                    None,
+                    format!("try_wait: {e}"),
+                ));
             }
         }
 
@@ -558,7 +587,11 @@ async fn wait_for_health_or_exit(
                 return Ok(());
             }
             Ok(response) => {
-                debug!(port, status = response.status().as_u16(), "health non-2xx, retrying");
+                debug!(
+                    port,
+                    status = response.status().as_u16(),
+                    "health non-2xx, retrying"
+                );
             }
             Err(e) => {
                 debug!(port, error = %e, "health connect failed, retrying");
@@ -702,15 +735,24 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-m", "/models/m.gguf",
-                "-c", "4096",
-                "--port", "9001",
-                "--temp", "0.6",
-                "--top-p", "0.95",
-                "--top-k", "40",
-                "--presence-penalty", "0",
-                "--repeat-penalty", "1",
-                "--flash-attn", "off",
+                "-m",
+                "/models/m.gguf",
+                "-c",
+                "4096",
+                "--port",
+                "9001",
+                "--temp",
+                "0.6",
+                "--top-p",
+                "0.95",
+                "--top-k",
+                "40",
+                "--presence-penalty",
+                "0",
+                "--repeat-penalty",
+                "1",
+                "--flash-attn",
+                "off",
             ],
         );
     }
@@ -738,9 +780,12 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "--model", "/models/m-safetensors",
-                "--port", "9001",
-                "--max-model-len", "4096",
+                "--model",
+                "/models/m-safetensors",
+                "--port",
+                "9001",
+                "--max-model-len",
+                "4096",
             ],
         );
     }
@@ -778,7 +823,9 @@ mod tests {
     fn gguf_argv_emits_flash_attn_off_when_disabled() {
         let args = build_command_args(&gguf_model(), None, 9001);
         assert_eq!(
-            args.windows(2).find(|w| w[0] == "--flash-attn").map(|w| w[1].as_str()),
+            args.windows(2)
+                .find(|w| w[0] == "--flash-attn")
+                .map(|w| w[1].as_str()),
             Some("off"),
         );
     }
@@ -824,7 +871,10 @@ mod tests {
         assert!(joined.contains("--cache-ram 0"), "{joined}");
         assert!(joined.contains("--reasoning-format deepseek"), "{joined}");
         assert!(joined.contains("--reasoning-budget 0"), "{joined}");
-        assert!(joined.contains(r#"--chat-template-kwargs {"enable_thinking":false}"#), "{joined}");
+        assert!(
+            joined.contains(r#"--chat-template-kwargs {"enable_thinking":false}"#),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -844,7 +894,10 @@ mod tests {
         m.reasoning_format = Some(ReasoningFormat::DeepseekLegacy);
         let args = build_command_args(&m, None, 9001);
         let joined = args.join(" ");
-        assert!(joined.contains("--reasoning-format deepseek-legacy"), "{joined}");
+        assert!(
+            joined.contains("--reasoning-format deepseek-legacy"),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -914,7 +967,9 @@ mod tests {
     }
 
     fn find_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-        args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
+        args.windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
     }
 
     #[test]
@@ -1026,6 +1081,27 @@ mod tests {
 
         assert_eq!(pm.instance_count("m"), 1);
         assert_eq!(pm.total_instance_count("m"), 2);
+    }
+
+    #[test]
+    fn acquire_any_instance_picks_idle_then_least_busy() {
+        let mut pm = ProcessManager::default();
+        pm.register_test_instance("m", 123, 9001);
+        pm.register_test_instance("m", 124, 9002);
+
+        let g1 = pm.acquire_any_instance("m").unwrap();
+        assert_eq!(g1.port, 9001);
+
+        let g2 = pm.acquire_any_instance("m").unwrap();
+        assert_eq!(g2.port, 9002);
+
+        let g3 = pm.acquire_any_instance("m").unwrap();
+        assert_eq!(g3.port, 9001);
+
+        let g4 = pm.acquire_any_instance("m").unwrap();
+        assert_eq!(g4.port, 9002);
+
+        drop((g1, g2, g3, g4));
     }
 
     #[test]
