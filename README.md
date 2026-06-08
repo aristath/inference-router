@@ -132,4 +132,178 @@ tests/              integration tests
 ## Hardware / scope
 
 - **Target:** single workstation, 3x AMD Radeon AI PRO R9700, llama.cpp Vulkan and ROCm builds.
+
+## Examples
+
+### 1. Creating a Basic Model
+
+```bash
+# Create a model using the dashboard or API
+curl -X POST http://localhost:8080/api/models \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "mistral-7b",
+    "name": "Mistral 7B",
+    "binary": "/path/to/llama-server",
+    "model_path": "/path/to/mistral-7b-v0.1.Q4_K_M.gguf",
+    "weights_format": "gguf",
+    "context": 4096,
+    "n_gpu_layers": 32
+  }'
+```
+
+### 2. Using Speculative Decoding
+
+```bash
+# Create a draft model first
+curl -X POST http://localhost:8080/api/models \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "tiny-draft",
+    "name": "Tiny Draft Model",
+    "binary": "/path/to/llama-server",
+    "model_path": "/path/to/tiny-model.gguf",
+    "weights_format": "gguf",
+    "context": 2048
+  }'
+
+# Then create a target model that uses it for speculative decoding
+curl -X POST http://localhost:8080/api/models \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "speculative-model",
+    "name": "Speculative Model",
+    "binary": "/path/to/llama-server",
+    "model_path": "/path/to/large-model.gguf",
+    "weights_format": "gguf",
+    "context": 4096,
+    "draft_model_id": "tiny-draft",
+    "draft_max": 5,
+    "draft_min": 2
+  }'
+```
+
+### 3. Using Vision Models
+
+```bash
+# Create a vision model with mmproj file
+curl -X POST http://localhost:8080/api/models \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "llava-1.5",
+    "name": "LLaVA 1.5",
+    "binary": "/path/to/llama-server",
+    "model_path": "/path/to/llava-1.5.Q4_K_M.gguf",
+    "mmproj_path": "/path/to/mmproj-model-f16.gguf",
+    "weights_format": "gguf",
+    "context": 2048
+  }'
+
+# Use with image input (via OpenAI API)
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llava-1.5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "What is in this image?"},
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ..."
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+### 4. Using the OpenAI-Compatible API
+
+```bash
+# Standard chat completion
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistral-7b",
+    "messages": [
+      {"role": "user", "content": "Hello!"}
+    ]
+  }'
+
+# Streaming response
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistral-7b",
+    "messages": [
+      {"role": "user", "content": "Tell me a story"}
+    ],
+    "stream": true
+  }'
+```
+
+## API Reference
+
+### Management API (`/api/*`)
+
+#### `GET /api/status`
+Returns complete system status including:
+- CPU/RAM usage and temperature
+- GPU metrics (VRAM, utilization, temperature)
+- All model configurations and runtime states
+- Recent orchestrator events
+
+**Response:** `StatusResponse` (see [src/api/state.rs](#))
+
+#### Model Management
+- `GET /api/models` — List all models
+- `POST /api/models` — Create a new model
+- `POST /api/models/validate` — Validate a model config
+- `PUT /api/models/{id}` — Update a model
+- `DELETE /api/models/{id}` — Delete a model
+- `POST /api/models/{id}/load` — Load a model
+- `POST /api/models/{id}/stop` — Stop a model
+
+**Request/Response:** `ModelConfig` (see [src/config/model.rs](#))
+
+#### Preset Management
+- `GET /api/presets` — List all binary presets
+- `POST /api/presets` — Create a new preset
+- `PUT /api/presets/{id}` — Update a preset
+- `DELETE /api/presets/{id}` — Delete a preset
+
+**Request/Response:** `BinaryPreset` (see [src/config/preset.rs](#))
+
+#### Settings
+- `GET /api/settings` — Get current settings
+- `PUT /api/settings` — Update settings
+
+**Request/Response:** `AppSettings` (see [src/config/settings.rs](#))
+
+### OpenAI-Compatible Proxy (`/v1/*`)
+
+#### `GET /v1/models`
+Returns a synthesized model list in OpenAI format.
+
+#### `POST /v1/{endpoint}`
+Proxies requests to the appropriate backend based on the `model` field.
+
+- Supports all OpenAI endpoints (`/chat/completions`, `/completions`, etc.)
+- Preserves streaming responses
+- Applies loop guard corrections when enabled
+
+### Utility Endpoints
+
+#### `GET /api/files?path={path}`
+Directory browser for model configuration forms.
+
+#### `GET /api/gguf-info?path={path}`
+Reads and returns GGUF metadata from a model file.
+
+#### `GET /healthz`
+Liveness check (returns "ok").
 - **Not a goal:** multi-host, multi-user, auth, quotas, CUDA.

@@ -1,6 +1,4 @@
-use crate::config::{
-    AppSettings, BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat,
-};
+use crate::config::{AppSettings, BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat};
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
@@ -247,7 +245,8 @@ impl Orchestrator {
     // ----- App settings -----
 
     pub async fn settings(&self) -> AppSettings {
-        self.settings.lock().await.clone()
+        let settings: AppSettings = self.settings.lock().await.clone();
+        settings
     }
 
     pub async fn update_settings(&self, settings: AppSettings) {
@@ -1108,9 +1107,9 @@ impl Orchestrator {
         }
 
         if self.settings_dirty.swap(false, Ordering::Relaxed) {
-            if let Some(store) = self.settings_store.clone() {
-                let snapshot = self.settings.lock().await.clone();
-                store.replace(snapshot);
+        if let Some(store) = self.settings_store.clone() {
+            let snapshot: AppSettings = self.settings.lock().await.clone();
+            store.replace(snapshot);
                 match tokio::task::spawn_blocking(move || store.save()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {

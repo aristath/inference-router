@@ -27,10 +27,16 @@ pub async fn update_settings(
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
+/// Response from model validation endpoint (`/api/models/validate`).
+/// 
+/// Returned when validating a model configuration before saving.
 #[derive(Serialize)]
 struct ValidationResponse {
+    /// Whether the configuration is valid
     valid: bool,
+    /// Validation errors (empty if valid)
     errors: Vec<String>,
+    /// Non-blocking warnings
     warnings: Vec<String>,
 }
 
@@ -79,8 +85,21 @@ pub async fn validate_model(
         .into_response()
 }
 
-/// Convert the orchestrator's mutation errors into an HTTP response. Used by
-/// every create/update/delete handler so the mapping lives in one place.
+/// Converts mutation errors into appropriate HTTP responses.
+/// 
+/// # Purpose
+/// Centralizes error handling for all CRUD operations to ensure consistent
+/// error responses across the API.
+/// 
+/// # Error Mapping
+/// | Error Type | HTTP Status | Response Body |
+/// |------------|-------------|----------------|
+/// | NotFound   | 404          | {"error": "'id' not found"} |
+/// | Conflict   | 409          | {"error": "'id' already exists"} |
+/// | InvalidConfig | 422      | {"error": "validation message"} |
+/// 
+/// # Used by
+/// All model/preset create/update/delete handlers
 fn mutation_response(e: MutationError) -> axum::response::Response {
     match e {
         MutationError::NotFound(id) => (

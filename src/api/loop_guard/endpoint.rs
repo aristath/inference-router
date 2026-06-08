@@ -1,10 +1,48 @@
+//! # Endpoint-Specific Handling
+//!
+//! Adapts the loop guard system to different upstream API formats:
+//! - OpenAI chat/completions
+//! - OpenAI legacy completions
+//! - llama.cpp's native `/completion` endpoint
+//!
+//! Each variant knows how to:
+//! 1. Parse streaming chunks into choice deltas
+//! 2. Detect when a response is complete
+//! 3. Format halt messages
+//! 4. Inject corrective prompts
+//!
+//! ## Key Differences
+//! | Endpoint          | Chunk Format       | Delta Field | Done Marker       |
+//! |-------------------|--------------------|-------------|-------------------|
+//! | chat/completions  | SSE (data: ...)    | delta       | [DONE]            |
+//! | completions       | SSE (data: ...)    | text        | [DONE]            |
+//! | llama.cpp          | SSE (data: ...)    | content     | stop: true        |
+
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
 use super::sse::{self, ChoiceDelta};
 
-/// Describes how to handle one upstream API style.
+/// Adapter for endpoint-specific streaming formats.
+/// 
+/// # Responsibilities
+/// 1. Parses streaming chunks into choice deltas
+/// 2. Detects when a response is complete
+/// 3. Formats halt messages for loop detection
+/// 4. Injects corrective prompts when loops are detected
+/// 
+/// # Supported Endpoints
+/// - OpenAI chat/completions (SSE with `delta` field)
+/// - OpenAI legacy completions (SSE with `text` field)
+/// - llama.cpp native `/completion` (SSE with `content` field)
+/// 
+/// # Key Methods
+/// - `detect()`: Identifies endpoint from path
+/// - `parse_chunk()`: Extracts choice deltas from chunk bytes
+/// - `is_done()`: Checks if response is complete
+/// - `format_halt_delta()`: Creates loop detection message
+/// - `inject_corrective()`: Adds corrective prompt to request
 #[derive(Debug, Clone, Copy)]
 pub(super) enum EndpointKind {
     Chat,

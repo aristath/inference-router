@@ -1,8 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// Global application settings.
+/// 
+/// Configured via environment variables or the dashboard Settings modal.
+/// Changes are persisted to `~/.config/inference-router/settings.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
+    /// Loop guard configuration for both streaming and tool loops
     pub loop_guards: LoopGuardSettings,
 }
 
@@ -19,10 +24,13 @@ impl AppSettings {
     }
 }
 
+/// Configuration for both streaming and cross-turn tool loop guards.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoopGuardSettings {
+    /// Streaming response loop detection (SSE chunks)
     pub streaming: StreamingLoopSettings,
+    /// Cross-turn tool call cycle detection
     pub tool: ToolLoopSettings,
 }
 
@@ -40,24 +48,39 @@ impl LoopGuardSettings {
     }
 }
 
+/// Action to take when a streaming loop is detected.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamingLoopAction {
+    /// Replay partial output and inject a corrective prompt (default)
     #[default]
     Heal,
+    /// Abort the stream with an error message
     Abort,
+    /// Log the detection but allow streaming to continue
     Log,
 }
 
+/// Configuration for streaming response loop detection.
+/// 
+/// Monitors SSE chunks for repeated text patterns using a sliding window.
+/// When a loop is detected, takes the configured action (heal, abort, or log).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StreamingLoopSettings {
+    /// Enable/disable streaming loop detection
     pub enabled: bool,
+    /// Size of the sliding window in bytes
     pub window_bytes: usize,
+    /// Minimum number of repeats to trigger detection
     pub repeats: usize,
+    /// How often to check for loops (milliseconds)
     pub check_interval_ms: u64,
+    /// Maximum number of retry attempts when healing
     pub max_retries: usize,
+    /// Action to take when a loop is detected
     pub action: StreamingLoopAction,
+    /// Whether to replay partial output before corrective prompt
     pub replay_partial: bool,
 }
 
@@ -115,11 +138,18 @@ impl StreamingLoopSettings {
     }
 }
 
+/// Configuration for cross-turn tool loop detection.
+/// 
+/// Analyzes message history for repeating tool call sequences.
+/// When detected, injects a corrective user message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolLoopSettings {
+    /// Enable/disable tool loop detection
     pub enabled: bool,
+    /// Minimum number of repeats to trigger detection
     pub repeats: usize,
+    /// Number of recent messages to analyze
     pub window_messages: usize,
 }
 

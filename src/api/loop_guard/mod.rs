@@ -1,3 +1,28 @@
+//! # Loop Guard System
+//!
+//! Detects and corrects infinite generation loops in streaming responses and cross-turn tool
+//! cycles. The system has two independent subsystems:
+//!
+//! 1. **Streaming Loop Guard** — Monitors SSE chunks for repeated text patterns in real-time.
+//!    - Uses a Z-function based tandem repeat detector with configurable window size
+//!    - Can heal (replay partial output + inject corrective prompt), abort, or just log
+//!    - Supports OpenAI-style chat/completions and llama.cpp's native `/completion` endpoints
+//!
+//! 2. **Cross-Turn Tool Loop Guard** — Detects repeated tool call sequences across multiple
+//!    turns in chat histories.
+//!    - Analyzes the last N messages for repeating tool → result → tool patterns
+//!    - Injects a corrective user message when detected
+//!    - Handles both OpenAI tool_calls and legacy function_call formats
+//!
+//! Both systems are opt-in via `AppSettings` and can be configured independently.
+//!
+//! ## Key Components
+//! - `StreamSession`: Manages a single streaming request with loop detection
+//! - `cross_turn`: Detects tool cycles in message histories
+//! - `detector`: Z-function based repeat detection algorithm
+//! - `sse`: Parses streaming chunks from OpenAI/llama.cpp formats
+//! - `endpoint`: Handles endpoint-specific payload formats and corrective injection
+
 mod cross_turn;
 mod detector;
 mod endpoint;

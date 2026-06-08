@@ -1,3 +1,36 @@
+//! # Cross-Turn Tool Loop Guard
+//!
+//! Detects and interrupts infinite tool call cycles across multiple conversation turns.
+//! Works by analyzing the last N messages for repeating patterns of:
+//!
+//! ```text
+//! assistant: [tool_call] → tool: [result] → assistant: [same tool_call] → tool: [same result] → ...
+//! ```
+//!
+//! ## Algorithm
+//! 1. Collects tool calls and their results from the last `window_messages`
+//! 2. Looks for the longest suffix that repeats at least `repeats` times
+//! 3. Injects a corrective user message when detected, listing:
+//!    - The repeating tool sequence
+//!    - The number of repetitions
+//!    - The last tool result(s)
+//!
+//! ## Supported Formats
+//! - OpenAI tool_calls (with tool_call_id)
+//! - Legacy function_call format
+//! - Mixed tool/function usage
+//!
+//! ## Example
+//! If the assistant calls `edit_file` three times with identical arguments and gets
+//! "no changes" each time, the guard injects:
+//!
+//! ```json
+//! {
+//!   "role": "user",
+//!   "content": "[INTERRUPT] The recent conversation repeated edit_file 3 times...
+//! }
+//! ```
+
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
