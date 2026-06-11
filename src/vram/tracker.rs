@@ -141,14 +141,32 @@ impl VRAMTracker {
 }
 
 fn append_nvidia_gpus(gpus: &mut Vec<GpuInfo>) {
-    for gpu in nvidia_smi_gpus() {
+    let vulkan = vulkan_devices_by_pci();
+    for mut gpu in nvidia_smi_gpus() {
         if gpu.pci_bus_id.as_deref().is_some_and(|pci| {
             gpus.iter()
                 .any(|existing| existing.pci_bus_id.as_deref() == Some(pci))
         }) {
             continue;
         }
+        merge_vulkan_identity(&mut gpu, vulkan);
         gpus.push(gpu);
+    }
+}
+
+/// Give an NVIDIA GPU (enumerated via `nvidia-smi`) its Vulkan identity too,
+/// when the same card is also a Vulkan device. The card keeps its CUDA name for
+/// CUDA-only runs, but now also carries a `VulkanN` name + index so it can join
+/// a Vulkan tensor-split alongside the AMD cards — a single Vulkan llama.cpp
+/// process drives the AMD RADV devices and the NVIDIA ICD together. No-op if the
+/// card has no Vulkan device or already has a Vulkan index.
+fn merge_vulkan_identity(gpu: &mut GpuInfo, vulkan: &HashMap<String, VulkanDevice>) {
+    if gpu.vulkan_index.is_some() {
+        return;
+    }
+    if let Some(vk) = gpu.pci_bus_id.as_deref().and_then(|pci| vulkan.get(pci)) {
+        gpu.vulkan_index = Some(vk.index);
+        gpu.vulkan_device = Some(format!("Vulkan{}", vk.index));
     }
 }
 
@@ -434,53 +452,83 @@ fn vulkan_devices_by_pci() -> &'static HashMap<String, VulkanDevice> {
 }
 
 fn discover_vulkan_devices_by_pci() -> HashMap<String, VulkanDevice> {
-    let Ok(output) = Command::new("vulkaninfo").arg("--summary").output() else {
+    // Full `vulkaninfo` (not `--summary`): the detailed output carries a
+    // `VkPhysicalDevicePCIBusInfoPropertiesEXT` block per device, which gives a
+    // vendor-neutral PCI address. `--summary` only exposes `deviceUUID`, and the
+    // PCI is recoverable from that UUID only for AMD's RADV driver — NVIDIA's
+    // UUID is opaque, so a summary-only parse can't map NVIDIA cards.
+    let Ok(output) = Command::new("vulkaninfo").output() else {
         return HashMap::new();
     };
     if !output.status.success() {
         return HashMap::new();
     }
-    parse_vulkaninfo_summary(&String::from_utf8_lossy(&output.stdout))
+    parse_vulkaninfo(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn parse_vulkaninfo_summary(summary: &str) -> HashMap<String, VulkanDevice> {
+/// Parse full `vulkaninfo` output into a PCI → `VulkanDevice` map. Reads the
+/// "Device Properties and Extensions" section, pairing each `GPUN:` device's
+/// `deviceType` with its `VkPhysicalDevicePCIBusInfoPropertiesEXT` PCI address.
+/// CPU/virtual devices (no discrete/integrated type) are skipped. `vulkaninfo`
+/// prints the PCI fields in decimal; we hex-format them to match sysfs and
+/// `nvidia-smi` bus ids (e.g. bus `13` → `0d`, bus `28` → `1c`).
+fn parse_vulkaninfo(output: &str) -> HashMap<String, VulkanDevice> {
     let mut out = HashMap::new();
-    let mut current_index: Option<usize> = None;
+    // Only the detailed section has the PCIBusInfo block; earlier sections
+    // repeat `GPUN:` headers without PCI, so gate on the section header.
+    let mut in_section = false;
+    let mut index: Option<usize> = None;
     // Some(false) = discrete, Some(true) = integrated, None = other (CPU,
     // virtual) which we skip entirely.
-    let mut current_integrated: Option<bool> = None;
+    let mut integrated: Option<bool> = None;
+    let mut domain: u32 = 0;
+    let mut bus: Option<u32> = None;
+    let mut device: Option<u32> = None;
 
-    for line in summary.lines().map(str::trim) {
-        if let Some(rest) = line.strip_prefix("GPU").and_then(|s| s.strip_suffix(':')) {
-            current_index = rest.parse::<usize>().ok();
-            current_integrated = None;
+    for line in output.lines().map(str::trim) {
+        if line.starts_with("Device Properties and Extensions") {
+            in_section = true;
             continue;
         }
-
+        if !in_section {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("GPU").and_then(|s| s.strip_suffix(':')) {
+            if let Ok(idx) = rest.parse::<usize>() {
+                index = Some(idx);
+                integrated = None;
+                domain = 0;
+                bus = None;
+                device = None;
+            }
+            continue;
+        }
         if let Some(value) = line
             .strip_prefix("deviceType")
             .and_then(|s| s.split('=').nth(1))
         {
-            current_integrated = match value.trim() {
+            integrated = match value.trim() {
                 "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU" => Some(false),
                 "PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU" => Some(true),
                 _ => None,
             };
             continue;
         }
-
-        if let Some(uuid) = line
-            .strip_prefix("deviceUUID")
-            .and_then(|s| s.split('=').nth(1))
-        {
-            let Some(index) = current_index else {
-                continue;
-            };
-            let Some(integrated) = current_integrated else {
-                continue;
-            };
-            if let Some(pci) = pci_from_radv_device_uuid(uuid.trim()) {
-                out.insert(pci, VulkanDevice { index, integrated });
+        if let Some(v) = parse_vulkaninfo_pci_field(line, "pciDomain") {
+            domain = v;
+        } else if let Some(v) = parse_vulkaninfo_pci_field(line, "pciBus") {
+            bus = Some(v);
+        } else if let Some(v) = parse_vulkaninfo_pci_field(line, "pciDevice") {
+            device = Some(v);
+        } else if let Some(func) = parse_vulkaninfo_pci_field(line, "pciFunction") {
+            // pciFunction is the last field of the block — emit here.
+            if let (Some(idx), Some(integrated), Some(bus), Some(device)) =
+                (index, integrated, bus, device)
+            {
+                let pci = format!("{domain:04x}:{bus:02x}:{device:02x}.{func:x}");
+                if is_pci_bus_id(&pci) {
+                    out.insert(pci, VulkanDevice { index: idx, integrated });
+                }
             }
         }
     }
@@ -488,18 +536,13 @@ fn parse_vulkaninfo_summary(summary: &str) -> HashMap<String, VulkanDevice> {
     out
 }
 
-fn pci_from_radv_device_uuid(uuid: &str) -> Option<String> {
-    let mut parts = uuid.split('-');
-    let _domain = parts.next()?;
-    let bus_device = parts.next()?;
-    if bus_device.len() != 4 || !bus_device.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    Some(format!(
-        "0000:{}:{}.0",
-        &bus_device[0..2],
-        &bus_device[2..4]
-    ))
+/// Parse a `vulkaninfo` `key = <decimal>` line (e.g. `pciBus = 13`). Returns
+/// `None` when the line is a different field, so chained calls can dispatch.
+fn parse_vulkaninfo_pci_field(line: &str, key: &str) -> Option<u32> {
+    line.strip_prefix(key)
+        .filter(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('='))
+        .and_then(|s| s.split('=').nth(1))
+        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 /// Reads the AMD junction temperature from `device/hwmon/hwmonN/temp2_input`
@@ -780,55 +823,76 @@ mod tests {
         assert!(!dgpu.integrated);
     }
 
-    #[test]
-    fn parses_vulkaninfo_summary_device_uuid_to_pci_order() {
-        let summary = r#"
+    // Mirrors the layout of real `vulkaninfo` output: a noise section up top
+    // that repeats `GPUN:` + `deviceType` headers without PCI (must be ignored),
+    // then the "Device Properties and Extensions" section with the PCIBusInfo
+    // blocks we parse. AMD bus 13 → 0d, NVIDIA bus 28 → 1c (decimal → hex), an
+    // integrated card, and a CPU device that must be skipped.
+    const VULKANINFO_FIXTURE: &str = r#"
+Devices:
+========
 GPU0:
-    deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
-    deviceName         = AMD Radeon AI PRO R9700 (RADV GFX1201)
-    deviceUUID         = 00000000-1b00-0000-0000-000000000000
+	apiVersion = 1.4.335
+	deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	deviceName = AMD Radeon AI PRO R9700 (RADV GFX1201)
+
+Device Properties and Extensions:
+=================================
+GPU0:
+VkPhysicalDeviceProperties:
+---------------------------
+	apiVersion        = 1.4.335 (4211023)
+	deviceType        = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	deviceName        = AMD Radeon AI PRO R9700 (RADV GFX1201)
+VkPhysicalDevicePCIBusInfoPropertiesEXT:
+	pciDomain   = 0
+	pciBus      = 13
+	pciDevice   = 0
+	pciFunction = 0
 GPU1:
-    deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
-    deviceName         = AMD Radeon AI PRO R9700 (RADV GFX1201)
-    deviceUUID         = 00000000-0300-0000-0000-000000000000
+VkPhysicalDeviceProperties:
+---------------------------
+	deviceType        = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	deviceName        = NVIDIA GeForce RTX 3090
+VkPhysicalDevicePCIBusInfoPropertiesEXT:
+	pciDomain   = 0
+	pciBus      = 28
+	pciDevice   = 0
+	pciFunction = 0
 GPU2:
-    deviceType         = PHYSICAL_DEVICE_TYPE_CPU
-    deviceName         = llvmpipe
-    deviceUUID         = 6d657361-3236-2e30-2e35-000000000000
+VkPhysicalDeviceProperties:
+---------------------------
+	deviceType        = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	deviceName        = AMD Radeon Graphics (RADV)
+VkPhysicalDevicePCIBusInfoPropertiesEXT:
+	pciDomain   = 0
+	pciBus      = 8
+	pciDevice   = 0
+	pciFunction = 0
+GPU3:
+VkPhysicalDeviceProperties:
+---------------------------
+	deviceType        = PHYSICAL_DEVICE_TYPE_CPU
+	deviceName        = llvmpipe (LLVM 22.1.5, 256 bits)
 "#;
-        let map = parse_vulkaninfo_summary(summary);
-        assert_eq!(
-            map.get("0000:1b:00.0"),
-            Some(&VulkanDevice {
-                index: 0,
-                integrated: false
-            })
-        );
-        assert_eq!(
-            map.get("0000:03:00.0"),
-            Some(&VulkanDevice {
-                index: 1,
-                integrated: false
-            })
-        );
-        assert!(!map.contains_key("0000:32:36.0"));
-    }
 
     #[test]
-    fn vulkaninfo_summary_maps_integrated_gpu_with_flag() {
-        let summary = r#"
-GPU0:
-    deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
-    deviceUUID         = 00000000-0300-0000-0000-000000000000
-GPU1:
-    deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
-    deviceUUID         = 00000000-0800-0000-0000-000000000000
-"#;
-        let map = parse_vulkaninfo_summary(summary);
+    fn parses_vulkaninfo_pci_bus_info_to_pci_order() {
+        let map = parse_vulkaninfo(VULKANINFO_FIXTURE);
+        // AMD discrete: decimal bus 13 → hex 0d.
         assert_eq!(
-            map.get("0000:03:00.0"),
+            map.get("0000:0d:00.0"),
             Some(&VulkanDevice {
                 index: 0,
+                integrated: false
+            })
+        );
+        // NVIDIA discrete: decimal bus 28 → hex 1c. The whole point — NVIDIA is
+        // mapped by PCI from PCIBusInfo, which the RADV-UUID parse could not do.
+        assert_eq!(
+            map.get("0000:1c:00.0"),
+            Some(&VulkanDevice {
+                index: 1,
                 integrated: false
             })
         );
@@ -836,9 +900,56 @@ GPU1:
         assert_eq!(
             map.get("0000:08:00.0"),
             Some(&VulkanDevice {
-                index: 1,
+                index: 2,
                 integrated: true
             })
         );
+        // CPU/virtual device has no usable PCI mapping and is skipped.
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn merge_vulkan_identity_gives_nvidia_a_vulkan_slot() {
+        let map = parse_vulkaninfo(VULKANINFO_FIXTURE);
+        let mut nvidia = GpuInfo {
+            id: "cuda0".into(),
+            pci_bus_id: Some("0000:1c:00.0".into()),
+            vulkan_device: None,
+            vulkan_index: None,
+            cuda_device: Some("CUDA0".into()),
+            cuda_index: Some(0),
+            integrated: false,
+            total_vram: 24 * 1024 * 1024 * 1024,
+            used_vram: 0,
+            busy_pct: 0,
+            temp_c: None,
+        };
+        merge_vulkan_identity(&mut nvidia, &map);
+        // Keeps its CUDA identity and gains the Vulkan one.
+        assert_eq!(nvidia.cuda_device.as_deref(), Some("CUDA0"));
+        assert_eq!(nvidia.vulkan_index, Some(1));
+        assert_eq!(nvidia.vulkan_device.as_deref(), Some("Vulkan1"));
+    }
+
+    #[test]
+    fn merge_vulkan_identity_noop_without_vulkan_device() {
+        let map = parse_vulkaninfo(VULKANINFO_FIXTURE);
+        // A card whose PCI isn't a Vulkan device (e.g. NVIDIA Vulkan ICD absent).
+        let mut gpu = GpuInfo {
+            id: "cuda0".into(),
+            pci_bus_id: Some("0000:99:00.0".into()),
+            vulkan_device: None,
+            vulkan_index: None,
+            cuda_device: Some("CUDA0".into()),
+            cuda_index: Some(0),
+            integrated: false,
+            total_vram: 24 * 1024 * 1024 * 1024,
+            used_vram: 0,
+            busy_pct: 0,
+            temp_c: None,
+        };
+        merge_vulkan_identity(&mut gpu, &map);
+        assert_eq!(gpu.vulkan_index, None);
+        assert_eq!(gpu.vulkan_device, None);
     }
 }
