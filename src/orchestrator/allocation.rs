@@ -94,6 +94,7 @@ mod tests {
             vulkan_index: None,
             cuda_device: None,
             cuda_index: None,
+            integrated: false,
             total_vram: free + 1_000_000_000,
             used_vram: 1_000_000_000,
             busy_pct: 0,

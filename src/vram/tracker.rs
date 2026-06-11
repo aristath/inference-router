@@ -22,6 +22,12 @@ pub struct GpuInfo {
     pub cuda_device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuda_index: Option<usize>,
+    /// True for integrated GPUs (Vulkan `PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU`).
+    /// Such devices are enumerated and addressable so a model can target them
+    /// explicitly, but they are kept out of the automatic placement pool — they
+    /// only run a model when that model's `device` names them.
+    #[serde(default)]
+    pub integrated: bool,
     pub total_vram: u64,
     pub used_vram: u64,
     /// GPU compute utilization 0..=100, from
@@ -58,6 +64,16 @@ impl VRAMTracker {
 
     /// Same as `refresh` but with an injectable sysfs root for tests.
     pub fn refresh_from(&self, sysfs_root: &str) -> Vec<GpuInfo> {
+        self.refresh_from_with_vulkan(sysfs_root, vulkan_devices_by_pci())
+    }
+
+    /// Core of `refresh_from` with the Vulkan device map injected so tests can
+    /// exercise integrated-GPU classification without invoking `vulkaninfo`.
+    fn refresh_from_with_vulkan(
+        &self,
+        sysfs_root: &str,
+        vulkan: &HashMap<String, VulkanDevice>,
+    ) -> Vec<GpuInfo> {
         let root = Path::new(sysfs_root);
         if !root.exists() {
             return Vec::new();
@@ -83,7 +99,16 @@ impl VRAMTracker {
                 Some(v) => v,
                 None => continue,
             };
-            if total < MIN_USABLE_GPU_VRAM_BYTES {
+            let pci_bus_id = read_pci_bus_id(&device);
+            let vk = pci_bus_id
+                .as_deref()
+                .and_then(|pci| vulkan.get(pci).copied());
+            let integrated = vk.is_some_and(|d| d.integrated);
+            // The minimum-VRAM filter exists to drop integrated/display-only
+            // adapters from the pool. Integrated GPUs are kept (so a model can
+            // target them explicitly) but flagged; `model_visible_gpus` keeps
+            // them out of automatic placement.
+            if !integrated && total < MIN_USABLE_GPU_VRAM_BYTES {
                 continue;
             }
             let used = read_u64(&device.join("mem_info_vram_used")).unwrap_or(0);
@@ -93,10 +118,7 @@ impl VRAMTracker {
             let temp_c = read_gpu_junction_temp(&device);
 
             let id = name.trim_start_matches("card").to_string();
-            let pci_bus_id = read_pci_bus_id(&device);
-            let vulkan_index = pci_bus_id
-                .as_deref()
-                .and_then(|pci| vulkan_devices_by_pci().get(pci).copied());
+            let vulkan_index = vk.map(|d| d.index);
             let vulkan_device = vulkan_index.map(|idx| format!("Vulkan{idx}"));
             gpus.push(GpuInfo {
                 id,
@@ -105,6 +127,7 @@ impl VRAMTracker {
                 vulkan_index,
                 cuda_device: None,
                 cuda_index: None,
+                integrated,
                 total_vram: total,
                 used_vram: used,
                 busy_pct,
@@ -175,6 +198,7 @@ fn parse_nvidia_smi_line(line: &str) -> Option<GpuInfo> {
         vulkan_index: None,
         cuda_device: Some(format!("CUDA{cuda_index}")),
         cuda_index: Some(cuda_index),
+        integrated: false,
         total_vram: total_mib.saturating_mul(1024 * 1024),
         used_vram: used_mib.saturating_mul(1024 * 1024),
         busy_pct,
@@ -283,6 +307,7 @@ fn intel_xe_gpus(drm_root: &str, proc_root: &str) -> Vec<GpuInfo> {
             vulkan_index: None,
             cuda_device: None,
             cuda_index: None,
+            integrated: false,
             total_vram: total_mib.saturating_mul(1024 * 1024),
             busy_pct: 0,
             temp_c: read_gpu_junction_temp(&device),
@@ -394,12 +419,21 @@ fn normalize_pci_bus_id(raw: &str) -> Option<String> {
     is_pci_bus_id(&normalized).then_some(normalized)
 }
 
-fn vulkan_devices_by_pci() -> &'static HashMap<String, usize> {
-    static CACHE: OnceLock<HashMap<String, usize>> = OnceLock::new();
+/// A Vulkan physical device's enumeration index plus whether it is integrated.
+/// Integrated devices are mapped (so a model can target them explicitly) but
+/// flagged so they stay out of the automatic placement pool.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VulkanDevice {
+    index: usize,
+    integrated: bool,
+}
+
+fn vulkan_devices_by_pci() -> &'static HashMap<String, VulkanDevice> {
+    static CACHE: OnceLock<HashMap<String, VulkanDevice>> = OnceLock::new();
     CACHE.get_or_init(discover_vulkan_devices_by_pci)
 }
 
-fn discover_vulkan_devices_by_pci() -> HashMap<String, usize> {
+fn discover_vulkan_devices_by_pci() -> HashMap<String, VulkanDevice> {
     let Ok(output) = Command::new("vulkaninfo").arg("--summary").output() else {
         return HashMap::new();
     };
@@ -409,15 +443,17 @@ fn discover_vulkan_devices_by_pci() -> HashMap<String, usize> {
     parse_vulkaninfo_summary(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn parse_vulkaninfo_summary(summary: &str) -> HashMap<String, usize> {
+fn parse_vulkaninfo_summary(summary: &str) -> HashMap<String, VulkanDevice> {
     let mut out = HashMap::new();
     let mut current_index: Option<usize> = None;
-    let mut current_is_discrete_gpu = false;
+    // Some(false) = discrete, Some(true) = integrated, None = other (CPU,
+    // virtual) which we skip entirely.
+    let mut current_integrated: Option<bool> = None;
 
     for line in summary.lines().map(str::trim) {
         if let Some(rest) = line.strip_prefix("GPU").and_then(|s| s.strip_suffix(':')) {
             current_index = rest.parse::<usize>().ok();
-            current_is_discrete_gpu = false;
+            current_integrated = None;
             continue;
         }
 
@@ -425,7 +461,11 @@ fn parse_vulkaninfo_summary(summary: &str) -> HashMap<String, usize> {
             .strip_prefix("deviceType")
             .and_then(|s| s.split('=').nth(1))
         {
-            current_is_discrete_gpu = value.trim() == "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU";
+            current_integrated = match value.trim() {
+                "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU" => Some(false),
+                "PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU" => Some(true),
+                _ => None,
+            };
             continue;
         }
 
@@ -436,11 +476,11 @@ fn parse_vulkaninfo_summary(summary: &str) -> HashMap<String, usize> {
             let Some(index) = current_index else {
                 continue;
             };
-            if !current_is_discrete_gpu {
+            let Some(integrated) = current_integrated else {
                 continue;
-            }
+            };
             if let Some(pci) = pci_from_radv_device_uuid(uuid.trim()) {
-                out.insert(pci, index);
+                out.insert(pci, VulkanDevice { index, integrated });
             }
         }
     }
@@ -534,6 +574,7 @@ mod tests {
             vulkan_index: None,
             cuda_device: None,
             cuda_index: None,
+            integrated: false,
             total_vram: 100,
             used_vram: 150,
             busy_pct: 0,
@@ -682,6 +723,64 @@ mod tests {
     }
 
     #[test]
+    fn refresh_keeps_integrated_gpu_below_threshold_and_flags_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Real sysfs makes `cardN/device` a symlink into a PCI-named dir;
+        // `read_pci_bus_id` canonicalizes it to recover the bus id. Mirror that.
+        let mk_card = |card: &str, pci: &str, total: u64| {
+            let pci_dir = root.join("pci").join(pci);
+            fs::create_dir_all(&pci_dir).unwrap();
+            fs::write(pci_dir.join("mem_info_vram_total"), total.to_string()).unwrap();
+            let card_dir = root.join(card);
+            fs::create_dir_all(&card_dir).unwrap();
+            std::os::unix::fs::symlink(&pci_dir, card_dir.join("device")).unwrap();
+        };
+
+        // Integrated GPU: small carve-out under the discrete threshold, present
+        // in the Vulkan map flagged integrated → kept.
+        mk_card("card0", "0000:08:00.0", 2 * 1024 * 1024 * 1024);
+
+        // Display-only adapter under threshold, NOT in the Vulkan map → dropped.
+        let display = root.join("card1").join("device");
+        fs::create_dir_all(&display).unwrap();
+        fs::write(
+            display.join("mem_info_vram_total"),
+            (1024 * 1024 * 1024u64).to_string(),
+        )
+        .unwrap();
+
+        // Discrete GPU at/above threshold → kept.
+        mk_card("card2", "0000:03:00.0", MIN_USABLE_GPU_VRAM_BYTES);
+
+        let mut vulkan = HashMap::new();
+        vulkan.insert(
+            "0000:03:00.0".to_string(),
+            VulkanDevice {
+                index: 0,
+                integrated: false,
+            },
+        );
+        vulkan.insert(
+            "0000:08:00.0".to_string(),
+            VulkanDevice {
+                index: 1,
+                integrated: true,
+            },
+        );
+
+        let gpus = VRAMTracker.refresh_from_with_vulkan(root.to_str().unwrap(), &vulkan);
+        // card0 (integrated, kept) and card2 (discrete) survive; card1 dropped.
+        assert_eq!(gpus.len(), 2);
+        let igpu = gpus.iter().find(|g| g.id == "0").unwrap();
+        assert!(igpu.integrated);
+        assert_eq!(igpu.vulkan_device.as_deref(), Some("Vulkan1"));
+        let dgpu = gpus.iter().find(|g| g.id == "2").unwrap();
+        assert!(!dgpu.integrated);
+    }
+
+    #[test]
     fn parses_vulkaninfo_summary_device_uuid_to_pci_order() {
         let summary = r#"
 GPU0:
@@ -698,8 +797,48 @@ GPU2:
     deviceUUID         = 6d657361-3236-2e30-2e35-000000000000
 "#;
         let map = parse_vulkaninfo_summary(summary);
-        assert_eq!(map.get("0000:1b:00.0"), Some(&0));
-        assert_eq!(map.get("0000:03:00.0"), Some(&1));
+        assert_eq!(
+            map.get("0000:1b:00.0"),
+            Some(&VulkanDevice {
+                index: 0,
+                integrated: false
+            })
+        );
+        assert_eq!(
+            map.get("0000:03:00.0"),
+            Some(&VulkanDevice {
+                index: 1,
+                integrated: false
+            })
+        );
         assert!(!map.contains_key("0000:32:36.0"));
+    }
+
+    #[test]
+    fn vulkaninfo_summary_maps_integrated_gpu_with_flag() {
+        let summary = r#"
+GPU0:
+    deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    deviceUUID         = 00000000-0300-0000-0000-000000000000
+GPU1:
+    deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+    deviceUUID         = 00000000-0800-0000-0000-000000000000
+"#;
+        let map = parse_vulkaninfo_summary(summary);
+        assert_eq!(
+            map.get("0000:03:00.0"),
+            Some(&VulkanDevice {
+                index: 0,
+                integrated: false
+            })
+        );
+        // Integrated GPU is mapped (addressable) but flagged.
+        assert_eq!(
+            map.get("0000:08:00.0"),
+            Some(&VulkanDevice {
+                index: 1,
+                integrated: true
+            })
+        );
     }
 }

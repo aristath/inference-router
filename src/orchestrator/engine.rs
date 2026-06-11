@@ -1271,7 +1271,9 @@ fn should_plan_tensor_split(model: &ModelConfig, device_count: usize) -> bool {
 
 fn model_visible_gpus(model: &ModelConfig, gpus: Vec<GpuInfo>) -> Vec<GpuInfo> {
     let Some(devices) = configured_llama_devices(model) else {
-        return gpus;
+        // No explicit device: automatic placement. Integrated GPUs are kept out
+        // of this pool — they only run a model that names them explicitly.
+        return gpus.into_iter().filter(|gpu| !gpu.integrated).collect();
     };
     if devices.is_empty() {
         return Vec::new();
@@ -1472,6 +1474,7 @@ mod tests {
             vulkan_index: Some(vulkan_index),
             cuda_device: None,
             cuda_index: None,
+            integrated: false,
             total_vram: 32 * 1024 * 1024 * 1024,
             used_vram: 0,
             busy_pct: 0,
@@ -1544,6 +1547,7 @@ mod tests {
             vulkan_index: None,
             cuda_device: Some("CUDA0".into()),
             cuda_index: Some(0),
+            integrated: false,
             total_vram: 24 * 1024 * 1024 * 1024,
             used_vram: 0,
             busy_pct: 0,
@@ -1558,6 +1562,27 @@ mod tests {
         let selected = model_visible_gpus(&m, gpus);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].cuda_device.as_deref(), Some("CUDA0"));
+    }
+
+    #[test]
+    fn integrated_gpu_excluded_from_auto_pool_but_selectable_explicitly() {
+        let mut igpu = gpu("0", "0000:08:00.0", 2);
+        igpu.integrated = true;
+        let dgpu = gpu("1", "0000:03:00.0", 0);
+
+        // No device configured → automatic placement: the iGPU is excluded.
+        let auto = model("auto");
+        let visible = model_visible_gpus(&auto, vec![igpu.clone(), dgpu.clone()]);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].pci_bus_id.as_deref(), Some("0000:03:00.0"));
+
+        // Explicitly targeting the iGPU runs the model there.
+        let mut targeted = model("on-igpu");
+        targeted.device = Some("Vulkan2".into());
+        let visible = model_visible_gpus(&targeted, vec![igpu, dgpu]);
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].integrated);
+        assert_eq!(visible[0].pci_bus_id.as_deref(), Some("0000:08:00.0"));
     }
 
     #[test]
@@ -1924,6 +1949,7 @@ mod tests {
                 vulkan_index: None,
                 cuda_device: None,
                 cuda_index: None,
+                integrated: false,
                 total_vram: 10 * 1024 * 1024 * 1024,
                 used_vram: 0,
                 busy_pct: 0,
