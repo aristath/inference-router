@@ -51,6 +51,7 @@ impl VRAMTracker {
     pub fn refresh(&self) -> Vec<GpuInfo> {
         let mut gpus = self.refresh_from("/sys/class/drm");
         append_nvidia_gpus(&mut gpus);
+        append_intel_gpus(&mut gpus);
         gpus.sort_by(|a, b| a.id.cmp(&b.id));
         gpus
     }
@@ -179,6 +180,171 @@ fn parse_nvidia_smi_line(line: &str) -> Option<GpuInfo> {
         busy_pct,
         temp_c,
     })
+}
+
+/// Intel GPUs use the `xe` driver, which (unlike amdgpu) exposes no
+/// `mem_info_vram_*` sysfs. We detect xe cards via the `device/driver`
+/// symlink, resolve total VRAM by PCI device id (xe exposes no total in
+/// unprivileged sysfs — debugfs has it but needs root), and read *used* VRAM
+/// from DRM `fdinfo` (`drm-resident-vram0`) summed across processes bound to
+/// the card's PCI — the same source `intel_gpu_top` uses. Deduped against
+/// existing entries by PCI bus id so a card already seen isn't double-counted.
+fn append_intel_gpus(gpus: &mut Vec<GpuInfo>) {
+    for gpu in intel_xe_gpus("/sys/class/drm", "/proc") {
+        if gpu.pci_bus_id.as_deref().is_some_and(|pci| {
+            gpus.iter()
+                .any(|existing| existing.pci_bus_id.as_deref() == Some(pci))
+        }) {
+            continue;
+        }
+        gpus.push(gpu);
+    }
+}
+
+/// Total VRAM (MiB) for known Intel GPUs, keyed by PCI device id. The `xe`
+/// driver exposes no total-VRAM node in unprivileged sysfs, so we map it per
+/// model. Add new GPUs here as we get them.
+fn intel_vram_mib_for_device(device_id: u16) -> Option<u64> {
+    match device_id {
+        0xe211 => Some(24480), // Intel Arc Pro B60 (Battlemage G21) — 24 GB
+        _ => None,
+    }
+}
+
+/// Manual override (MiB) for any Intel card — escape hatch for a model not yet
+/// in `intel_vram_mib_for_device`. Takes precedence over the table.
+fn intel_vram_mib_override() -> Option<u64> {
+    std::env::var("INFERENCE_ROUTER_INTEL_VRAM_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Reads a `0x….`-style hex id file (e.g. `device/device`) as a u16.
+fn read_pci_hex_id(path: &Path) -> Option<u16> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let s = raw.trim();
+    u16::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok()
+}
+
+/// Basename of the `device/driver` symlink target (e.g. `xe`, `amdgpu`).
+fn read_driver_name(device: &Path) -> Option<String> {
+    std::fs::read_link(device.join("driver"))
+        .ok()?
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+}
+
+fn intel_xe_gpus(drm_root: &str, proc_root: &str) -> Vec<GpuInfo> {
+    let Ok(entries) = std::fs::read_dir(drm_root) else {
+        return Vec::new();
+    };
+
+    let mut gpus = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        // Real cards only (`cardN`), not connector sub-nodes (`cardN-DP-1`).
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+
+        let device = entry.path().join("device");
+        if read_driver_name(&device).as_deref() != Some("xe") {
+            continue;
+        }
+        let Some(pci_bus_id) = read_pci_bus_id(&device) else {
+            continue;
+        };
+
+        // No total-VRAM sysfs for xe — resolve by model (env override wins).
+        let device_id = read_pci_hex_id(&device.join("device"));
+        let Some(total_mib) =
+            intel_vram_mib_override().or_else(|| device_id.and_then(intel_vram_mib_for_device))
+        else {
+            let id_str = device_id
+                .map(|d| format!("{d:#06x}"))
+                .unwrap_or_else(|| "unknown".into());
+            tracing::warn!(
+                card = %name,
+                device_id = %id_str,
+                "unknown Intel GPU VRAM size — add it to intel_vram_mib_for_device \
+                 or set INFERENCE_ROUTER_INTEL_VRAM_MIB; skipping this GPU"
+            );
+            continue;
+        };
+
+        gpus.push(GpuInfo {
+            id: name.trim_start_matches("card").to_string(),
+            used_vram: intel_used_vram_bytes(proc_root, &pci_bus_id),
+            pci_bus_id: Some(pci_bus_id),
+            // SYCL/level-zero device selection is by ONEAPI_DEVICE_SELECTOR,
+            // not a Vulkan/CUDA index, so those stay unset.
+            vulkan_device: None,
+            vulkan_index: None,
+            cuda_device: None,
+            cuda_index: None,
+            total_vram: total_mib.saturating_mul(1024 * 1024),
+            busy_pct: 0,
+            temp_c: read_gpu_junction_temp(&device),
+        });
+    }
+    gpus
+}
+
+/// Sum resident VRAM (`drm-resident-vram0`, KiB) across all DRM clients bound
+/// to `pci`, deduped by `drm-client-id` so several fds of one client aren't
+/// counted twice. Returns bytes.
+fn intel_used_vram_bytes(proc_root: &str, pci: &str) -> u64 {
+    let mut by_client: HashMap<u64, u64> = HashMap::new();
+    let Ok(procs) = std::fs::read_dir(proc_root) else {
+        return 0;
+    };
+    for proc in procs.flatten() {
+        let Ok(fds) = std::fs::read_dir(proc.path().join("fdinfo")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(content) = std::fs::read_to_string(fd.path()) else {
+                continue;
+            };
+            if let Some((client, resident_kib)) = parse_intel_fdinfo(&content, pci) {
+                by_client
+                    .entry(client)
+                    .and_modify(|v| *v = (*v).max(resident_kib))
+                    .or_insert(resident_kib);
+            }
+        }
+    }
+    by_client.values().sum::<u64>().saturating_mul(1024)
+}
+
+/// Parse a DRM `fdinfo` block. Returns `(drm-client-id, drm-resident-vram0
+/// KiB)` when the block belongs to the `xe` driver and matches `pci`.
+fn parse_intel_fdinfo(content: &str, pci: &str) -> Option<(u64, u64)> {
+    let mut is_xe = false;
+    let mut matches_pci = false;
+    let mut client_id: Option<u64> = None;
+    let mut resident_kib: u64 = 0;
+    for line in content.lines() {
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
+        let val = val.trim();
+        match key.trim() {
+            "drm-driver" => is_xe = val == "xe",
+            "drm-pdev" => matches_pci = val == pci,
+            "drm-client-id" => client_id = val.parse::<u64>().ok(),
+            "drm-resident-vram0" => {
+                resident_kib = val
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+    (is_xe && matches_pci).then_some((client_id?, resident_kib))
 }
 
 fn read_u64(path: &Path) -> Option<u64> {
@@ -318,6 +484,46 @@ fn read_gpu_junction_temp(device: &Path) -> Option<f32> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn parses_intel_fdinfo_resident_vram() {
+        let block = "drm-driver:\txe\n\
+            drm-pdev:\t0000:03:00.0\n\
+            drm-client-id:\t235\n\
+            drm-resident-vram0:\t17398892 KiB\n";
+        assert_eq!(
+            parse_intel_fdinfo(block, "0000:03:00.0"),
+            Some((235, 17398892))
+        );
+        // Wrong PCI -> not this card.
+        assert_eq!(parse_intel_fdinfo(block, "0000:0f:00.0"), None);
+        // Non-xe driver -> ignored even if PCI matches.
+        let amd = "drm-driver:\tamdgpu\n\
+            drm-pdev:\t0000:03:00.0\n\
+            drm-client-id:\t1\n\
+            drm-resident-vram0:\t100 KiB\n";
+        assert_eq!(parse_intel_fdinfo(amd, "0000:03:00.0"), None);
+        // xe fd with no VRAM residency yet -> 0 KiB.
+        let idle = "drm-driver:\txe\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t9\n";
+        assert_eq!(parse_intel_fdinfo(idle, "0000:03:00.0"), Some((9, 0)));
+    }
+
+    #[test]
+    fn intel_vram_table_maps_known_models() {
+        assert_eq!(intel_vram_mib_for_device(0xe211), Some(24480)); // Arc Pro B60
+        assert_eq!(intel_vram_mib_for_device(0x1234), None); // unknown -> skip/override
+    }
+
+    #[test]
+    fn reads_pci_hex_id_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("device");
+        fs::write(&f, "0xe211\n").unwrap();
+        assert_eq!(read_pci_hex_id(&f), Some(0xe211));
+        fs::write(&f, "e211").unwrap();
+        assert_eq!(read_pci_hex_id(&f), Some(0xe211));
+        assert_eq!(read_pci_hex_id(&dir.path().join("missing")), None);
+    }
 
     #[test]
     fn free_vram_saturates() {
