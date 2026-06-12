@@ -128,8 +128,6 @@ fn temp_class(celsius: f32) -> String {
 pub struct ModelDisplay {
     pub id: String,
     pub name: String,
-    pub profile: String,
-    pub format_str: String,
     pub context_tokens: u32,
     pub context_str: String,
     /// Raw bytes for sorting (not rendered directly).
@@ -143,9 +141,6 @@ pub struct ModelDisplay {
     pub is_loaded: bool,
     pub loaded_sort_key: u8,
     pub primary_action_sort: String,
-    pub architecture_display: String,
-    pub quant_label: String,
-    pub size_label: String,
 }
 
 impl ModelDisplay {
@@ -168,39 +163,11 @@ impl ModelDisplay {
             ModelState::Idle | ModelState::Error(_) => "load",
             ModelState::Loading => "edit",
         };
-        let format_str = match m.weights_format {
-            WeightsFormat::Gguf => "GGUF".into(),
-            WeightsFormat::Safetensors => "Safetensors".into(),
-        };
-
         let (file_size_bytes, required_vram_bytes) = compute_sizes(m);
-
-        let architecture = m
-            .gguf_meta
-            .as_ref()
-            .and_then(|g| g.architecture.clone())
-            .unwrap_or_default();
-        let architecture_display = if architecture.is_empty() {
-            "Other".into()
-        } else {
-            capitalize_first(&architecture)
-        };
-        let quant_label = m
-            .gguf_meta
-            .as_ref()
-            .and_then(|g| g.quant_label.clone())
-            .unwrap_or_default();
-        let size_label = m
-            .gguf_meta
-            .as_ref()
-            .and_then(|g| g.size_label.clone())
-            .unwrap_or_default();
 
         Self {
             id: m.id.clone(),
             name: m.name.clone(),
-            profile: m.profile.clone().unwrap_or_default(),
-            format_str,
             context_tokens: m.context,
             context_str: format_context(m.context),
             file_size_bytes,
@@ -213,9 +180,6 @@ impl ModelDisplay {
             is_loaded,
             loaded_sort_key: if is_loaded { 0 } else { 1 },
             primary_action_sort: primary_action_sort.into(),
-            architecture_display,
-            quant_label,
-            size_label,
         }
     }
 }
@@ -225,14 +189,6 @@ fn format_context(ctx: u32) -> String {
         format!("{}K ctx", ctx / 1024)
     } else {
         format!("{} ctx", ctx)
-    }
-}
-
-fn capitalize_first(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
     }
 }
 

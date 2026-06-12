@@ -1,4 +1,7 @@
-use crate::config::{AppSettings, BinaryPreset, ConfigError, JsonStore, ModelConfig, ModelState, WeightsFormat};
+use crate::config::{
+    AppSettings, BinaryPreset, ConfigError, JsonStore, ModelAlias, ModelConfig, ModelState,
+    WeightsFormat,
+};
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
@@ -6,7 +9,7 @@ use crate::system::stats::{SystemStats, SystemTracker};
 use crate::vram::estimator::VramEstimate;
 use crate::vram::tracker::{GpuInfo, VRAMTracker};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -23,6 +26,8 @@ pub struct AppData {
     pub models: HashMap<String, ModelConfig>,
     pub gpus: Vec<GpuInfo>,
     pub presets: HashMap<String, BinaryPreset>,
+    /// Alias name -> alias definition. Resolved to a target model at request time.
+    pub aliases: HashMap<String, ModelAlias>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,10 +59,13 @@ pub struct Orchestrator {
     pub load_guards: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub store: Arc<JsonStore<Vec<ModelConfig>>>,
     pub presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
+    pub aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
     pub settings_store: Option<Arc<JsonStore<AppSettings>>>,
     pub dirty: Arc<AtomicBool>,
     /// Set when presets change so reconcile persists presets.json.
     pub presets_dirty: Arc<AtomicBool>,
+    /// Set when aliases change so reconcile persists aliases.json.
+    pub aliases_dirty: Arc<AtomicBool>,
     /// Set when app settings change so reconcile persists settings.json.
     pub settings_dirty: Arc<AtomicBool>,
     pub server_port: u16,
@@ -73,11 +81,13 @@ impl Orchestrator {
     pub fn new(
         store: Arc<JsonStore<Vec<ModelConfig>>>,
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
+        aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
         server_port: u16,
     ) -> Self {
         Self::new_inner(
             store,
             presets_store,
+            aliases_store,
             None,
             AppSettings::from_env(),
             server_port,
@@ -87,6 +97,7 @@ impl Orchestrator {
     pub fn new_with_settings_store(
         store: Arc<JsonStore<Vec<ModelConfig>>>,
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
+        aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
         settings_store: Arc<JsonStore<AppSettings>>,
         server_port: u16,
     ) -> Self {
@@ -94,6 +105,7 @@ impl Orchestrator {
         Self::new_inner(
             store,
             presets_store,
+            aliases_store,
             Some(settings_store),
             settings.sanitized(),
             server_port,
@@ -103,6 +115,7 @@ impl Orchestrator {
     fn new_inner(
         store: Arc<JsonStore<Vec<ModelConfig>>>,
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
+        aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
         settings_store: Option<Arc<JsonStore<AppSettings>>>,
         settings: AppSettings,
         server_port: u16,
@@ -146,12 +159,18 @@ impl Orchestrator {
             .into_iter()
             .map(|p| (p.id.clone(), p))
             .collect();
+        let aliases: HashMap<String, ModelAlias> = aliases_store
+            .snapshot()
+            .into_iter()
+            .map(|a| (a.alias.clone(), a))
+            .collect();
 
         Self {
             data: Arc::new(Mutex::new(AppData {
                 models,
                 gpus: Vec::new(),
                 presets,
+                aliases,
             })),
             process_manager: Arc::new(Mutex::new(ProcessManager::default())),
             vram_tracker: Arc::new(VRAMTracker),
@@ -161,9 +180,11 @@ impl Orchestrator {
             load_guards: Arc::new(Mutex::new(HashMap::new())),
             store,
             presets_store,
+            aliases_store,
             settings_store,
             dirty: Arc::new(AtomicBool::new(migrated_any)),
             presets_dirty: Arc::new(AtomicBool::new(false)),
+            aliases_dirty: Arc::new(AtomicBool::new(false)),
             settings_dirty: Arc::new(AtomicBool::new(false)),
             server_port,
             settings: Arc::new(Mutex::new(settings)),
@@ -240,6 +261,67 @@ impl Orchestrator {
         let mut v: Vec<BinaryPreset> = self.data.lock().await.presets.values().cloned().collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
+    }
+
+    // ----- Aliases -----
+
+    pub async fn list_aliases(&self) -> Vec<ModelAlias> {
+        let mut v: Vec<ModelAlias> = self.data.lock().await.aliases.values().cloned().collect();
+        v.sort_by(|a, b| a.alias.cmp(&b.alias));
+        v
+    }
+
+    /// Resolve a requested name to a real model id by following the alias
+    /// chain. An alias may target another alias, so `default → planner →
+    /// qwen-32b` resolves to `qwen-32b`; repointing `default` propagates to
+    /// every alias that references it.
+    ///
+    /// Returns an empty string when the chain hits an unassigned alias or a
+    /// cycle (the proxy turns that into a clear 503). A name that isn't an
+    /// alias passes through unchanged. Always resolves regardless of the
+    /// `/v1/models` exposure mode.
+    pub async fn resolve_model_id(&self, name: &str) -> String {
+        let data = self.data.lock().await;
+        resolve_alias_chain(&data.aliases, name)
+    }
+
+    pub async fn add_alias(&self, alias: ModelAlias) -> Result<(), MutationError> {
+        let mut data = self.data.lock().await;
+        if data.aliases.contains_key(&alias.alias) {
+            return Err(MutationError::AliasConflict(alias.alias));
+        }
+        validate_alias(&data, &alias)?;
+        data.aliases.insert(alias.alias.clone(), alias);
+        self.aliases_dirty.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub async fn update_alias(&self, alias: ModelAlias) -> Result<(), MutationError> {
+        let mut data = self.data.lock().await;
+        if !data.aliases.contains_key(&alias.alias) {
+            return Err(MutationError::AliasNotFound(alias.alias));
+        }
+        validate_alias(&data, &alias)?;
+        data.aliases.insert(alias.alias.clone(), alias);
+        self.aliases_dirty.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub async fn remove_alias(&self, name: &str) -> Result<(), MutationError> {
+        let mut data = self.data.lock().await;
+        if data.aliases.remove(name).is_none() {
+            return Err(MutationError::AliasNotFound(name.into()));
+        }
+        // Any alias that targeted this one is now unassigned (mirrors how
+        // deleting a model unassigns aliases). The referencing alias stays
+        // defined and can be repointed.
+        for a in data.aliases.values_mut() {
+            if a.target == name {
+                a.target.clear();
+            }
+        }
+        self.aliases_dirty.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     // ----- App settings -----
@@ -410,7 +492,23 @@ impl Orchestrator {
                 pm.forget(pid);
             }
         }
-        self.data.lock().await.models.remove(id);
+        {
+            let mut data = self.data.lock().await;
+            data.models.remove(id);
+            // Aliases are canonical interface names, so we keep them and just
+            // unassign the target. The alias stays defined and can be pointed
+            // at another model from the UI without being recreated.
+            let mut unassigned_any = false;
+            for a in data.aliases.values_mut() {
+                if a.target == id {
+                    a.target.clear();
+                    unassigned_any = true;
+                }
+            }
+            if unassigned_any {
+                self.aliases_dirty.store(true, Ordering::Relaxed);
+            }
+        }
         // Drop the per-model load guard so the HashMap doesn't slowly grow
         // as configs come and go.
         self.load_guards.lock().await.remove(id);
@@ -1106,6 +1204,24 @@ impl Orchestrator {
             }
         }
 
+        if self.aliases_dirty.swap(false, Ordering::Relaxed) {
+            let snapshot: Vec<ModelAlias> =
+                self.data.lock().await.aliases.values().cloned().collect();
+            self.aliases_store.replace(snapshot);
+            let store = self.aliases_store.clone();
+            match tokio::task::spawn_blocking(move || store.save()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!(error = %e, "failed to persist aliases.json");
+                    self.aliases_dirty.store(true, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error!(error = %e, "aliases.json persistence task failed");
+                    self.aliases_dirty.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
         if self.settings_dirty.swap(false, Ordering::Relaxed) {
         if let Some(store) = self.settings_store.clone() {
             let snapshot: AppSettings = self.settings.lock().await.clone();
@@ -1178,6 +1294,120 @@ pub enum MutationError {
 
     #[error("cannot delete '{id}': used as a draft by {}", targets.join(", "))]
     DraftInUse { id: String, targets: Vec<String> },
+
+    #[error("alias '{0}' already exists")]
+    AliasConflict(String),
+
+    #[error("alias '{0}' not found")]
+    AliasNotFound(String),
+
+    #[error("alias '{0}' collides with an existing model id")]
+    AliasShadowsModel(String),
+
+    #[error("alias '{alias}' points at '{target}', which is not a model or alias")]
+    AliasTargetMissing { alias: String, target: String },
+
+    #[error("alias '{alias}' → '{target}' would create a resolution cycle")]
+    AliasCycle { alias: String, target: String },
+
+    #[error("invalid alias: {0}")]
+    AliasInvalid(String),
+}
+
+/// A canonical alias name: 1–64 chars of lowercase ASCII letters, digits, and
+/// `.`, `_`, `-`. Kept tight because the name doubles as a URL path segment
+/// (`/api/aliases/{alias}`) and the `model` field clients send.
+fn is_valid_alias_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Follow the alias chain from `name` to a concrete model id.
+///
+/// Stops and returns an empty string when it reaches an unassigned alias or
+/// detects a cycle; returns `name` unchanged when it isn't an alias.
+fn resolve_alias_chain(aliases: &HashMap<String, ModelAlias>, name: &str) -> String {
+    let mut current = name.to_string();
+    let mut seen = HashSet::new();
+    loop {
+        match aliases.get(&current) {
+            Some(a) => {
+                if !seen.insert(current.clone()) {
+                    return String::new(); // cycle
+                }
+                if a.target.is_empty() {
+                    return String::new(); // unassigned alias in the chain
+                }
+                current = a.target.clone();
+            }
+            // Not an alias: a model id (or an unknown name that passes through).
+            None => return current,
+        }
+    }
+}
+
+/// Would assigning `target` to `alias_name` create a cycle? Walks the chain
+/// starting from `target`; revisiting any node (including `alias_name`) means
+/// the assignment would loop.
+fn target_creates_cycle(
+    aliases: &HashMap<String, ModelAlias>,
+    alias_name: &str,
+    target: &str,
+) -> bool {
+    let mut current = target.to_string();
+    let mut seen = HashSet::new();
+    seen.insert(alias_name.to_string());
+    while let Some(a) = aliases.get(&current) {
+        if !seen.insert(current.clone()) {
+            return true;
+        }
+        if a.target.is_empty() {
+            return false;
+        }
+        current = a.target.clone();
+    }
+    false
+}
+
+/// Validate an alias against the current model + alias tables.
+///
+/// Aliases are canonical, stable interface names, so an empty `target` is a
+/// valid "unassigned" state — the alias exists and can be reassigned from the
+/// UI without being recreated.
+///
+/// Checked conditions:
+/// - the alias name matches the canonical charset (see `is_valid_alias_name`)
+/// - the alias does not shadow an existing model id
+/// - if a target is given, it names an existing model **or** an existing alias
+/// - the target does not create a resolution cycle
+fn validate_alias(data: &AppData, alias: &ModelAlias) -> Result<(), MutationError> {
+    if !is_valid_alias_name(&alias.alias) {
+        return Err(MutationError::AliasInvalid(
+            "alias must be 1–64 characters of lowercase letters, digits, '.', '_' or '-'".into(),
+        ));
+    }
+    if data.models.contains_key(&alias.alias) {
+        return Err(MutationError::AliasShadowsModel(alias.alias.clone()));
+    }
+    if !alias.target.is_empty() {
+        let is_model = data.models.contains_key(&alias.target);
+        let is_alias = data.aliases.contains_key(&alias.target);
+        if !is_model && !is_alias {
+            return Err(MutationError::AliasTargetMissing {
+                alias: alias.alias.clone(),
+                target: alias.target.clone(),
+            });
+        }
+        if is_alias && target_creates_cycle(&data.aliases, &alias.alias, &alias.target) {
+            return Err(MutationError::AliasCycle {
+                alias: alias.alias.clone(),
+                target: alias.target.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Validate a target's `draft_model_id` against the current model table.
@@ -1448,7 +1678,10 @@ mod tests {
         let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
             tmp.path().join("presets.json"),
         ));
-        Arc::new(Orchestrator::new(store, presets, 8080))
+        let aliases = Arc::new(JsonStore::<Vec<ModelAlias>>::new(
+            tmp.path().join("aliases.json"),
+        ));
+        Arc::new(Orchestrator::new(store, presets, aliases, 8080))
     }
 
     fn model(id: &str) -> ModelConfig {
@@ -1811,7 +2044,10 @@ mod tests {
         let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
             tmp.path().join("presets.json"),
         ));
-        let o = Arc::new(Orchestrator::new(store, presets, 8080));
+        let aliases = Arc::new(JsonStore::<Vec<ModelAlias>>::new(
+            tmp.path().join("aliases.json"),
+        ));
+        let o = Arc::new(Orchestrator::new(store, presets, aliases, 8080));
         let loaded = o.get_model("a").await.unwrap();
         assert_eq!(loaded.state, ModelState::Idle);
         assert_eq!(loaded.pid, None);
@@ -1996,7 +2232,10 @@ mod tests {
         let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
             tmp.path().join("presets.json"),
         ));
-        let o = Arc::new(Orchestrator::new(store, presets, 8080));
+        let aliases = Arc::new(JsonStore::<Vec<ModelAlias>>::new(
+            tmp.path().join("aliases.json"),
+        ));
+        let o = Arc::new(Orchestrator::new(store, presets, aliases, 8080));
 
         // First reconcile: nothing dirty, no file written.
         o.reconcile().await;
@@ -2025,9 +2264,12 @@ mod tests {
         let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
             tmp.path().join("presets.json"),
         ));
+        let aliases = Arc::new(JsonStore::<Vec<ModelAlias>>::new(
+            tmp.path().join("aliases.json"),
+        ));
         let settings = Arc::new(JsonStore::<AppSettings>::new(settings_path.clone()));
         let o = Arc::new(Orchestrator::new_with_settings_store(
-            store, presets, settings, 8080,
+            store, presets, aliases, settings, 8080,
         ));
 
         let mut next = o.settings().await;
@@ -2045,5 +2287,182 @@ mod tests {
             crate::config::StreamingLoopAction::Log,
         );
         assert_eq!(saved.loop_guards.tool.window_messages, 24);
+    }
+
+    fn alias(name: &str, target: &str) -> ModelAlias {
+        ModelAlias {
+            alias: name.into(),
+            target: target.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_alias_requires_existing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        // Target model does not exist yet.
+        let err = o.add_alias(alias("fast", "qwen")).await.unwrap_err();
+        assert!(matches!(err, MutationError::AliasTargetMissing { .. }));
+
+        o.add_model(model("qwen")).await.unwrap();
+        o.add_alias(alias("fast", "qwen")).await.unwrap();
+        assert_eq!(o.list_aliases().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn alias_resolves_to_target_and_passthrough_for_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("qwen")).await.unwrap();
+        o.add_alias(alias("fast", "qwen")).await.unwrap();
+
+        assert_eq!(o.resolve_model_id("fast").await, "qwen");
+        // A non-alias name passes through unchanged.
+        assert_eq!(o.resolve_model_id("qwen").await, "qwen");
+        assert_eq!(o.resolve_model_id("unknown").await, "unknown");
+    }
+
+    #[tokio::test]
+    async fn alias_cannot_shadow_model_id_or_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("qwen")).await.unwrap();
+        o.add_model(model("llama")).await.unwrap();
+
+        // Alias name equal to an existing model id is rejected.
+        let err = o.add_alias(alias("llama", "qwen")).await.unwrap_err();
+        assert!(matches!(err, MutationError::AliasShadowsModel(_)));
+
+        o.add_alias(alias("fast", "qwen")).await.unwrap();
+        // Duplicate alias name is rejected.
+        let err = o.add_alias(alias("fast", "llama")).await.unwrap_err();
+        assert!(matches!(err, MutationError::AliasConflict(_)));
+    }
+
+    #[tokio::test]
+    async fn deleting_model_unassigns_aliases_but_keeps_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("qwen")).await.unwrap();
+        o.add_model(model("llama")).await.unwrap();
+        o.add_alias(alias("fast", "qwen")).await.unwrap();
+        o.add_alias(alias("big", "llama")).await.unwrap();
+
+        o.remove_model("qwen").await.unwrap();
+
+        // Both aliases survive; the one pointing at "qwen" is now unassigned.
+        let aliases = o.list_aliases().await;
+        assert_eq!(aliases, vec![alias("big", "llama"), alias("fast", "")]);
+        // An unassigned alias resolves to an empty target (handled as an error
+        // at the proxy layer).
+        assert_eq!(o.resolve_model_id("fast").await, "");
+    }
+
+    #[tokio::test]
+    async fn add_alias_rejects_invalid_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("qwen")).await.unwrap();
+        let too_long = "x".repeat(65);
+        for bad in ["Planner", "my alias", "a/b", "café", "", too_long.as_str()] {
+            let err = o.add_alias(alias(bad, "qwen")).await.unwrap_err();
+            assert!(
+                matches!(err, MutationError::AliasInvalid(_)),
+                "expected {bad:?} to be rejected as invalid",
+            );
+        }
+        // Canonical names are accepted.
+        o.add_alias(alias("gpt-4o.fast_v2", "qwen")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn alias_can_target_another_alias_and_follows_repoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("qwen")).await.unwrap();
+        o.add_model(model("llama")).await.unwrap();
+        o.add_alias(alias("default", "qwen")).await.unwrap();
+        // Several aliases reference `default` instead of a concrete model.
+        o.add_alias(alias("coder", "default")).await.unwrap();
+        o.add_alias(alias("planner", "default")).await.unwrap();
+
+        assert_eq!(o.resolve_model_id("coder").await, "qwen");
+        assert_eq!(o.resolve_model_id("planner").await, "qwen");
+
+        // Repointing `default` propagates to every alias that references it,
+        // without touching those aliases.
+        o.update_alias(alias("default", "llama")).await.unwrap();
+        assert_eq!(o.resolve_model_id("coder").await, "llama");
+        assert_eq!(o.resolve_model_id("planner").await, "llama");
+        // The referencing aliases still store the reference, not the model.
+        let coder = o.list_aliases().await.into_iter().find(|a| a.alias == "coder").unwrap();
+        assert_eq!(coder.target, "default");
+    }
+
+    #[tokio::test]
+    async fn alias_chain_through_unassigned_resolves_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_alias(alias("default", "")).await.unwrap(); // unassigned
+        o.add_alias(alias("coder", "default")).await.unwrap();
+        assert_eq!(o.resolve_model_id("coder").await, "");
+    }
+
+    #[tokio::test]
+    async fn alias_cycles_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("qwen")).await.unwrap();
+        o.add_alias(alias("a", "qwen")).await.unwrap();
+        o.add_alias(alias("b", "a")).await.unwrap();
+        // a → b would close the loop a → b → a.
+        let err = o.update_alias(alias("a", "b")).await.unwrap_err();
+        assert!(matches!(err, MutationError::AliasCycle { .. }));
+        // Resolution is unaffected (the cyclic update was rejected).
+        assert_eq!(o.resolve_model_id("b").await, "qwen");
+    }
+
+    #[tokio::test]
+    async fn deleting_alias_unassigns_aliases_referencing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        o.add_model(model("qwen")).await.unwrap();
+        o.add_alias(alias("default", "qwen")).await.unwrap();
+        o.add_alias(alias("coder", "default")).await.unwrap();
+
+        o.remove_alias("default").await.unwrap();
+        let coder = o.list_aliases().await.into_iter().find(|a| a.alias == "coder").unwrap();
+        assert_eq!(coder.target, "", "coder should be unassigned after default is deleted");
+    }
+
+    #[tokio::test]
+    async fn alias_can_be_created_unassigned_then_pointed_at_a_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = orch(&tmp);
+        // Canonical interface name defined before any model is assigned.
+        o.add_alias(alias("planner", "")).await.unwrap();
+        assert_eq!(o.resolve_model_id("planner").await, "");
+
+        o.add_model(model("qwen")).await.unwrap();
+        o.update_alias(alias("planner", "qwen")).await.unwrap();
+        assert_eq!(o.resolve_model_id("planner").await, "qwen");
+
+        // Reassigning to a non-existent model is still rejected.
+        let err = o.update_alias(alias("planner", "ghost")).await.unwrap_err();
+        assert!(matches!(err, MutationError::AliasTargetMissing { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconcile_persists_aliases_when_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aliases_path = tmp.path().join("aliases.json");
+        let o = orch(&tmp);
+        o.add_model(model("qwen")).await.unwrap();
+        o.add_alias(alias("fast", "qwen")).await.unwrap();
+        o.reconcile().await;
+
+        let saved: Vec<ModelAlias> =
+            serde_json::from_str(&std::fs::read_to_string(&aliases_path).unwrap()).unwrap();
+        assert_eq!(saved, vec![alias("fast", "qwen")]);
     }
 }

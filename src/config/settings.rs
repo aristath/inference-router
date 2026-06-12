@@ -9,18 +9,45 @@ use serde::{Deserialize, Serialize};
 pub struct AppSettings {
     /// Loop guard configuration for both streaming and tool loops
     pub loop_guards: LoopGuardSettings,
+    /// Which set of model names is advertised on `/v1/models`.
+    pub model_exposure: ModelExposure,
 }
 
 impl AppSettings {
     pub fn from_env() -> Self {
         Self {
             loop_guards: LoopGuardSettings::from_env(),
+            model_exposure: ModelExposure::from_env(),
         }
     }
 
     pub fn sanitized(mut self) -> Self {
         self.loop_guards.sanitize();
         self
+    }
+}
+
+/// Which set of model names the OpenAI-compatible `/v1/models` endpoint
+/// advertises.
+///
+/// Aliases always *resolve* at request time regardless of this setting — it
+/// only controls what is *listed*.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelExposure {
+    /// List every configured model *and* every alias (default).
+    #[default]
+    FullList,
+    /// List only the defined aliases.
+    AliasesOnly,
+}
+
+impl ModelExposure {
+    fn from_env() -> Self {
+        match env_bool("INFERENCE_ROUTER_EXPOSE_ALIASES_ONLY") {
+            Some(true) => ModelExposure::AliasesOnly,
+            _ => ModelExposure::FullList,
+        }
     }
 }
 

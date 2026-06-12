@@ -7,7 +7,7 @@ use std::path::Path as StdPath;
 use std::time::Duration;
 use tokio::process::Command;
 
-use crate::config::{AppSettings, BinaryPreset, CacheType, ModelConfig, WeightsFormat};
+use crate::config::{AppSettings, BinaryPreset, CacheType, ModelAlias, ModelConfig, WeightsFormat};
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
 use crate::vram::estimator::GgufMeta;
 
@@ -126,6 +126,24 @@ fn mutation_response(e: MutationError) -> axum::response::Response {
                     targets.join(", "),
                 ),
             })),
+        )
+            .into_response(),
+        MutationError::AliasConflict(alias) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("alias '{alias}' already exists")})),
+        )
+            .into_response(),
+        MutationError::AliasNotFound(alias) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("alias '{alias}' not found")})),
+        )
+            .into_response(),
+        e @ (MutationError::AliasShadowsModel(_)
+        | MutationError::AliasTargetMissing { .. }
+        | MutationError::AliasCycle { .. }
+        | MutationError::AliasInvalid(_)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
     }
@@ -343,6 +361,51 @@ pub async fn delete_preset(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.remove_preset(&id).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => mutation_response(e),
+    }
+}
+
+// ===== Model aliases =====
+
+pub async fn list_aliases(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.list_aliases().await)
+}
+
+pub async fn create_alias(
+    State(state): State<AppState>,
+    Json(alias): Json<ModelAlias>,
+) -> impl IntoResponse {
+    let name = alias.alias.clone();
+    match state.add_alias(alias).await {
+        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({"alias": name}))).into_response(),
+        Err(e) => mutation_response(e),
+    }
+}
+
+pub async fn update_alias(
+    State(state): State<AppState>,
+    Path(alias_name): Path<String>,
+    Json(alias): Json<ModelAlias>,
+) -> impl IntoResponse {
+    if alias.alias != alias_name {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "alias in URL and body must match"})),
+        )
+            .into_response();
+    }
+    match state.update_alias(alias).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => mutation_response(e),
+    }
+}
+
+pub async fn delete_alias(
+    State(state): State<AppState>,
+    Path(alias_name): Path<String>,
+) -> impl IntoResponse {
+    match state.remove_alias(&alias_name).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => mutation_response(e),
     }

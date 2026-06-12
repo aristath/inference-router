@@ -73,7 +73,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         }
     };
 
-    let model_id = match body_peek::extract_model(&body_bytes) {
+    let requested_model = match body_peek::extract_model(&body_bytes) {
         Some(id) => id,
         None => {
             return (
@@ -83,6 +83,25 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
                 .into_response();
         }
     };
+
+    // Resolve aliases to their target model. Non-alias names pass through
+    // unchanged. The upstream backend ignores the body's `model` field, so we
+    // route on the resolved id without rewriting the request.
+    let model_id = state.resolve_model_id(&requested_model).await;
+
+    // A defined-but-unassigned alias resolves to an empty target. Real model
+    // ids are never empty, so this unambiguously means "alias not pointed at a
+    // model yet" — surface a clear error instead of a confusing "not found".
+    if model_id.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": format!("alias '{requested_model}' is not assigned to a model"),
+                "model": requested_model,
+            })),
+        )
+            .into_response();
+    }
 
     let guard = match state.clone().ensure_loaded(&model_id).await {
         Ok(g) => g,
@@ -190,21 +209,35 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
 
 /// Synthesized OpenAI-style model list from the current config.
 ///
-/// Drafts are filtered out: they have no standalone process and shouldn't
-/// appear as selectable models to OpenAI clients.
+/// The exposure mode controls which names are advertised:
+/// - `FullList` (default): every configured model *and* every alias.
+/// - `AliasesOnly`: only the defined aliases.
+///
+/// Aliases always resolve at request time regardless of this setting.
 pub async fn list_v1_models(State(state): State<AppState>) -> impl IntoResponse {
-    let models = state.list_models().await;
-    let data: Vec<_> = models
-        .into_iter()
-        .map(|m| {
-            json!({
-                "id": m.id,
-                "object": "model",
-                "created": 0,
-                "owned_by": "local",
-            })
+    use crate::config::ModelExposure;
+
+    fn entry(id: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "local",
         })
-        .collect();
+    }
+
+    let exposure = state.settings().await.model_exposure;
+    let mut data: Vec<serde_json::Value> = Vec::new();
+
+    if exposure == ModelExposure::FullList {
+        for m in state.list_models().await {
+            data.push(entry(&m.id));
+        }
+    }
+    for a in state.list_aliases().await {
+        data.push(entry(&a.alias));
+    }
+
     Json(json!({"object": "list", "data": data}))
 }
 

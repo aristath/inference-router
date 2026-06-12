@@ -12,7 +12,7 @@ use tracing::{error, info};
 use crate::api::proxy;
 use crate::api::routes::*;
 use crate::api::state::get_app_state;
-use crate::config::{AppSettings, BinaryPreset, JsonStore, ModelConfig};
+use crate::config::{AppSettings, BinaryPreset, JsonStore, ModelAlias, ModelConfig};
 use crate::orchestrator::{AppState, Orchestrator};
 use crate::ui::templates::{DashboardTemplate, GpuDisplay, ModelDisplay, SystemDisplay};
 
@@ -47,6 +47,8 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         Arc::new(JsonStore::new(config_dir.join("models.json")));
     let presets_store: Arc<JsonStore<Vec<BinaryPreset>>> =
         Arc::new(JsonStore::new(config_dir.join("presets.json")));
+    let aliases_store: Arc<JsonStore<Vec<ModelAlias>>> =
+        Arc::new(JsonStore::new(config_dir.join("aliases.json")));
     let settings_path = config_dir.join("settings.json");
     let settings_exists = settings_path.exists();
     let settings_store: Arc<JsonStore<AppSettings>> = Arc::new(JsonStore::new(settings_path));
@@ -57,6 +59,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let orchestrator = Arc::new(Orchestrator::new_with_settings_store(
         models_store.clone(),
         presets_store.clone(),
+        aliases_store.clone(),
         settings_store.clone(),
         config.port,
     ));
@@ -93,6 +96,11 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         .route(
             "/api/presets/{id}",
             put(update_preset).delete(delete_preset),
+        )
+        .route("/api/aliases", get(list_aliases).post(create_alias))
+        .route(
+            "/api/aliases/{alias}",
+            put(update_alias).delete(delete_alias),
         )
         // OpenAI-compatible surface
         .route("/v1/models", get(proxy::list_v1_models))

@@ -86,8 +86,49 @@
         </div>
     </div>
 
-    <!-- ===== Right column: Models ===== -->
+    <!-- ===== Right column: Aliases + Models ===== -->
     <div class="col">
+        <!-- ===== Model aliases ===== -->
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: 1rem;">
+            <h2 class="section" style="margin: 0;">Aliases</h2>
+            <label class="toggle-line" title="Full list exposes every model AND every alias on /v1/models. Aliases only exposes just the aliases.">
+                <input type="checkbox" id="alias-exposure-toggle" onchange="saveAliasExposure(this.checked)">
+                Expose aliases only
+            </label>
+            <button type="button" class="btn btn-primary btn-sm" onclick="openAliasEditor()">+ Add alias</button>
+        </div>
+        <div class="card" id="alias-card" style="margin-bottom: 1.5rem;">
+            <small class="field-help" style="margin-bottom: 0.75rem;">
+                Stable, canonical names (e.g. <code>planner</code>, <code>coder</code>, <code>fast</code>) that
+                clients request while you swap the underlying model from here. An alias can also point at
+                <em>another alias</em> — e.g. several aliases sharing one <code>default</code>; repointing
+                <code>default</code> moves them all. Deleting a model or alias leaves anything referencing it
+                <em>unassigned</em>, ready to repoint. Aliases always resolve regardless of the exposure
+                switch — the switch only changes what <code>/v1/models</code> advertises.
+            </small>
+            <div id="alias-list" style="margin-top: 0.5rem;"></div>
+
+            <div id="alias-editor" style="display: none; margin-top: 1rem; border-top: 1px solid #334155; padding-top: 1rem;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="alias-name">Alias</label>
+                        <input type="text" id="alias-name" placeholder="e.g. gpt-4o"
+                               autocapitalize="off" autocorrect="off" spellcheck="false"
+                               pattern="[a-z0-9._-]+" maxlength="64">
+                        <small class="field-help">Unique. Lowercase letters, digits, <code>.</code> <code>_</code> <code>-</code>. Can't collide with a model id. Renaming is allowed.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="alias-target">Target model</label>
+                        <select id="alias-target"></select>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 0.75rem; margin-top: 0.75rem;">
+                    <button type="button" class="btn btn-primary btn-sm" onclick="saveAlias()">Save</button>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="closeAliasEditor()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
         <div style="display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: 1rem;">
             <h2 class="section" style="margin: 0;">Models</h2>
             <input type="search" id="model-filter" placeholder="Filter by name…" autocomplete="off"
@@ -109,11 +150,6 @@
                     <tr>
                         <th class="sortable" scope="col" data-sort-key="state" data-sort-type="number" aria-sort="none">State</th>
                         <th class="sortable" scope="col" data-sort-key="name" data-sort-type="text" aria-sort="none">Name</th>
-                        <th class="sortable" scope="col" data-sort-key="profile" data-sort-type="text" aria-sort="none">Profile</th>
-                        <th class="sortable" scope="col" data-sort-key="architecture" data-sort-type="text" aria-sort="none">Arch</th>
-                        <th class="sortable" scope="col" data-sort-key="size" data-sort-type="text" aria-sort="none">Size</th>
-                        <th class="sortable" scope="col" data-sort-key="quant" data-sort-type="text" aria-sort="none">Quant</th>
-                        <th class="sortable" scope="col" data-sort-key="format" data-sort-type="text" aria-sort="none">Format</th>
                         <th class="sortable" scope="col" data-sort-key="context" data-sort-type="number" aria-sort="none">Context</th>
                         <th class="sortable" scope="col" data-sort-key="file-size" data-sort-type="number" aria-sort="none">File</th>
                         <th class="sortable" scope="col" data-sort-key="vram" data-sort-type="number" aria-sort="none">VRAM</th>
@@ -127,20 +163,10 @@
                         id="model-row-{{ model.id }}"
                         data-model-id="{{ model.id }}"
                         data-name="{{ model.name }}"
-                        data-profile="{{ model.profile }}"
-                        data-architecture="{{ model.architecture_display }}"
-                        data-quant="{{ model.quant_label }}"
-                        data-size-label="{{ model.size_label }}"
-                        data-format="{{ model.format_str }}"
                         data-state="{{ model.state_class }}"
                         data-loaded-priority="{{ model.loaded_sort_key }}"
                         data-sort-state="{{ model.state_sort_key }}"
                         data-sort-name="{{ model.name }}"
-                        data-sort-profile="{{ model.profile }}"
-                        data-sort-architecture="{{ model.architecture_display }}"
-                        data-sort-size="{{ model.size_label }}"
-                        data-sort-quant="{{ model.quant_label }}"
-                        data-sort-format="{{ model.format_str }}"
                         data-sort-context="{{ model.context_tokens }}"
                         data-sort-file-size="{% if !model.file_size_gib_str.eq("—") %}{{ model.file_size_bytes }}{% endif %}"
                         data-sort-vram="{% if !model.required_vram_gib_str.eq("—") %}{{ model.required_vram_bytes }}{% endif %}"
@@ -151,29 +177,6 @@
                             <span class="model-row-name">{{ model.name }}</span>
                             <code class="model-row-id">{{ model.id }}</code>
                         </td>
-                        <td>
-                            {% if model.profile.is_empty() %}
-                            <span class="model-muted">—</span>
-                            {% else %}
-                            <span class="model-chip profile">{{ model.profile }}</span>
-                            {% endif %}
-                        </td>
-                        <td>{{ model.architecture_display }}</td>
-                        <td>
-                            {% if model.size_label.is_empty() %}
-                            <span class="model-muted">—</span>
-                            {% else %}
-                            <span class="model-chip size">{{ model.size_label }}</span>
-                            {% endif %}
-                        </td>
-                        <td>
-                            {% if model.quant_label.is_empty() %}
-                            <span class="model-muted">—</span>
-                            {% else %}
-                            <span class="model-chip quant">{{ model.quant_label }}</span>
-                            {% endif %}
-                        </td>
-                        <td><span class="model-chip">{{ model.format_str }}</span></td>
                         <td>{{ model.context_str }}</td>
                         <td>
                             {% if model.file_size_gib_str.eq("—") %}
@@ -209,7 +212,7 @@
                     </tr>
                     {% endfor %}
                     <tr class="model-filter-empty" id="model-filter-empty" hidden>
-                        <td colspan="12">No models match this filter.</td>
+                        <td colspan="7">No models match this filter.</td>
                     </tr>
                 </tbody>
             </table>
@@ -773,7 +776,7 @@
 .browser-item.is-gguf { color:#34d399; }
 /* ── Model table ── */
 .model-table-wrap { background:#1e293b; border:1px solid #334155; border-radius:8px; overflow:auto; box-shadow:0 16px 36px rgba(0,0,0,0.18); }
-.model-table { min-width:1180px; }
+.model-table { min-width:720px; }
 .model-table th { position:sticky; top:0; z-index:1; background:#1e293b; padding:0.65rem 0.75rem; font-size:0.78rem; white-space:nowrap; }
 .model-table td { padding:0.65rem 0.75rem; font-size:0.88rem; vertical-align:middle; }
 .model-table tbody tr { transition:background 0.15s; }
@@ -1590,11 +1593,6 @@ function applyModelFilter() {
         const haystack = [
             row.dataset.modelId,
             row.dataset.name,
-            row.dataset.profile,
-            row.dataset.architecture,
-            row.dataset.sizeLabel,
-            row.dataset.quant,
-            row.dataset.format,
             row.dataset.state,
         ].join(' ').toLowerCase();
         const show = !needle || haystack.includes(needle);
@@ -1884,6 +1882,215 @@ async function deletePreset(id, name) {
     }
     await refreshPresetList();
 }
+
+// ===== Alias management (top of Models column) =====
+
+let _aliasEditorMode = 'add';  // 'add' | 'edit'
+let _aliasEditingOriginal = null;  // original alias name when editing (for rename)
+
+// Canonical alias form, mirrored server-side: lowercase a-z, digits, . _ -
+function normalizeAliasName(s) { return String(s || '').trim().toLowerCase(); }
+function isValidAliasName(s) { return /^[a-z0-9._-]{1,64}$/.test(s); }
+
+async function refreshAliasList() {
+    const list = document.getElementById('alias-list');
+    if (!list) return;
+    list.innerHTML = '<div style="color:#94a3b8;">Loading…</div>';
+    try {
+        const r = await fetch('/api/aliases');
+        if (!r.ok) { list.innerHTML = '<div style="color:#fca5a5;">Failed to load aliases.</div>'; return; }
+        const aliases = await r.json();
+        if (aliases.length === 0) {
+            list.innerHTML = '<div style="color:#94a3b8; font-style:italic;">No aliases yet. Add one above.</div>';
+        } else {
+            list.innerHTML = '';
+            aliases.forEach(a => list.appendChild(renderAliasRow(a)));
+        }
+    } catch (e) {
+        list.innerHTML = `<div style="color:#fca5a5;">Error: ${e}</div>`;
+    }
+}
+
+function renderAliasRow(a) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:0.75rem; align-items:center; padding:0.5rem 0; border-bottom:1px solid #334155;';
+    const targetHtml = a.target
+        ? `<code>${escapeHtmlText(a.target)}</code>`
+        : `<span style="color:#fbbf24; font-style:italic;">unassigned</span>`;
+    row.innerHTML = `
+        <div style="flex:1; min-width:0;">
+            <code class="model-chip profile">${escapeHtmlText(a.alias)}</code>
+            <span style="color:#64748b;">→</span>
+            ${targetHtml}
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm">Edit</button>
+        <button type="button" class="btn btn-danger btn-sm">Delete</button>
+    `;
+    row.querySelectorAll('button')[0].addEventListener('click', () => openAliasEditor(a));
+    row.querySelectorAll('button')[1].addEventListener('click', () => deleteAlias(a.alias));
+    return row;
+}
+
+// Rebuild the target <select>, optionally pre-selecting. The first option is
+// "— Unassigned —" (empty value). Aliases are listed first (an alias can point
+// at another alias — e.g. several aliases sharing one `default`), then models.
+// The alias being edited is excluded so it can't target itself.
+async function refreshAliasTargetSelect(selected) {
+    const sel = document.getElementById('alias-target');
+    if (!sel) return;
+    sel.innerHTML = '';
+    const unassigned = document.createElement('option');
+    unassigned.value = '';
+    unassigned.textContent = '— Unassigned —';
+    sel.appendChild(unassigned);
+    try {
+        const [mr, ar] = await Promise.all([fetch('/api/models'), fetch('/api/aliases')]);
+        const models = mr.ok ? await mr.json() : [];
+        const aliases = ar.ok ? await ar.json() : [];
+
+        const aliasOpts = aliases
+            .filter(a => a.alias !== _aliasEditingOriginal)
+            .sort((a, b) => a.alias.localeCompare(b.alias));
+        if (aliasOpts.length) {
+            const group = document.createElement('optgroup');
+            group.label = 'Aliases';
+            aliasOpts.forEach(a => {
+                const opt = document.createElement('option');
+                opt.value = a.alias;
+                opt.textContent = a.target ? `${a.alias} → ${a.target}` : `${a.alias} (unassigned)`;
+                group.appendChild(opt);
+            });
+            sel.appendChild(group);
+        }
+
+        const modelGroup = document.createElement('optgroup');
+        modelGroup.label = 'Models';
+        models
+            .slice()
+            .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
+            .forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m.id;
+                opt.textContent = m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id;
+                modelGroup.appendChild(opt);
+            });
+        sel.appendChild(modelGroup);
+    } catch (e) { /* leave just the unassigned option on failure */ }
+    sel.value = selected || '';
+}
+
+async function openAliasEditor(existing) {
+    _aliasEditorMode = existing ? 'edit' : 'add';
+    _aliasEditingOriginal = existing ? existing.alias : null;
+    document.getElementById('alias-editor').style.display = '';
+    const nameEl = document.getElementById('alias-name');
+    nameEl.value = existing ? existing.alias : '';
+    // Names are editable — including renaming an existing alias.
+    await refreshAliasTargetSelect(existing ? existing.target : undefined);
+    setTimeout(() => nameEl.focus(), 20);
+}
+
+function closeAliasEditor() {
+    document.getElementById('alias-editor').style.display = 'none';
+}
+
+async function saveAlias() {
+    const nameEl = document.getElementById('alias-name');
+    const alias = normalizeAliasName(nameEl.value);
+    nameEl.value = alias; // reflect the normalized (lowercased/trimmed) value
+    const target = document.getElementById('alias-target').value; // '' = unassigned
+    if (!alias) { alert('Alias name is required.'); return; }
+    if (!isValidAliasName(alias)) {
+        alert("Alias must be 1–64 chars: lowercase letters, digits, '.', '_' or '-'.");
+        return;
+    }
+
+    // Renaming an existing alias: the name is the storage key, so create the
+    // new entry first (validates uniqueness/charset), then drop the old one.
+    const renaming = _aliasEditorMode === 'edit'
+        && _aliasEditingOriginal && _aliasEditingOriginal !== alias;
+    if (renaming) {
+        const cr = await fetch('/api/aliases', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ alias, target }),
+        });
+        if (!cr.ok) {
+            const j = await cr.json().catch(() => ({}));
+            alert('Rename failed: ' + (j.error || cr.statusText));
+            return;
+        }
+        await fetch(`/api/aliases/${encodeURIComponent(_aliasEditingOriginal)}`, { method: 'DELETE' });
+        closeAliasEditor();
+        await refreshAliasList();
+        return;
+    }
+
+    const body = JSON.stringify({ alias, target });
+    const url = _aliasEditorMode === 'add' ? '/api/aliases' : `/api/aliases/${encodeURIComponent(alias)}`;
+    const method = _aliasEditorMode === 'add' ? 'POST' : 'PUT';
+    const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body });
+    if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        alert('Save failed: ' + (j.error || r.statusText));
+        return;
+    }
+    closeAliasEditor();
+    await refreshAliasList();
+}
+
+async function deleteAlias(name) {
+    if (!confirm(`Delete alias "${name}"?`)) return;
+    const r = await fetch(`/api/aliases/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        alert('Delete failed: ' + (j.error || r.statusText));
+        return;
+    }
+    await refreshAliasList();
+}
+
+// ----- Exposure switch (full-list vs aliases-only) -----
+
+async function loadAliasExposure() {
+    const toggle = document.getElementById('alias-exposure-toggle');
+    if (!toggle) return;
+    try {
+        const r = await fetch('/api/settings');
+        if (!r.ok) return;
+        const s = await r.json();
+        toggle.checked = s.model_exposure === 'aliases_only';
+    } catch (e) { /* leave default (unchecked = full list) */ }
+}
+
+async function saveAliasExposure(checked) {
+    // Read-modify-write the full settings object so loop-guard settings are preserved.
+    let settings = {};
+    try {
+        const r = await fetch('/api/settings');
+        if (r.ok) settings = await r.json();
+    } catch (e) { /* fall back to a minimal body */ }
+    settings.model_exposure = checked ? 'aliases_only' : 'full_list';
+    try {
+        const r = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(settings),
+        });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+        if (typeof _currentAppSettings === 'object' && _currentAppSettings) {
+            _currentAppSettings.model_exposure = settings.model_exposure;
+        }
+    } catch (err) {
+        alert('Failed to save exposure mode: ' + (err.message || err));
+        await loadAliasExposure(); // revert toggle to the server's truth
+    }
+}
+
+(function initAliases() {
+    refreshAliasList();
+    loadAliasExposure();
+})();
 
 // ----- Submit -----
 document.getElementById('model-form').addEventListener('submit', async (e) => {

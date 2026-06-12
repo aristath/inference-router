@@ -16,7 +16,7 @@ use axum::routing::{any, get, post};
 use axum::Json;
 use futures_util::{stream, Stream};
 use inference_router::api::proxy;
-use inference_router::config::{JsonStore, ModelConfig, ModelState};
+use inference_router::config::{JsonStore, ModelAlias, ModelConfig, ModelExposure, ModelState};
 use inference_router::orchestrator::{AppState, Orchestrator};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -265,6 +265,21 @@ async fn spawn_capturing_fake_llama() -> (u16, Arc<tokio::sync::Mutex<Option<ser
 /// Builds an Orchestrator + axum Router with a "loaded" model pointed at the
 /// given upstream port. No real spawn — we synthesize `Running` state.
 async fn build_proxy_app(upstream_port: u16) -> axum::Router {
+    router_for(build_proxy_orchestrator(upstream_port).await)
+}
+
+/// Wraps an orchestrator in the proxy router (so tests can pre-configure the
+/// orchestrator — e.g. add aliases — before serving).
+fn router_for(orchestrator: Arc<Orchestrator>) -> axum::Router {
+    let state: AppState = orchestrator;
+    axum::Router::new()
+        .route("/v1/models", get(proxy::list_v1_models))
+        .route("/v1/{*rest}", any(proxy::proxy_handler))
+        .with_state(state)
+}
+
+/// Builds the orchestrator with a single "loaded" model pointed at `upstream_port`.
+async fn build_proxy_orchestrator(upstream_port: u16) -> Arc<Orchestrator> {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(
         tmp.path().join("models.json"),
@@ -272,11 +287,14 @@ async fn build_proxy_app(upstream_port: u16) -> axum::Router {
     let presets = Arc::new(inference_router::config::JsonStore::<
         Vec<inference_router::config::BinaryPreset>,
     >::new(tmp.path().join("presets.json")));
+    let aliases = Arc::new(inference_router::config::JsonStore::<
+        Vec<inference_router::config::ModelAlias>,
+    >::new(tmp.path().join("aliases.json")));
     // Leak the tempdir so it outlives the test — dropping mid-test deletes the
     // config dir out from under the store.
     std::mem::forget(tmp);
 
-    let orchestrator = Arc::new(Orchestrator::new(store, presets, 0));
+    let orchestrator = Arc::new(Orchestrator::new(store, presets, aliases, 0));
     orchestrator
         .add_model(ModelConfig {
             id: "fake".into(),
@@ -301,11 +319,7 @@ async fn build_proxy_app(upstream_port: u16) -> axum::Router {
         .await
         .register_port("fake", upstream_port);
 
-    let state: AppState = orchestrator;
-    axum::Router::new()
-        .route("/v1/models", get(proxy::list_v1_models))
-        .route("/v1/{*rest}", any(proxy::proxy_handler))
-        .with_state(state)
+    orchestrator
 }
 
 async fn start_proxy_server(app: axum::Router) -> u16 {
@@ -584,4 +598,169 @@ async fn v1_models_synthesizes_list_without_upstream() {
     assert_eq!(body["object"], "list");
     let data = body["data"].as_array().unwrap();
     assert!(data.iter().any(|m| m["id"] == "fake"));
+}
+
+#[tokio::test]
+async fn proxy_routes_alias_to_target_model() {
+    let upstream = spawn_fake_llama().await;
+    let orchestrator = build_proxy_orchestrator(upstream).await;
+    orchestrator
+        .add_alias(ModelAlias {
+            alias: "gpt-4o".into(),
+            target: "fake".into(),
+        })
+        .await
+        .unwrap();
+    let proxy_port = start_proxy_server(router_for(orchestrator)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    // The alias resolved to the running "fake" model and served its response.
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.text().await.unwrap(), JSON_RESPONSE);
+}
+
+#[tokio::test]
+async fn proxy_routes_alias_chain_to_target_model() {
+    let upstream = spawn_fake_llama().await;
+    let orchestrator = build_proxy_orchestrator(upstream).await;
+    // coder -> default -> fake (a real, running model).
+    orchestrator
+        .add_alias(ModelAlias {
+            alias: "default".into(),
+            target: "fake".into(),
+        })
+        .await
+        .unwrap();
+    orchestrator
+        .add_alias(ModelAlias {
+            alias: "coder".into(),
+            target: "default".into(),
+        })
+        .await
+        .unwrap();
+    let proxy_port = start_proxy_server(router_for(orchestrator)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"coder","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.text().await.unwrap(), JSON_RESPONSE);
+}
+
+#[tokio::test]
+async fn proxy_returns_503_for_unassigned_alias() {
+    let upstream = spawn_fake_llama().await;
+    let orchestrator = build_proxy_orchestrator(upstream).await;
+    // A canonical alias defined but not yet pointed at a model.
+    orchestrator
+        .add_alias(ModelAlias {
+            alias: "planner".into(),
+            target: String::new(),
+        })
+        .await
+        .unwrap();
+    let proxy_port = start_proxy_server(router_for(orchestrator)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"planner","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("not assigned"),
+        "expected a clear unassigned-alias error, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn v1_models_full_list_includes_models_and_aliases() {
+    let upstream = spawn_fake_llama().await;
+    let orchestrator = build_proxy_orchestrator(upstream).await;
+    orchestrator
+        .add_alias(ModelAlias {
+            alias: "gpt-4o".into(),
+            target: "fake".into(),
+        })
+        .await
+        .unwrap();
+    let proxy_port = start_proxy_server(router_for(orchestrator)).await;
+
+    let client = reqwest::Client::new();
+    let body: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{}/v1/models", proxy_port))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"fake"), "full list must include the model");
+    assert!(ids.contains(&"gpt-4o"), "full list must include the alias");
+}
+
+#[tokio::test]
+async fn v1_models_aliases_only_hides_real_models() {
+    let upstream = spawn_fake_llama().await;
+    let orchestrator = build_proxy_orchestrator(upstream).await;
+    orchestrator
+        .add_alias(ModelAlias {
+            alias: "gpt-4o".into(),
+            target: "fake".into(),
+        })
+        .await
+        .unwrap();
+    let mut settings = orchestrator.settings().await;
+    settings.model_exposure = ModelExposure::AliasesOnly;
+    orchestrator.update_settings(settings).await;
+    let proxy_port = start_proxy_server(router_for(orchestrator)).await;
+
+    let client = reqwest::Client::new();
+    let body: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{}/v1/models", proxy_port))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["gpt-4o"], "aliases-only must list only aliases");
 }

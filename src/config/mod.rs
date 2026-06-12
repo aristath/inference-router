@@ -11,13 +11,16 @@
 //! All configuration is stored in `~/.config/inference-router/` as JSON files:
 //! - `models.json`: All model definitions
 //! - `presets.json`: Binary path presets
+//! - `aliases.json`: Model name aliases
 //! - `settings.json`: Application settings
 
+pub mod alias;
 pub mod model;
 pub mod preset;
 pub mod settings;
 pub mod store;
 
+pub use alias::*;
 pub use model::*;
 pub use preset::*;
 pub use settings::*;
