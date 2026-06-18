@@ -34,46 +34,76 @@
     </div>
 </div>
 
-<h2 class="section" style="margin-top: 1.5rem;">GPUs</h2>
-{% for gpu in gpus %}
-<div class="card" id="gpu-card-{{ gpu.id }}">
-    <div style="display: flex; justify-content: space-between; align-items: baseline;">
-        <h2 style="margin: 0;">GPU {{ gpu.id }} <small style="color: #94a3b8;">{{ gpu.label }}</small></h2>
-        <span class="chip-temp {{ gpu.temp_class }}" id="gpu-temp-chip-{{ gpu.id }}"
-              title="GPU junction temperature">
-            <span class="gpu-temp">{{ gpu.temp_c_str }}</span>°C
-        </span>
-    </div>
-    <div class="gpu-metric" id="gpu-vram-{{ gpu.id }}" style="margin-top: 0.9rem;">
+<div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 1rem;">
+    <h2 class="section" style="margin: 0;">GPUs</h2>
+    {% if gpu_totals.count > 0 %}
+    <span class="gpu-metric-label">{{ gpu_totals.count }} device{% if gpu_totals.count != 1 %}s{% endif %}</span>
+    {% endif %}
+</div>
+<div class="card" id="gpu-card">
+    {% if gpus.is_empty() %}
+    <p style="color: #94a3b8;">No AMD GPUs found via sysfs.</p>
+    {% else %}
+    <!-- Aggregate totals across all GPUs -->
+    <div class="gpu-metric">
         <div class="gpu-metric-head">
-            <span class="gpu-metric-label">VRAM</span>
+            <span class="gpu-metric-label">Total VRAM</span>
             <span class="gpu-metric-value">
-                <span class="gpu-vram-used">{{ gpu.used_gib_str }}</span> /
-                {{ gpu.total_gib_str }} GiB
-                &middot; <span class="gpu-vram-free">{{ gpu.free_gib_str }}</span> GiB free
+                {{ gpu_totals.vram_used_gib_str }} / {{ gpu_totals.vram_total_gib_str }} GiB
+                &middot; {{ gpu_totals.vram_free_gib_str }} GiB free
             </span>
         </div>
         <div class="progress-bar">
-            <div class="progress-bar-fill {{ gpu.usage_class }}" style="width: {{ gpu.usage_pct_str }}%"></div>
+            <div class="progress-bar-fill {{ gpu_totals.vram_class }}" style="width: {{ gpu_totals.vram_pct_str }}%"></div>
         </div>
     </div>
-    <div class="gpu-metric" id="gpu-busy-{{ gpu.id }}" style="margin-top: 0.75rem;">
+    <div class="gpu-metric" style="margin-top: 0.75rem;">
         <div class="gpu-metric-head">
-            <span class="gpu-metric-label">Activity</span>
-            <span class="gpu-metric-value"><span class="gpu-busy-pct">{{ gpu.busy_pct_str }}</span>%</span>
+            <span class="gpu-metric-label">Total Activity</span>
+            <span class="gpu-metric-value">{{ gpu_totals.busy_pct_str }}%</span>
         </div>
         <div class="progress-bar">
-            <div class="progress-bar-fill {{ gpu.busy_class }}" style="width: {{ gpu.busy_pct_str }}%"></div>
+            <div class="progress-bar-fill {{ gpu_totals.busy_class }}" style="width: {{ gpu_totals.busy_pct_str }}%"></div>
         </div>
     </div>
+
+    <!-- Per-GPU breakdown -->
+    <div class="gpu-breakdown">
+        {% for gpu in gpus %}
+        <div class="gpu-breakdown-item" id="gpu-item-{{ gpu.id }}">
+            <div class="gpu-breakdown-head">
+                <span class="gpu-breakdown-name">GPU {{ gpu.id }} <small style="color: #94a3b8; font-weight: 400;">{{ gpu.label }}</small></span>
+                <span class="chip-temp {{ gpu.temp_class }}" id="gpu-temp-chip-{{ gpu.id }}" title="GPU junction temperature">
+                    <span class="gpu-temp">{{ gpu.temp_c_str }}</span>°C
+                </span>
+            </div>
+            <div class="gpu-metric" id="gpu-vram-{{ gpu.id }}" style="margin-top: 0.5rem;">
+                <div class="gpu-metric-head">
+                    <span class="gpu-metric-label">VRAM</span>
+                    <span class="gpu-metric-value">
+                        <span class="gpu-vram-used">{{ gpu.used_gib_str }}</span> /
+                        {{ gpu.total_gib_str }} GiB
+                        &middot; <span class="gpu-vram-free">{{ gpu.free_gib_str }}</span> GiB free
+                    </span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill {{ gpu.usage_class }}" style="width: {{ gpu.usage_pct_str }}%"></div>
+                </div>
+            </div>
+            <div class="gpu-metric" id="gpu-busy-{{ gpu.id }}" style="margin-top: 0.4rem;">
+                <div class="gpu-metric-head">
+                    <span class="gpu-metric-label">Activity</span>
+                    <span class="gpu-metric-value"><span class="gpu-busy-pct">{{ gpu.busy_pct_str }}</span>%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill {{ gpu.busy_class }}" style="width: {{ gpu.busy_pct_str }}%"></div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
 </div>
-{% endfor %}
-{% if gpus.is_empty() %}
-<div class="card">
-    <h2>No GPUs detected</h2>
-    <p style="color: #94a3b8;">No AMD GPUs found via sysfs.</p>
-</div>
-{% endif %}
 
 <h2 class="section" style="margin-top: 1.5rem;">Events</h2>
 <div class="card">

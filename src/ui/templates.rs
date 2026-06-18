@@ -60,6 +60,51 @@ impl GpuDisplay {
     }
 }
 
+/// Aggregate VRAM + activity across all GPUs, shown at the top of the single
+/// "GPUs" widget above the per-GPU breakdown. VRAM is additive (sum of used /
+/// sum of total); activity is the mean utilization across GPUs, since it's a
+/// percentage and summing it would be meaningless.
+#[derive(Debug, Clone)]
+pub struct GpuTotals {
+    pub count: usize,
+    pub vram_used_gib_str: String,
+    pub vram_total_gib_str: String,
+    pub vram_free_gib_str: String,
+    pub vram_pct_str: String,
+    pub vram_class: String,
+    pub busy_pct_str: String,
+    pub busy_class: String,
+}
+
+impl GpuTotals {
+    pub fn from_gpus(gpus: &[GpuInfo]) -> Self {
+        let count = gpus.len();
+        let used: u64 = gpus.iter().map(|g| g.used_vram).sum();
+        let total: u64 = gpus.iter().map(|g| g.total_vram).sum();
+        let free = total.saturating_sub(used);
+        let vram_pct = if total > 0 {
+            used as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        let busy_avg = if count > 0 {
+            gpus.iter().map(|g| g.busy_pct as u32).sum::<u32>() as f64 / count as f64
+        } else {
+            0.0
+        };
+        Self {
+            count,
+            vram_used_gib_str: format!("{:.1}", used as f64 / 1_073_741_824.0),
+            vram_total_gib_str: format!("{:.1}", total as f64 / 1_073_741_824.0),
+            vram_free_gib_str: format!("{:.1}", free as f64 / 1_073_741_824.0),
+            vram_pct_str: format!("{:.0}", vram_pct),
+            vram_class: bar_class(vram_pct),
+            busy_pct_str: format!("{:.0}", busy_avg),
+            busy_class: bar_class(busy_avg),
+        }
+    }
+}
+
 /// Pre-formatted host metrics (CPU / RAM / CPU temp) for the dashboard.
 #[derive(Debug, Clone)]
 pub struct SystemDisplay {
@@ -438,6 +483,7 @@ pub struct DashboardTemplate {
     pub title: String,
     pub system: SystemDisplay,
     pub gpus: Vec<GpuDisplay>,
+    pub gpu_totals: GpuTotals,
     pub events: Vec<EventDisplay>,
     /// Already filtered + sorted for display.
     pub models: Vec<ModelDisplay>,
@@ -461,6 +507,7 @@ pub struct DashboardTemplate {
 pub struct DashboardFragmentTemplate {
     pub system: SystemDisplay,
     pub gpus: Vec<GpuDisplay>,
+    pub gpu_totals: GpuTotals,
     pub events: Vec<EventDisplay>,
     pub models: Vec<ModelDisplay>,
     pub has_any_models: bool,
@@ -603,6 +650,48 @@ mod tests {
         assert_eq!(ev.time_str.matches(':').count(), 2);
     }
 
+    fn gpu(id: &str, total: u64, used: u64, busy: u8) -> GpuInfo {
+        GpuInfo {
+            id: id.into(),
+            pci_bus_id: None,
+            vulkan_device: None,
+            vulkan_index: None,
+            cuda_device: None,
+            cuda_index: None,
+            integrated: false,
+            total_vram: total,
+            used_vram: used,
+            busy_pct: busy,
+            temp_c: None,
+        }
+    }
+
+    #[test]
+    fn gpu_totals_sum_vram_and_average_activity() {
+        const GIB: u64 = 1_073_741_824;
+        let gpus = [
+            gpu("0", 32 * GIB, 8 * GIB, 40),
+            gpu("1", 32 * GIB, 24 * GIB, 60),
+        ];
+        let t = GpuTotals::from_gpus(&gpus);
+        assert_eq!(t.count, 2);
+        // VRAM is summed across devices.
+        assert_eq!(t.vram_used_gib_str, "32.0"); // 8 + 24
+        assert_eq!(t.vram_total_gib_str, "64.0");
+        assert_eq!(t.vram_free_gib_str, "32.0");
+        assert_eq!(t.vram_pct_str, "50"); // 32 / 64
+                                          // Activity is the mean utilization, not a sum.
+        assert_eq!(t.busy_pct_str, "50"); // (40 + 60) / 2
+    }
+
+    #[test]
+    fn gpu_totals_with_no_devices_is_zeroed() {
+        let t = GpuTotals::from_gpus(&[]);
+        assert_eq!(t.count, 0);
+        assert_eq!(t.vram_pct_str, "0");
+        assert_eq!(t.busy_pct_str, "0");
+    }
+
     #[test]
     fn fragment_template_wraps_regions_for_oob_morph() {
         let tpl = DashboardFragmentTemplate {
@@ -613,6 +702,7 @@ mod tests {
                 cpu_temp_c: None,
             }),
             gpus: vec![],
+            gpu_totals: GpuTotals::from_gpus(&[]),
             events: vec![],
             models: vec![model("m1", "Model One", ModelState::Idle, 1)],
             has_any_models: true,

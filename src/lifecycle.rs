@@ -16,7 +16,7 @@ use crate::config::{AppSettings, BinaryPreset, JsonStore, ModelAlias, ModelConfi
 use crate::orchestrator::{AppState, Orchestrator};
 use crate::ui::templates::{
     sort_and_filter, DashboardFragmentTemplate, DashboardTemplate, EventDisplay, GpuDisplay,
-    ModelDisplay, ModelSort, SystemDisplay,
+    GpuTotals, ModelDisplay, ModelSort, SystemDisplay,
 };
 
 const DEFAULT_CONFIG_DIR: &str = "~/.config/inference-router";
@@ -186,6 +186,7 @@ struct DashboardQuery {
 struct LiveData {
     system: SystemDisplay,
     gpus: Vec<GpuDisplay>,
+    gpu_totals: GpuTotals,
     events: Vec<EventDisplay>,
     models: Vec<ModelDisplay>,
     has_any_models: bool,
@@ -218,6 +219,7 @@ async fn collect_live_data(state: &AppState, sort: &str, dir: &str, query: &str)
 
     LiveData {
         system: SystemDisplay::from_stats(sys),
+        gpu_totals: GpuTotals::from_gpus(&gpus),
         gpus: gpus.iter().map(GpuDisplay::from_gpu).collect(),
         events: events
             .into_iter()
@@ -239,6 +241,7 @@ async fn index_page(State(state): State<AppState>) -> impl IntoResponse {
         title: "Dashboard".into(),
         system: live.system,
         gpus: live.gpus,
+        gpu_totals: live.gpu_totals,
         events: live.events,
         models: live.models,
         has_any_models: live.has_any_models,
@@ -264,6 +267,7 @@ async fn dashboard_fragment(
     let tpl = DashboardFragmentTemplate {
         system: live.system,
         gpus: live.gpus,
+        gpu_totals: live.gpu_totals,
         events: live.events,
         models: live.models,
         has_any_models: live.has_any_models,
