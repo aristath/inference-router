@@ -5,84 +5,8 @@
 <div class="dashboard-grid">
     <!-- ===== Left column: host + GPUs ===== -->
     <div class="col">
-        <h2 class="section">Host</h2>
-        <div class="card" id="host-card">
-            <div style="display: flex; justify-content: space-between; align-items: baseline;">
-                <h2 style="margin: 0;">CPU &amp; RAM</h2>
-                <span class="chip-temp {{ system.cpu_temp_class }}" id="host-cpu-temp-chip"
-                      title="CPU temperature">
-                    <span id="host-cpu-temp">{{ system.cpu_temp_c_str }}</span>°C
-                </span>
-            </div>
-            <div class="gpu-metric" id="host-cpu" style="margin-top: 0.9rem;">
-                <div class="gpu-metric-head">
-                    <span class="gpu-metric-label">CPU</span>
-                    <span class="gpu-metric-value"><span id="host-cpu-pct">{{ system.cpu_pct_str }}</span>%</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-bar-fill {{ system.cpu_class }}" style="width: {{ system.cpu_pct_str }}%"></div>
-                </div>
-            </div>
-            <div class="gpu-metric" id="host-ram" style="margin-top: 0.75rem;">
-                <div class="gpu-metric-head">
-                    <span class="gpu-metric-label">RAM</span>
-                    <span class="gpu-metric-value">
-                        <span id="host-ram-used">{{ system.ram_used_gib_str }}</span> /
-                        {{ system.ram_total_gib_str }} GiB
-                    </span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-bar-fill {{ system.ram_class }}" style="width: {{ system.ram_pct_str }}%"></div>
-                </div>
-            </div>
-        </div>
-
-        <h2 class="section" style="margin-top: 1.5rem;">GPUs</h2>
-        {% for gpu in gpus %}
-        <div class="card" id="gpu-card-{{ gpu.id }}">
-            <div style="display: flex; justify-content: space-between; align-items: baseline;">
-                <h2 style="margin: 0;">GPU {{ gpu.id }} <small style="color: #94a3b8;">{{ gpu.label }}</small></h2>
-                <span class="chip-temp {{ gpu.temp_class }}" id="gpu-temp-chip-{{ gpu.id }}"
-                      title="GPU junction temperature">
-                    <span class="gpu-temp">{{ gpu.temp_c_str }}</span>°C
-                </span>
-            </div>
-            <div class="gpu-metric" id="gpu-vram-{{ gpu.id }}" style="margin-top: 0.9rem;">
-                <div class="gpu-metric-head">
-                    <span class="gpu-metric-label">VRAM</span>
-                    <span class="gpu-metric-value">
-                        <span class="gpu-vram-used">{{ gpu.used_gib_str }}</span> /
-                        {{ gpu.total_gib_str }} GiB
-                        &middot; <span class="gpu-vram-free">{{ gpu.free_gib_str }}</span> GiB free
-                    </span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-bar-fill {{ gpu.usage_class }}" style="width: {{ gpu.usage_pct_str }}%"></div>
-                </div>
-            </div>
-            <div class="gpu-metric" id="gpu-busy-{{ gpu.id }}" style="margin-top: 0.75rem;">
-                <div class="gpu-metric-head">
-                    <span class="gpu-metric-label">Activity</span>
-                    <span class="gpu-metric-value"><span class="gpu-busy-pct">{{ gpu.busy_pct_str }}</span>%</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-bar-fill {{ gpu.busy_class }}" style="width: {{ gpu.busy_pct_str }}%"></div>
-                </div>
-            </div>
-        </div>
-        {% endfor %}
-        {% if gpus.is_empty() %}
-        <div class="card">
-            <h2>No GPUs detected</h2>
-            <p style="color: #94a3b8;">No AMD GPUs found via sysfs.</p>
-        </div>
-        {% endif %}
-
-        <h2 class="section" style="margin-top: 1.5rem;">Events</h2>
-        <div class="card">
-            <div id="event-log" class="event-log">
-                <div style="color:#64748b;">No recent events.</div>
-            </div>
+        <div id="live-left">
+        {% include "_live_left_inner.html" %}
         </div>
     </div>
 
@@ -136,88 +60,9 @@
             <button type="button" class="btn btn-primary" onclick="openAddModelModal()">+ Add Model</button>
         </div>
 
-        {% if models.is_empty() %}
-        <div class="card">
-            <div class="empty-state">
-                <p>No models configured.</p>
-                <button type="button" class="btn btn-primary" style="margin-top: 1rem;" onclick="openAddModelModal()">Add your first model</button>
-            </div>
+        <div id="live-models">
+        {% include "_live_models_inner.html" %}
         </div>
-        {% else %}
-        <div class="model-table-wrap" id="model-table-container">
-            <table class="model-table" id="model-table">
-                <thead>
-                    <tr>
-                        <th class="sortable" scope="col" data-sort-key="state" data-sort-type="number" aria-sort="none">State</th>
-                        <th class="sortable" scope="col" data-sort-key="name" data-sort-type="text" aria-sort="none">Name</th>
-                        <th class="sortable" scope="col" data-sort-key="context" data-sort-type="number" aria-sort="none">Context</th>
-                        <th class="sortable" scope="col" data-sort-key="file-size" data-sort-type="number" aria-sort="none">File</th>
-                        <th class="sortable" scope="col" data-sort-key="vram" data-sort-type="number" aria-sort="none">VRAM</th>
-                        <th class="sortable" scope="col" data-sort-key="activity" data-sort-type="number" aria-sort="none">Activity</th>
-                        <th class="sortable" scope="col" data-sort-key="actions" data-sort-type="text" aria-sort="none">Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for model in models %}
-                    <tr class="model-row{% if model.is_loaded %} is-loaded{% endif %}"
-                        id="model-row-{{ model.id }}"
-                        data-model-id="{{ model.id }}"
-                        data-name="{{ model.name }}"
-                        data-state="{{ model.state_class }}"
-                        data-loaded-priority="{{ model.loaded_sort_key }}"
-                        data-sort-state="{{ model.state_sort_key }}"
-                        data-sort-name="{{ model.name }}"
-                        data-sort-context="{{ model.context_tokens }}"
-                        data-sort-file-size="{% if !model.file_size_gib_str.eq("—") %}{{ model.file_size_bytes }}{% endif %}"
-                        data-sort-vram="{% if !model.required_vram_gib_str.eq("—") %}{{ model.required_vram_bytes }}{% endif %}"
-                        data-sort-activity="0"
-                        data-sort-actions="{{ model.primary_action_sort }}">
-                        <td><span class="badge badge-{{ model.state_class }}" id="model-status-{{ model.id }}">{{ model.state_display }}</span></td>
-                        <td class="model-name-cell">
-                            <span class="model-row-name">{{ model.name }}</span>
-                            <code class="model-row-id">{{ model.id }}</code>
-                        </td>
-                        <td>{{ model.context_str }}</td>
-                        <td>
-                            {% if model.file_size_gib_str.eq("—") %}
-                            <span class="model-muted">—</span>
-                            {% else %}
-                            {{ model.file_size_gib_str }} GiB
-                            {% endif %}
-                        </td>
-                        <td>
-                            {% if model.required_vram_gib_str.eq("—") %}
-                            <span class="model-muted">—</span>
-                            {% else %}
-                            {{ model.required_vram_gib_str }} GiB
-                            {% endif %}
-                        </td>
-                        <td class="model-activity-cell">
-                            <span class="model-runtime" id="model-active-{{ model.id }}" style="display:none;"></span>
-                            <span class="model-runtime" id="model-pending-{{ model.id }}" style="display:none;"></span>
-                            <span class="model-muted" data-model-activity-empty>—</span>
-                        </td>
-                        <td>
-                            <div class="model-table-actions" data-model-actions>
-                                {% if model.state_class == "idle" || model.state_class == "error" %}
-                                <button type="button" class="btn btn-success btn-sm" data-model-action="load" data-model-id="{{ model.id }}">Load</button>
-                                {% endif %}
-                                {% if model.state_class == "running" %}
-                                <button type="button" class="btn btn-danger btn-sm" data-model-action="stop" data-model-id="{{ model.id }}">Stop</button>
-                                {% endif %}
-                                <button type="button" class="btn btn-secondary btn-sm" data-model-action="edit" data-model-id="{{ model.id }}">Edit</button>
-                                <button type="button" class="btn btn-danger btn-sm" data-model-action="delete" data-model-id="{{ model.id }}" data-model-name="{{ model.name }}">Delete</button>
-                            </div>
-                        </td>
-                    </tr>
-                    {% endfor %}
-                    <tr class="model-filter-empty" id="model-filter-empty" hidden>
-                        <td colspan="7">No models match this filter.</td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
-        {% endif %}
     </div>
 </div>
 
@@ -1278,79 +1123,36 @@ function setOptionalSlider(name, value) {
     slider.dispatchEvent(new Event('input'));
 }
 
-// ----- Row actions and live row state -----
-function modelStateLabel(state, message) {
-    const cls = state || 'idle';
-    const label = cls.charAt(0).toUpperCase() + cls.slice(1);
-    return message ? `${label}: ${message}` : label;
-}
-
-function modelStateSortKey(state) {
-    if (state === 'running') return 0;
-    if (state === 'loading') return 1;
-    if (state === 'idle') return 2;
-    if (state === 'error') return 3;
-    return 4;
-}
-
-function loadedPriorityForState(state) {
-    return (state === 'running' || state === 'loading') ? 0 : 1;
-}
-
-function primaryActionForState(state) {
-    if (state === 'running') return 'stop';
-    if (state === 'idle' || state === 'error') return 'load';
-    return 'edit';
-}
-
-function makeModelActionButton(label, klass, action, id, name) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = `btn ${klass} btn-sm`;
-    btn.dataset.modelAction = action;
-    btn.dataset.modelId = id;
-    if (name) btn.dataset.modelName = name;
-    btn.textContent = label;
-    return btn;
-}
-
-function updateModelActionsForState(row, model) {
-    const cell = row ? row.querySelector('[data-model-actions]') : null;
-    if (!cell || !model) return;
-    const id = row.dataset.modelId || model.id || '';
-    const name = row.dataset.name || model.name || id;
-    const wanted = primaryActionForState(model.state || 'idle');
-    if (cell.dataset.primaryAction === wanted) return;
-
-    cell.innerHTML = '';
-    cell.dataset.primaryAction = wanted;
-    if (wanted === 'load') {
-        cell.appendChild(makeModelActionButton('Load', 'btn-success', 'load', id));
-    } else if (wanted === 'stop') {
-        cell.appendChild(makeModelActionButton('Stop', 'btn-danger', 'stop', id));
-    }
-    cell.appendChild(makeModelActionButton('Edit', 'btn-secondary', 'edit', id));
-    cell.appendChild(makeModelActionButton('Delete', 'btn-danger', 'delete', id, name));
+// ----- Row actions -----
+// The row markup (state badge, action buttons, activity) is rendered by the
+// server and morphed in on each poll, so there is no client-side row patching
+// here anymore. After a mutation we just kick an immediate poll so the new
+// state morphs in without a full page reload.
+function refreshDashboardSoon() {
+    if (typeof window.poll === 'function') window.poll();
 }
 
 async function loadModel(id) {
     const r = await fetch(`/api/models/${encodeURIComponent(id)}/load`, { method: 'POST' });
     if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Load failed: ' + (j.error || r.statusText)); }
-    else location.reload();
+    else refreshDashboardSoon();
 }
 async function stopModel(id) {
     const r = await fetch(`/api/models/${encodeURIComponent(id)}/stop`, { method: 'POST' });
     if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Stop failed: ' + (j.error || r.statusText)); }
-    else location.reload();
+    else refreshDashboardSoon();
 }
 async function deleteModel(id, name) {
     if (!confirm(`Delete ${name}?`)) return;
     const r = await fetch(`/api/models/${encodeURIComponent(id)}`, { method: 'DELETE' });
     if (!r.ok) { const j = await r.json().catch(() => ({})); alert('Delete failed: ' + (j.error || r.statusText)); }
-    else location.reload();
+    else refreshDashboardSoon();
 }
 
-document.getElementById('model-table-container')?.addEventListener('click', (e) => {
+// Delegate on document: the table (and even the #model-table-container itself)
+// is morphed/recreated on poll and toggles with the empty state, so a listener
+// bound to the table would not survive.
+document.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-model-action]');
     if (!btn) return;
     const id = btn.dataset.modelId || '';
@@ -1526,107 +1328,67 @@ document.getElementById('model-table-container')?.addEventListener('click', (e) 
     });
 })();
 
-// ===== Model table: sort and filter =====
+// ===== Model table: sort and filter (server-authoritative) =====
+//
+// The browser only remembers WHICH column/direction is active plus the filter
+// text. The server renders the rows already ordered and filtered (and renders
+// the active sort arrow), so there is no client-side reordering — which is what
+// used to thrash the tbody on every poll and make the table flash. Header
+// clicks and filter typing just update this state and kick an immediate poll;
+// poll() replays it as ?sort=&dir=&q= via window.dashboardQueryString().
 
-const modelTableSort = { key: 'name', direction: 'asc', type: 'text' };
+const MODEL_SORT_KEY = 'inferenceRouterModelSort';
+const modelTableSort = loadModelSort();
 
-function modelRows() {
-    return Array.from(document.querySelectorAll('#model-table tbody tr.model-row'));
+function loadModelSort() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(MODEL_SORT_KEY) || 'null');
+        if (raw && typeof raw.key === 'string' && (raw.dir === 'asc' || raw.dir === 'desc')) {
+            return { key: raw.key, dir: raw.dir };
+        }
+    } catch (e) {}
+    return { key: 'name', dir: 'asc' };
+}
+function saveModelSort() {
+    try { localStorage.setItem(MODEL_SORT_KEY, JSON.stringify(modelTableSort)); } catch (e) {}
 }
 
-function sortValue(row, key, type) {
-    const raw = row.getAttribute(`data-sort-${key}`) || '';
-    if (type === 'number') {
-        const num = Number(raw);
-        return { empty: raw === '' || !Number.isFinite(num), value: num };
+// Consumed by poll() (base.html) to build each /fragment/dashboard request.
+window.dashboardQueryString = function () {
+    const filter = document.getElementById('model-filter');
+    const q = filter ? filter.value.trim() : '';
+    const params = new URLSearchParams({ sort: modelTableSort.key, dir: modelTableSort.dir });
+    if (q) params.set('q', q);
+    return '?' + params.toString();
+};
+
+// Header clicks toggle direction (or switch column), then re-poll so the server
+// re-renders in the new order. Delegated on document because the header cells
+// are morphed on every poll and a directly-bound listener would not survive.
+document.addEventListener('click', (e) => {
+    const th = e.target.closest('#model-table th.sortable');
+    if (!th) return;
+    const key = th.dataset.sortKey || 'name';
+    if (modelTableSort.key === key) {
+        modelTableSort.dir = modelTableSort.dir === 'asc' ? 'desc' : 'asc';
+    } else {
+        modelTableSort.key = key;
+        modelTableSort.dir = 'asc';
     }
-    return { empty: raw.trim() === '', value: raw.toLocaleLowerCase() };
-}
+    saveModelSort();
+    if (typeof window.poll === 'function') window.poll();
+});
 
-function compareSortValues(a, b, type, direction) {
-    if (a.empty !== b.empty) return a.empty ? 1 : -1;
-    if (a.empty && b.empty) return 0;
-    const dir = direction === 'desc' ? -1 : 1;
-    if (type === 'number') return (a.value - b.value) * dir;
-    return a.value.localeCompare(b.value) * dir;
-}
-
-function applyModelTableSort() {
-    const table = document.getElementById('model-table');
-    const tbody = table ? table.tBodies[0] : null;
-    if (!tbody) return;
-
-    const rows = modelRows();
-    rows.sort((a, b) => {
-        const loaded = Number(a.dataset.loadedPriority || '1') - Number(b.dataset.loadedPriority || '1');
-        if (loaded !== 0) return loaded;
-
-        const cmp = compareSortValues(
-            sortValue(a, modelTableSort.key, modelTableSort.type),
-            sortValue(b, modelTableSort.key, modelTableSort.type),
-            modelTableSort.type,
-            modelTableSort.direction,
-        );
-        if (cmp !== 0) return cmp;
-
-        return (a.dataset.sortName || '').localeCompare(b.dataset.sortName || '')
-            || (a.dataset.modelId || '').localeCompare(b.dataset.modelId || '');
-    });
-
-    rows.forEach(row => tbody.appendChild(row));
-    const empty = document.getElementById('model-filter-empty');
-    if (empty) tbody.appendChild(empty);
-
-    document.querySelectorAll('#model-table th.sortable').forEach(th => {
-        const active = th.dataset.sortKey === modelTableSort.key;
-        th.classList.toggle('sort-asc', active && modelTableSort.direction === 'asc');
-        th.classList.toggle('sort-desc', active && modelTableSort.direction === 'desc');
-        th.setAttribute('aria-sort', active ? (modelTableSort.direction === 'asc' ? 'ascending' : 'descending') : 'none');
-    });
-}
-
-function applyModelFilter() {
+// Filter typing re-polls (debounced). The filter input lives outside the
+// morphed #live-models region, so its value and focus survive every poll.
+(function wireModelFilter() {
     const filter = document.getElementById('model-filter');
-    const needle = filter ? filter.value.trim().toLowerCase() : '';
-    let visible = 0;
-    modelRows().forEach(row => {
-        const haystack = [
-            row.dataset.modelId,
-            row.dataset.name,
-            row.dataset.state,
-        ].join(' ').toLowerCase();
-        const show = !needle || haystack.includes(needle);
-        row.hidden = !show;
-        if (show) visible += 1;
+    if (!filter) return;
+    let timer = null;
+    filter.addEventListener('input', () => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { if (typeof window.poll === 'function') window.poll(); }, 150);
     });
-    const empty = document.getElementById('model-filter-empty');
-    if (empty) empty.hidden = visible !== 0 || !needle;
-}
-
-(function wireModelTable() {
-    const table = document.getElementById('model-table');
-    const filter = document.getElementById('model-filter');
-    if (!table) return;
-
-    table.querySelectorAll('th.sortable').forEach(th => {
-        th.addEventListener('click', () => {
-            const key = th.dataset.sortKey || 'name';
-            const type = th.dataset.sortType || 'text';
-            if (modelTableSort.key === key) {
-                modelTableSort.direction = modelTableSort.direction === 'asc' ? 'desc' : 'asc';
-            } else {
-                modelTableSort.key = key;
-                modelTableSort.type = type;
-                modelTableSort.direction = 'asc';
-            }
-            applyModelTableSort();
-            applyModelFilter();
-        });
-    });
-
-    if (filter) filter.addEventListener('input', applyModelFilter);
-    applyModelTableSort();
-    applyModelFilter();
 })();
 
 // ===== Preset management (Settings modal) =====

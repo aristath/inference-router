@@ -1,0 +1,90 @@
+{# Models region: empty state, or the sortable/filterable table.
+   Rendered server-side on first paint and on every poll. The browser holds
+   only the sort choice + filter text and replays them as ?sort=&dir=&q=; the
+   server returns rows already ordered and filtered, so idiomorph just morphs
+   cells in place. `has_any_models` is the *unfiltered* count, so an empty
+   `models` with `has_any_models == true` means "filtered everything out".
+
+   th classes/aria reflect the active sort column via sort_key / sort_dir_class
+   / sort_aria, so the sort arrow survives every morph without any JS. #}
+{% if !has_any_models %}
+<div class="card">
+    <div class="empty-state">
+        <p>No models configured.</p>
+        <button type="button" class="btn btn-primary" style="margin-top: 1rem;" onclick="openAddModelModal()">Add your first model</button>
+    </div>
+</div>
+{% else %}
+<div class="model-table-wrap" id="model-table-container">
+    <table class="model-table" id="model-table">
+        <thead>
+            <tr>
+                <th class="sortable{% if sort_key == "state" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="state" data-sort-type="number" aria-sort="{% if sort_key == "state" %}{{ sort_aria }}{% else %}none{% endif %}">State</th>
+                <th class="sortable{% if sort_key == "name" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="name" data-sort-type="text" aria-sort="{% if sort_key == "name" %}{{ sort_aria }}{% else %}none{% endif %}">Name</th>
+                <th class="sortable{% if sort_key == "context" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="context" data-sort-type="number" aria-sort="{% if sort_key == "context" %}{{ sort_aria }}{% else %}none{% endif %}">Context</th>
+                <th class="sortable{% if sort_key == "file-size" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="file-size" data-sort-type="number" aria-sort="{% if sort_key == "file-size" %}{{ sort_aria }}{% else %}none{% endif %}">File</th>
+                <th class="sortable{% if sort_key == "vram" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="vram" data-sort-type="number" aria-sort="{% if sort_key == "vram" %}{{ sort_aria }}{% else %}none{% endif %}">VRAM</th>
+                <th class="sortable{% if sort_key == "activity" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="activity" data-sort-type="number" aria-sort="{% if sort_key == "activity" %}{{ sort_aria }}{% else %}none{% endif %}">Activity</th>
+                <th class="sortable{% if sort_key == "actions" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="actions" data-sort-type="text" aria-sort="{% if sort_key == "actions" %}{{ sort_aria }}{% else %}none{% endif %}">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for model in models %}
+            <tr class="model-row{% if model.is_loaded %} is-loaded{% endif %}"
+                id="model-row-{{ model.id }}"
+                data-model-id="{{ model.id }}"
+                data-name="{{ model.name }}">
+                <td><span class="badge badge-{{ model.state_class }}" id="model-status-{{ model.id }}">{{ model.state_display }}</span></td>
+                <td class="model-name-cell">
+                    <span class="model-row-name">{{ model.name }}</span>
+                    <code class="model-row-id">{{ model.id }}</code>
+                </td>
+                <td>{{ model.context_str }}</td>
+                <td>
+                    {% if model.file_size_gib_str.eq("—") %}
+                    <span class="model-muted">—</span>
+                    {% else %}
+                    {{ model.file_size_gib_str }} GiB
+                    {% endif %}
+                </td>
+                <td>
+                    {% if model.required_vram_gib_str.eq("—") %}
+                    <span class="model-muted">—</span>
+                    {% else %}
+                    {{ model.required_vram_gib_str }} GiB
+                    {% endif %}
+                </td>
+                <td class="model-activity-cell">
+                    {% if model.active_requests > 0 %}
+                    <span class="model-runtime">{{ model.active_requests }} active</span>
+                    {% endif %}
+                    {% if model.pending_instances > 0 %}
+                    <span class="model-runtime">{{ model.pending_instances }} loading</span>
+                    {% endif %}
+                    {% if model.total_activity() == 0 %}
+                    <span class="model-muted">—</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <div class="model-table-actions" data-model-actions>
+                        {% if model.state_class == "idle" || model.state_class == "error" %}
+                        <button type="button" class="btn btn-success btn-sm" data-model-action="load" data-model-id="{{ model.id }}">Load</button>
+                        {% endif %}
+                        {% if model.state_class == "running" %}
+                        <button type="button" class="btn btn-danger btn-sm" data-model-action="stop" data-model-id="{{ model.id }}">Stop</button>
+                        {% endif %}
+                        <button type="button" class="btn btn-secondary btn-sm" data-model-action="edit" data-model-id="{{ model.id }}">Edit</button>
+                        <button type="button" class="btn btn-danger btn-sm" data-model-action="delete" data-model-id="{{ model.id }}" data-model-name="{{ model.name }}">Delete</button>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+            {% if models.is_empty() %}
+            <tr class="model-filter-empty">
+                <td colspan="7">No models match this filter.</td>
+            </tr>
+            {% endif %}
+        </tbody>
+    </table>
+</div>
+{% endif %}

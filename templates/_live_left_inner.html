@@ -1,0 +1,93 @@
+{# Left-column live regions: host metrics, GPU cards, event log.
+   Included by both dashboard.html (first paint) and dashboard_fragment.html
+   (each poll). The wrapping #live-left element lives in the caller so the
+   fragment can tag it for an out-of-band morph. #}
+<h2 class="section">Host</h2>
+<div class="card" id="host-card">
+    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+        <h2 style="margin: 0;">CPU &amp; RAM</h2>
+        <span class="chip-temp {{ system.cpu_temp_class }}" id="host-cpu-temp-chip"
+              title="CPU temperature">
+            <span id="host-cpu-temp">{{ system.cpu_temp_c_str }}</span>°C
+        </span>
+    </div>
+    <div class="gpu-metric" id="host-cpu" style="margin-top: 0.9rem;">
+        <div class="gpu-metric-head">
+            <span class="gpu-metric-label">CPU</span>
+            <span class="gpu-metric-value"><span id="host-cpu-pct">{{ system.cpu_pct_str }}</span>%</span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-bar-fill {{ system.cpu_class }}" style="width: {{ system.cpu_pct_str }}%"></div>
+        </div>
+    </div>
+    <div class="gpu-metric" id="host-ram" style="margin-top: 0.75rem;">
+        <div class="gpu-metric-head">
+            <span class="gpu-metric-label">RAM</span>
+            <span class="gpu-metric-value">
+                <span id="host-ram-used">{{ system.ram_used_gib_str }}</span> /
+                {{ system.ram_total_gib_str }} GiB
+            </span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-bar-fill {{ system.ram_class }}" style="width: {{ system.ram_pct_str }}%"></div>
+        </div>
+    </div>
+</div>
+
+<h2 class="section" style="margin-top: 1.5rem;">GPUs</h2>
+{% for gpu in gpus %}
+<div class="card" id="gpu-card-{{ gpu.id }}">
+    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+        <h2 style="margin: 0;">GPU {{ gpu.id }} <small style="color: #94a3b8;">{{ gpu.label }}</small></h2>
+        <span class="chip-temp {{ gpu.temp_class }}" id="gpu-temp-chip-{{ gpu.id }}"
+              title="GPU junction temperature">
+            <span class="gpu-temp">{{ gpu.temp_c_str }}</span>°C
+        </span>
+    </div>
+    <div class="gpu-metric" id="gpu-vram-{{ gpu.id }}" style="margin-top: 0.9rem;">
+        <div class="gpu-metric-head">
+            <span class="gpu-metric-label">VRAM</span>
+            <span class="gpu-metric-value">
+                <span class="gpu-vram-used">{{ gpu.used_gib_str }}</span> /
+                {{ gpu.total_gib_str }} GiB
+                &middot; <span class="gpu-vram-free">{{ gpu.free_gib_str }}</span> GiB free
+            </span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-bar-fill {{ gpu.usage_class }}" style="width: {{ gpu.usage_pct_str }}%"></div>
+        </div>
+    </div>
+    <div class="gpu-metric" id="gpu-busy-{{ gpu.id }}" style="margin-top: 0.75rem;">
+        <div class="gpu-metric-head">
+            <span class="gpu-metric-label">Activity</span>
+            <span class="gpu-metric-value"><span class="gpu-busy-pct">{{ gpu.busy_pct_str }}</span>%</span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-bar-fill {{ gpu.busy_class }}" style="width: {{ gpu.busy_pct_str }}%"></div>
+        </div>
+    </div>
+</div>
+{% endfor %}
+{% if gpus.is_empty() %}
+<div class="card">
+    <h2>No GPUs detected</h2>
+    <p style="color: #94a3b8;">No AMD GPUs found via sysfs.</p>
+</div>
+{% endif %}
+
+<h2 class="section" style="margin-top: 1.5rem;">Events</h2>
+<div class="card">
+    <div id="event-log" class="event-log">
+        {% if events.is_empty() %}
+        <div style="color:#64748b;">No recent events.</div>
+        {% else %}
+        {% for ev in events %}
+        <div class="event-row">
+            <span>{{ ev.time_str }}</span>
+            <span class="event-level-{{ ev.level }}">{{ ev.level }}</span>
+            <span>{{ ev.message }}</span>
+        </div>
+        {% endfor %}
+        {% endif %}
+    </div>
+</div>

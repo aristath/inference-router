@@ -217,8 +217,14 @@
         .modal-close:hover { background: #334155; color: #e2e8f0; }
         .modal-body { padding: 1.25rem 1.5rem; }
     </style>
+    <!-- Vendored, embedded in the binary and served from /assets (no CDN, works
+         offline). Loaded synchronously in <head> so htmx is defined before the
+         inline scripts at the end of <body> start the poll loop. idiomorph-ext
+         registers the htmx `morph` swap (and OOB morph) used for live updates. -->
+    <script src="/assets/htmx.min.js"></script>
+    <script src="/assets/idiomorph-ext.min.js"></script>
 </head>
-<body>
+<body hx-ext="morph">
     <header class="topbar">
         <div class="brand"><span class="dot"></span> Inference Router</div>
         <div class="actions">
@@ -230,6 +236,11 @@
         {% block body %}{% endblock %}
     </div>
     <footer>Inference Router v0.1.0</footer>
+
+    <!-- Hidden target for the polling request. The real updates arrive as
+         out-of-band morphs targeting #live-left / #live-models; this element
+         just gives htmx.ajax() a (no-op) primary swap target. -->
+    <div id="dash-poller" hidden></div>
 
     <script>
     // Generic modal open/close.
@@ -282,147 +293,19 @@
     }
     </script>
     <script>
-        async function poll() {
-            try {
-                const res = await fetch('/api/status');
-                if (!res.ok) return;
-                const data = await res.json();
-                updateDashboard(data);
-            } catch (e) {}
+        // Live updates are server-rendered now: each poll GETs the dashboard
+        // fragment (host/GPU/event/model regions) and htmx + idiomorph morph it
+        // into place via out-of-band swaps, touching only the nodes that
+        // actually changed. The browser sends its sort/filter choice as query
+        // params (window.dashboardQueryString, defined in the page); on first
+        // load, before that's wired, we fall back to no params.
+        function poll() {
+            if (!window.htmx) return;
+            const qs = (typeof window.dashboardQueryString === 'function')
+                ? window.dashboardQueryString() : '';
+            htmx.ajax('GET', '/fragment/dashboard' + qs, { target: '#dash-poller', swap: 'none' });
         }
-        function barClass(pct) { return pct > 90 ? 'red' : pct > 70 ? 'yellow' : 'green'; }
-        function tempClass(c) {
-            if (c == null) return 'muted';
-            return c > 85 ? 'red' : c > 70 ? 'yellow' : 'green';
-        }
-        function setBar(container, pct, klass) {
-            if (!container) return;
-            const fill = container.querySelector('.progress-bar-fill');
-            if (!fill) return;
-            fill.style.width = (pct || 0) + '%';
-            fill.className = 'progress-bar-fill ' + (klass || barClass(pct || 0));
-        }
-        function setText(id, value) {
-            const el = document.getElementById(id);
-            if (el) el.textContent = value;
-        }
-        function setTempChip(id, c) {
-            const el = document.getElementById(id);
-            if (!el) return;
-            const klass = tempClass(c);
-            el.className = 'chip-temp ' + klass;
-            const v = el.querySelector('.gpu-temp') || el.firstElementChild;
-            if (v) v.textContent = c == null ? '—' : Math.round(c);
-        }
-        function updateEventLog(events) {
-            const log = document.getElementById('event-log');
-            if (!log) return;
-            const rows = (events || []).slice(0, 30);
-            if (rows.length === 0) {
-                log.innerHTML = '<div style="color:#64748b;">No recent events.</div>';
-                return;
-            }
-            log.innerHTML = '';
-            rows.forEach(ev => {
-                const row = document.createElement('div');
-                row.className = 'event-row';
-                const dt = new Date((ev.ts || 0) * 1000);
-                const time = Number.isFinite(dt.getTime()) ? dt.toLocaleTimeString() : '--:--:--';
-                const level = String(ev.level || 'info');
-                row.innerHTML = `
-                    <span>${time}</span>
-                    <span class="event-level-${level}">${level}</span>
-                    <span></span>
-                `;
-                row.lastElementChild.textContent = ev.message || '';
-                log.appendChild(row);
-            });
-        }
-        function updateDashboard(data) {
-            // Host (CPU / RAM / CPU temp)
-            if (data.system) {
-                const sys = data.system;
-                setBar(document.getElementById('host-cpu'), sys.cpu_pct);
-                setText('host-cpu-pct', Math.round(sys.cpu_pct));
-                const ramPct = sys.ram_total > 0 ? (sys.ram_used / sys.ram_total * 100) : 0;
-                setBar(document.getElementById('host-ram'), ramPct);
-                setText('host-ram-used', (sys.ram_used / 1073741824).toFixed(1));
-                const chip = document.getElementById('host-cpu-temp-chip');
-                if (chip) {
-                    chip.className = 'chip-temp ' + tempClass(sys.cpu_temp_c);
-                    setText('host-cpu-temp', sys.cpu_temp_c == null ? '—' : Math.round(sys.cpu_temp_c));
-                }
-            }
-            (data.gpus || []).forEach(gpu => {
-                // VRAM bar + numbers
-                const vramCard = document.getElementById('gpu-vram-' + gpu.id);
-                if (vramCard) {
-                    const pct = gpu.total_vram > 0 ? (gpu.used_vram / gpu.total_vram * 100) : 0;
-                    setBar(vramCard, pct);
-                    const used = vramCard.querySelector('.gpu-vram-used');
-                    const free = vramCard.querySelector('.gpu-vram-free');
-                    if (used) used.textContent = (gpu.used_vram / 1073741824).toFixed(1);
-                    if (free) free.textContent = ((gpu.total_vram - gpu.used_vram) / 1073741824).toFixed(1);
-                }
-                setBar(document.getElementById('gpu-busy-' + gpu.id), gpu.busy_pct);
-                const busyVal = document.querySelector('#gpu-busy-' + gpu.id + ' .gpu-busy-pct');
-                if (busyVal) busyVal.textContent = gpu.busy_pct || 0;
-                // Temperature chip
-                setTempChip('gpu-temp-chip-' + gpu.id, gpu.temp_c);
-            });
-            let modelRowsChanged = false;
-            (data.models || []).forEach(model => {
-                const el = document.getElementById('model-status-' + model.id);
-                let cls = model.state || 'idle';
-                if (el) {
-                    el.className = 'badge badge-' + cls;
-                    el.textContent = (typeof modelStateLabel === 'function')
-                        ? modelStateLabel(cls, model.state_message)
-                        : (model.state_message
-                            ? `${cls.charAt(0).toUpperCase() + cls.slice(1)}: ${model.state_message}`
-                            : cls.charAt(0).toUpperCase() + cls.slice(1));
-                }
-                const row = document.getElementById('model-row-' + model.id);
-                if (row) {
-                    const loadedPriority = (typeof loadedPriorityForState === 'function')
-                        ? loadedPriorityForState(cls)
-                        : ((cls === 'running' || cls === 'loading') ? 0 : 1);
-                    const stateSort = (typeof modelStateSortKey === 'function') ? modelStateSortKey(cls) : 4;
-                    const actionSort = (typeof primaryActionForState === 'function') ? primaryActionForState(cls) : cls;
-                    row.dataset.state = cls;
-                    row.dataset.loadedPriority = String(loadedPriority);
-                    row.dataset.sortState = String(stateSort);
-                    row.dataset.sortActions = actionSort;
-                    row.classList.toggle('is-loaded', loadedPriority === 0);
-                    if (typeof updateModelActionsForState === 'function') {
-                        updateModelActionsForState(row, model);
-                    }
-                    modelRowsChanged = true;
-                }
-                const active = document.getElementById('model-active-' + model.id);
-                const activeCount = model.active_requests || 0;
-                if (active) {
-                    active.textContent = activeCount === 1 ? '1 active' : `${activeCount} active`;
-                    active.style.display = activeCount > 0 ? '' : 'none';
-                }
-                const pending = document.getElementById('model-pending-' + model.id);
-                const pendingCount = model.pending_instances || 0;
-                if (pending) {
-                    pending.textContent = pendingCount === 1 ? '1 loading' : `${pendingCount} loading`;
-                    pending.style.display = pendingCount > 0 ? '' : 'none';
-                }
-                if (row) {
-                    row.dataset.sortActivity = String(activeCount + pendingCount);
-                    const empty = row.querySelector('[data-model-activity-empty]');
-                    if (empty) empty.style.display = activeCount + pendingCount > 0 ? 'none' : '';
-                }
-            });
-            if (modelRowsChanged && typeof applyModelTableSort === 'function') {
-                applyModelTableSort();
-                if (typeof applyModelFilter === 'function') applyModelFilter();
-            }
-            updateEventLog(data.events || []);
-        }
+        window.poll = poll;
         // Polling interval is a per-browser UI preference, stored in
         // localStorage. The dashboard Settings modal exposes a field to
         // change it. Clamped to keep the range sane; 0 would DoS the UA.

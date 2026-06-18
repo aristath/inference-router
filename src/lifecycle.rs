@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use askama::Template;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{any, get, post, put};
 use tracing::{error, info};
@@ -14,7 +14,10 @@ use crate::api::routes::*;
 use crate::api::state::get_app_state;
 use crate::config::{AppSettings, BinaryPreset, JsonStore, ModelAlias, ModelConfig};
 use crate::orchestrator::{AppState, Orchestrator};
-use crate::ui::templates::{DashboardTemplate, GpuDisplay, ModelDisplay, SystemDisplay};
+use crate::ui::templates::{
+    sort_and_filter, DashboardFragmentTemplate, DashboardTemplate, EventDisplay, GpuDisplay,
+    ModelDisplay, ModelSort, SystemDisplay,
+};
 
 const DEFAULT_CONFIG_DIR: &str = "~/.config/inference-router";
 
@@ -78,36 +81,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
     let app_state: AppState = orchestrator.clone();
 
-    let router = axum::Router::new()
-        // Single-page UI
-        .route("/", get(index_page))
-        // REST API
-        .route("/api/status", get(get_app_state))
-        .route("/api/settings", get(get_settings).put(update_settings))
-        .route("/api/models", get(list_models).post(create_model))
-        .route("/api/models/validate", post(validate_model))
-        .route("/api/models/{id}", put(update_model).delete(delete_model))
-        .route("/api/models/{id}/load", post(load_model))
-        .route("/api/models/{id}/stop", post(stop_model))
-        .route("/api/service/restart", post(restart_service))
-        .route("/api/files", get(list_files))
-        .route("/api/gguf-info", get(gguf_info))
-        .route("/api/presets", get(list_presets).post(create_preset))
-        .route(
-            "/api/presets/{id}",
-            put(update_preset).delete(delete_preset),
-        )
-        .route("/api/aliases", get(list_aliases).post(create_alias))
-        .route(
-            "/api/aliases/{alias}",
-            put(update_alias).delete(delete_alias),
-        )
-        // OpenAI-compatible surface
-        .route("/v1/models", get(proxy::list_v1_models))
-        .route("/v1/{*rest}", any(proxy::proxy_handler))
-        // Liveness
-        .route("/healthz", get(proxy::healthz))
-        .with_state(app_state);
+    let router = build_router(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -157,25 +131,145 @@ async fn shutdown_signal() {
     }
 }
 
-async fn index_page(State(state): State<AppState>) -> impl IntoResponse {
+/// Builds the full application router. Extracted from [`run`] so tests can
+/// mount every route against a pre-configured orchestrator without binding a
+/// socket or starting the reconcile loop.
+pub fn build_router(app_state: AppState) -> axum::Router {
+    axum::Router::new()
+        // Single-page UI
+        .route("/", get(index_page))
+        // Live dashboard regions, morphed in on each poll (htmx + idiomorph)
+        .route("/fragment/dashboard", get(dashboard_fragment))
+        // Embedded front-end assets (htmx, idiomorph)
+        .route("/assets/{file}", get(crate::ui::assets::serve_asset))
+        // REST API
+        .route("/api/status", get(get_app_state))
+        .route("/api/settings", get(get_settings).put(update_settings))
+        .route("/api/models", get(list_models).post(create_model))
+        .route("/api/models/validate", post(validate_model))
+        .route("/api/models/{id}", put(update_model).delete(delete_model))
+        .route("/api/models/{id}/load", post(load_model))
+        .route("/api/models/{id}/stop", post(stop_model))
+        .route("/api/service/restart", post(restart_service))
+        .route("/api/files", get(list_files))
+        .route("/api/gguf-info", get(gguf_info))
+        .route("/api/presets", get(list_presets).post(create_preset))
+        .route(
+            "/api/presets/{id}",
+            put(update_preset).delete(delete_preset),
+        )
+        .route("/api/aliases", get(list_aliases).post(create_alias))
+        .route(
+            "/api/aliases/{alias}",
+            put(update_alias).delete(delete_alias),
+        )
+        // OpenAI-compatible surface
+        .route("/v1/models", get(proxy::list_v1_models))
+        .route("/v1/{*rest}", any(proxy::proxy_handler))
+        // Liveness
+        .route("/healthz", get(proxy::healthz))
+        .with_state(app_state)
+}
+
+/// Sort/filter the browser replays on every poll. Absent fields fall back to
+/// the first-paint defaults (name ascending, no filter).
+#[derive(serde::Deserialize, Default)]
+struct DashboardQuery {
+    sort: Option<String>,
+    dir: Option<String>,
+    q: Option<String>,
+}
+
+/// The four live dashboard regions (host, GPUs, events, models), pre-formatted
+/// and ready to drop into either the full page or the poll fragment. Built once
+/// per request so first paint and every poll render from identical data.
+struct LiveData {
+    system: SystemDisplay,
+    gpus: Vec<GpuDisplay>,
+    events: Vec<EventDisplay>,
+    models: Vec<ModelDisplay>,
+    has_any_models: bool,
+    sort_key: String,
+    sort_dir_class: String,
+    sort_aria: String,
+}
+
+/// Snapshots host/GPU/event/model state and applies the requested sort+filter.
+/// Activity counters come from the live process runtimes, overlaid onto the
+/// per-model display built from static config.
+async fn collect_live_data(state: &AppState, sort: &str, dir: &str, query: &str) -> LiveData {
     let gpus = state.list_gpus().await;
     let models = state.list_models().await;
+    let runtimes = state.model_runtimes().await;
+    let events = state.recent_events().await;
     let sys = state.system_stats();
 
-    let mut displays: Vec<ModelDisplay> = models.iter().map(ModelDisplay::from_model).collect();
-    displays.sort_by(|a, b| {
-        a.loaded_sort_key
-            .cmp(&b.loaded_sort_key)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    let has_any_models = !models.is_empty();
+    let displays: Vec<ModelDisplay> = models
+        .iter()
+        .map(|m| {
+            let rt = runtimes.get(&m.id).copied().unwrap_or_default();
+            ModelDisplay::from_model(m).with_runtime(rt.active, rt.pending)
+        })
+        .collect();
 
-    let tpl = DashboardTemplate {
-        title: "Dashboard".into(),
+    let model_sort = ModelSort::new(sort, dir);
+    let models = sort_and_filter(displays, model_sort, query);
+
+    LiveData {
         system: SystemDisplay::from_stats(sys),
         gpus: gpus.iter().map(GpuDisplay::from_gpu).collect(),
-        models: displays,
+        events: events
+            .into_iter()
+            .map(|e| EventDisplay::new(e.ts, e.level, e.message))
+            .collect(),
+        models,
+        has_any_models,
+        sort_key: model_sort.key.to_string(),
+        sort_dir_class: model_sort.dir_class().to_string(),
+        sort_aria: model_sort.aria().to_string(),
+    }
+}
+
+async fn index_page(State(state): State<AppState>) -> impl IntoResponse {
+    // First paint uses the default ordering; the browser then polls
+    // /fragment/dashboard with its own sort/filter choices.
+    let live = collect_live_data(&state, "name", "asc", "").await;
+    let tpl = DashboardTemplate {
+        title: "Dashboard".into(),
+        system: live.system,
+        gpus: live.gpus,
+        events: live.events,
+        models: live.models,
+        has_any_models: live.has_any_models,
+        sort_key: live.sort_key,
+        sort_dir_class: live.sort_dir_class,
+        sort_aria: live.sort_aria,
         server_port: state.server_port,
+    };
+    Html(tpl.render().unwrap())
+}
+
+/// Poll endpoint: renders only the live regions, each wrapped for an idiomorph
+/// out-of-band swap. The browser calls this on its polling interval with the
+/// active sort column/direction and filter text.
+async fn dashboard_fragment(
+    State(state): State<AppState>,
+    Query(query): Query<DashboardQuery>,
+) -> impl IntoResponse {
+    let sort = query.sort.as_deref().unwrap_or("name");
+    let dir = query.dir.as_deref().unwrap_or("asc");
+    let q = query.q.as_deref().unwrap_or("");
+    let live = collect_live_data(&state, sort, dir, q).await;
+    let tpl = DashboardFragmentTemplate {
+        system: live.system,
+        gpus: live.gpus,
+        events: live.events,
+        models: live.models,
+        has_any_models: live.has_any_models,
+        sort_key: live.sort_key,
+        sort_dir_class: live.sort_dir_class,
+        sort_aria: live.sort_aria,
     };
     Html(tpl.render().unwrap())
 }

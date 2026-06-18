@@ -1,0 +1,11 @@
+{# Poll response: only the two live regions, each tagged for an idiomorph
+   out-of-band swap. htmx finds #live-left / #live-models already in the page
+   and morphs them in place (keyed by element id), so unchanged GPU cards and
+   model rows are never recreated. The hx-swap-oob attribute is stripped by
+   htmx before the morph, so the live DOM never carries it. #}
+<div id="live-left" hx-swap-oob="morph">
+{% include "_live_left_inner.html" %}
+</div>
+<div id="live-models" hx-swap-oob="morph">
+{% include "_live_models_inner.html" %}
+</div>
