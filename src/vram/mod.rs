@@ -1,7 +1,7 @@
 //! # VRAM Management
 //!
 //! GPU VRAM tracking and estimation for admission control and eviction.
-//! 
+//!
 //! ## Key Components
 //! - `estimator.rs`: `VramEstimate` from GGUF metadata + context size
 //! - `tracker.rs`: `VRAMTracker` reading AMD GPU sysfs for live VRAM usage

@@ -2,6 +2,18 @@
 
 {% block body %}
 
+<!-- Action-icon sprite. Lives in the persistent shell (outside #live-models) so
+     <use> references survive htmx morphs of the table fragment. Icons are
+     stroke-based and inherit currentColor, so they match each button's text. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="icon-load" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7V5z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="icon-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="icon-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></symbol>
+    <symbol id="icon-delete" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M10 11v6M14 11v6"/></symbol>
+    <symbol id="icon-instances" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 3 7l9 5 9-5-9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></symbol>
+    <symbol id="icon-requests" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></symbol>
+</svg>
+
 <div class="dashboard-grid">
     <!-- ===== Left column: host + GPUs ===== -->
     <div class="col">
@@ -445,6 +457,24 @@
     </div><!-- /modal -->
 </div><!-- /modal-overlay -->
 
+<!-- ===== Model folder scan modal ===== -->
+<div class="modal-overlay" id="model-scan-modal">
+    <div class="modal" style="max-width: 980px;">
+        <div class="modal-header">
+            <h2>Scan Models Folder</h2>
+            <button type="button" class="modal-close" onclick="closeModal('model-scan-modal')">×</button>
+        </div>
+        <div class="modal-body">
+            <div id="model-scan-state" class="model-muted">Ready.</div>
+            <div id="model-scan-results" style="margin-top:1rem;"></div>
+            <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap; margin-top:1rem; padding-top:0.75rem; border-top:1px solid #334155;">
+                <button type="button" class="btn btn-primary" id="model-scan-apply-btn" onclick="applyModelScan()" disabled>Apply selected</button>
+                <button type="button" class="btn btn-secondary" onclick="closeModal('model-scan-modal')">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- ===== Settings modal ===== -->
 <div class="modal-overlay" id="settings-modal">
     <div class="modal">
@@ -489,6 +519,16 @@
 
             <div class="card" style="margin-bottom: 1rem;">
                 <h2>Dashboard</h2>
+                <div class="form-group" style="margin-bottom:1rem;">
+                    <label for="models-folder-setting">Models folder</label>
+                    <div style="display:flex; gap:0.5rem; align-items:center;">
+                        <input type="text" id="models-folder-setting" data-path-field autocomplete="off" spellcheck="false"
+                               placeholder="~/models" style="flex:1;">
+                        <button type="button" class="btn btn-primary btn-sm" onclick="saveModelsFolderSetting()">Save</button>
+                    </div>
+                    <small class="field-help">Folder used by the header scan action.</small>
+                    <span id="models-folder-setting-state" class="model-muted" style="display:block; margin-top:0.35rem;"></span>
+                </div>
                 <div class="form-group">
                     <label for="poll-interval">Polling interval (ms)</label>
                     <div class="slider-container">
@@ -637,11 +677,29 @@
 .model-chip.quant { color: #38bdf8; border-color: #1e40af; }
 .model-chip.size  { color: #a78bfa; border-color: #4c1d95; }
 .model-chip.profile { color: #34d399; border-color: #065f46; }
-.model-runtime { display:inline-flex; align-items:center; color:#94a3b8; margin-right:0.45rem; white-space:nowrap; }
+.model-status-cell { white-space:nowrap; }
+.status-dot { display:inline-block; width:0.6rem; height:0.6rem; border-radius:50%; vertical-align:middle; margin-right:0.5rem; flex:none; }
+.status-dot-running { background:#22c55e; }
+.status-dot-loading { background:#eab308; animation:status-pulse 1s ease-in-out infinite; }
+.status-dot-idle { background:#475569; }
+.status-dot-error { background:#ef4444; }
+.status-metric { display:inline-flex; align-items:center; gap:0.2rem; color:#94a3b8; font-size:0.82rem; margin-right:0.5rem; font-variant-numeric:tabular-nums; }
+.status-metric svg { width:0.85rem; height:0.85rem; flex:none; }
+@keyframes status-pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 .model-table-actions { display:flex; gap:0.35rem; flex-wrap:nowrap; }
 .model-table .btn-sm { font-size:0.82rem; padding:0.28rem 0.55rem; }
+.model-table-actions .btn-icon { display:inline-flex; align-items:center; justify-content:center; padding:0.32rem; line-height:0; }
+.model-table-actions .btn-icon svg { width:1rem; height:1rem; display:block; }
 .model-table .badge { font-size:0.78rem; white-space:nowrap; }
 .model-filter-empty td { text-align:center; color:#94a3b8; padding:1.5rem; }
+.scan-section { border:1px solid #334155; border-radius:8px; overflow:hidden; margin-bottom:1rem; }
+.scan-section h3 { margin:0; padding:0.65rem 0.8rem; background:#0f172a; color:#e2e8f0; font-size:1rem; }
+.scan-row { display:grid; grid-template-columns:auto 1fr; gap:0.65rem; padding:0.7rem 0.8rem; border-top:1px solid #334155; align-items:start; }
+.scan-row-main { min-width:0; }
+.scan-row-title { color:#e2e8f0; font-weight:600; word-break:break-word; }
+.scan-row-path { color:#94a3b8; font-size:0.85rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.scan-row-meta { color:#64748b; font-size:0.82rem; margin-top:0.2rem; }
+.scan-errors { color:#fca5a5; font-size:0.88rem; line-height:1.5; }
 .event-log { display:flex; flex-direction:column; gap:0.35rem; max-height:18rem; overflow:auto; font-size:0.82rem; }
 .event-row { display:grid; grid-template-columns:4.5rem 3.5rem 1fr; gap:0.45rem; color:#94a3b8; }
 .event-level-info { color:#38bdf8; }
@@ -690,6 +748,154 @@ let _currentGgufMeta = null;
 let _editingModelGgufMeta = null;
 let _ggufApplyInfo = null;     // set by GGUF preview IIFE once mounted
 let _step1BrowserCwd = null;
+let _lastModelScan = null;
+
+async function scanModelsFolder() {
+    const btn = document.getElementById('scan-models-btn');
+    const state = document.getElementById('model-scan-state');
+    const results = document.getElementById('model-scan-results');
+    const applyBtn = document.getElementById('model-scan-apply-btn');
+    openModal('model-scan-modal');
+    if (btn) btn.disabled = true;
+    if (state) { state.textContent = 'Scanning…'; state.style.color = '#94a3b8'; }
+    if (results) results.innerHTML = '';
+    if (applyBtn) applyBtn.disabled = true;
+    _lastModelScan = null;
+
+    try {
+        const r = await fetch('/api/models/scan', { method: 'POST' });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.error || r.statusText);
+        _lastModelScan = body;
+        renderModelScan(body);
+    } catch (err) {
+        if (state) { state.textContent = `Scan failed: ${err.message || err}`; state.style.color = '#fca5a5'; }
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function renderModelScan(scan) {
+    const state = document.getElementById('model-scan-state');
+    const results = document.getElementById('model-scan-results');
+    const applyBtn = document.getElementById('model-scan-apply-btn');
+    const candidates = scan.candidates || [];
+    const missing = scan.missing || [];
+    const errors = scan.errors || [];
+
+    if (state) {
+        state.textContent = `Folder: ${scan.folder || '~/models'} · ${candidates.length} new · ${missing.length} missing`;
+        state.style.color = '#94a3b8';
+    }
+    if (!results) return;
+    results.innerHTML = '';
+
+    if (candidates.length === 0 && missing.length === 0 && errors.length === 0) {
+        results.innerHTML = '<div class="empty-state" style="padding:1.5rem;">No model changes found.</div>';
+    }
+
+    if (candidates.length > 0) {
+        const section = document.createElement('section');
+        section.className = 'scan-section';
+        section.innerHTML = '<h3>New GGUF files</h3>';
+        candidates.forEach((item, idx) => {
+            const meta = item.model.gguf_meta || {};
+            const row = document.createElement('label');
+            row.className = 'scan-row';
+            row.innerHTML = `
+                <input type="checkbox" data-scan-add="${idx}" checked>
+                <span class="scan-row-main">
+                    <span class="scan-row-title">${escapeHtmlText(item.model.name || item.model.id)}</span>
+                    <span class="scan-row-path" title="${escapeHtmlText(item.path)}">${escapeHtmlText(item.path)}</span>
+                    <span class="scan-row-meta"><code>${escapeHtmlText(item.model.id)}</code>${meta.quant_label ? ' · ' + escapeHtmlText(meta.quant_label) : ''}${meta.max_context ? ' · ' + Number(meta.max_context).toLocaleString() : ''}</span>
+                </span>
+            `;
+            section.appendChild(row);
+        });
+        results.appendChild(section);
+    }
+
+    if (missing.length > 0) {
+        const section = document.createElement('section');
+        section.className = 'scan-section';
+        section.innerHTML = '<h3>Configured models with missing files</h3>';
+        missing.forEach((item, idx) => {
+            const row = document.createElement('label');
+            row.className = 'scan-row';
+            row.innerHTML = `
+                <input type="checkbox" data-scan-remove="${idx}" checked>
+                <span class="scan-row-main">
+                    <span class="scan-row-title">${escapeHtmlText(item.name || item.id)}</span>
+                    <span class="scan-row-path" title="${escapeHtmlText(item.path)}">${escapeHtmlText(item.path)}</span>
+                    <span class="scan-row-meta"><code>${escapeHtmlText(item.id)}</code></span>
+                </span>
+            `;
+            section.appendChild(row);
+        });
+        results.appendChild(section);
+    }
+
+    if (errors.length > 0) {
+        const section = document.createElement('section');
+        section.className = 'scan-section';
+        section.innerHTML = '<h3>Skipped files</h3>';
+        const list = document.createElement('div');
+        list.className = 'scan-errors';
+        list.style.padding = '0.7rem 0.8rem';
+        list.innerHTML = errors.slice(0, 20).map(escapeHtmlText).join('<br>');
+        if (errors.length > 20) list.innerHTML += `<br>… ${errors.length - 20} more`;
+        section.appendChild(list);
+        results.appendChild(section);
+    }
+
+    if (applyBtn) applyBtn.disabled = candidates.length === 0 && missing.length === 0;
+}
+
+async function applyModelScan() {
+    if (!_lastModelScan) return;
+    const applyBtn = document.getElementById('model-scan-apply-btn');
+    const state = document.getElementById('model-scan-state');
+    const add = [];
+    const remove = [];
+    document.querySelectorAll('[data-scan-add]:checked').forEach(input => {
+        const idx = parseInt(input.dataset.scanAdd, 10);
+        const item = _lastModelScan.candidates[idx];
+        if (item && item.model) add.push(item.model);
+    });
+    document.querySelectorAll('[data-scan-remove]:checked').forEach(input => {
+        const idx = parseInt(input.dataset.scanRemove, 10);
+        const item = _lastModelScan.missing[idx];
+        if (item && item.id) remove.push(item.id);
+    });
+    if (add.length === 0 && remove.length === 0) {
+        if (state) { state.textContent = 'Nothing selected.'; state.style.color = '#fbbf24'; }
+        return;
+    }
+
+    if (applyBtn) applyBtn.disabled = true;
+    if (state) { state.textContent = 'Applying…'; state.style.color = '#94a3b8'; }
+    try {
+        const r = await fetch('/api/models/reconcile', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ add, remove }),
+        });
+        const body = await r.json().catch(() => ({}));
+        const errors = body.errors || [];
+        if (!r.ok && errors.length === 0) throw new Error(body.error || r.statusText);
+        if (errors.length > 0) {
+            if (state) { state.textContent = `Applied with errors: ${errors.join('; ')}`; state.style.color = '#fca5a5'; }
+            if (applyBtn) applyBtn.disabled = false;
+        } else {
+            if (state) { state.textContent = `Added ${body.added.length}, removed ${body.removed.length}.`; state.style.color = '#86efac'; }
+            closeModal('model-scan-modal');
+            refreshDashboardSoon();
+        }
+    } catch (err) {
+        if (state) { state.textContent = `Apply failed: ${err.message || err}`; state.style.color = '#fca5a5'; }
+        if (applyBtn) applyBtn.disabled = false;
+    }
+}
 
 async function openAddModelModal() {
     _currentGgufMeta = null;
@@ -1344,7 +1550,9 @@ function loadModelSort() {
     try {
         const raw = JSON.parse(localStorage.getItem(MODEL_SORT_KEY) || 'null');
         if (raw && typeof raw.key === 'string' && (raw.dir === 'asc' || raw.dir === 'desc')) {
-            return { key: raw.key, dir: raw.dir };
+            // The old "State" and "Activity" columns merged into "Status".
+            const key = (raw.key === 'state' || raw.key === 'activity') ? 'status' : raw.key;
+            return { key, dir: raw.dir };
         }
     } catch (e) {}
     return { key: 'name', dir: 'asc' };
@@ -1469,6 +1677,64 @@ async function savePreset() {
     }
     closePresetEditor();
     await refreshPresetList();
+}
+
+// ----- Models folder setting -----
+
+function setModelsFolderSettingState(text, kind) {
+    const el = document.getElementById('models-folder-setting-state');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = kind === 'error' ? '#fca5a5' : (kind === 'ok' ? '#86efac' : '#94a3b8');
+}
+
+async function refreshModelsFolderSetting() {
+    const input = document.getElementById('models-folder-setting');
+    if (!input) return;
+    setModelsFolderSettingState('Loading…');
+    try {
+        const r = await fetch('/api/settings');
+        if (!r.ok) throw new Error(r.statusText);
+        const settings = await r.json();
+        input.value = settings.models_folder || '~/models';
+        setModelsFolderSettingState('');
+    } catch (err) {
+        input.value = '~/models';
+        setModelsFolderSettingState(`Load failed: ${err.message || err}`, 'error');
+    }
+}
+
+async function saveModelsFolderSetting() {
+    const input = document.getElementById('models-folder-setting');
+    if (!input) return;
+    const modelsFolder = (input.value || '').trim() || '~/models';
+    setModelsFolderSettingState('Saving…');
+    try {
+        let settings = {};
+        const r = await fetch('/api/settings');
+        if (r.ok) settings = await r.json();
+        settings.models_folder = modelsFolder;
+        const wr = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(settings),
+        });
+        if (!wr.ok) {
+            const body = await wr.json().catch(() => ({}));
+            throw new Error(body.error || wr.statusText);
+        }
+        input.value = modelsFolder;
+        if (typeof _currentAppSettings === 'object' && _currentAppSettings) {
+            _currentAppSettings.models_folder = modelsFolder;
+        }
+        setModelsFolderSettingState('Saved', 'ok');
+        setTimeout(() => {
+            const el = document.getElementById('models-folder-setting-state');
+            if (el && el.textContent === 'Saved') setModelsFolderSettingState('');
+        }, 1600);
+    } catch (err) {
+        setModelsFolderSettingState(`Save failed: ${err.message || err}`, 'error');
+    }
 }
 
 // ----- Polling interval setting (base.html owns localStorage + poll loop) -----

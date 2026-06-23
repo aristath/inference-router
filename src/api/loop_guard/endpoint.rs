@@ -20,23 +20,23 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::sse::{self, ChoiceDelta};
 
 /// Adapter for endpoint-specific streaming formats.
-/// 
+///
 /// # Responsibilities
 /// 1. Parses streaming chunks into choice deltas
 /// 2. Detects when a response is complete
 /// 3. Formats halt messages for loop detection
 /// 4. Injects corrective prompts when loops are detected
-/// 
+///
 /// # Supported Endpoints
 /// - OpenAI chat/completions (SSE with `delta` field)
 /// - OpenAI legacy completions (SSE with `text` field)
 /// - llama.cpp native `/completion` (SSE with `content` field)
-/// 
+///
 /// # Key Methods
 /// - `detect()`: Identifies endpoint from path
 /// - `parse_chunk()`: Extracts choice deltas from chunk bytes
@@ -115,9 +115,15 @@ impl EndpointKind {
 
 fn corrective_text(attempt: usize) -> &'static str {
     match attempt {
-        0 => "[INTERRUPT \u{2014} automated proxy notice] The previous attempt entered a thinking/output loop. Step back, identify the real next concrete action, and proceed without restating analysis you've already done.",
-        1 => "[INTERRUPT \u{2014} automated proxy notice] Two attempts have looped. Skip all deliberation and produce the next tool call or concrete output directly.",
-        _ => "[INTERRUPT \u{2014} automated proxy notice] Final attempt \u{2014} emit only the next required action, no thinking, no commentary.",
+        0 => {
+            "[INTERRUPT \u{2014} automated proxy notice] The previous attempt entered a thinking/output loop. Step back, identify the real next concrete action, and proceed without restating analysis you've already done."
+        }
+        1 => {
+            "[INTERRUPT \u{2014} automated proxy notice] Two attempts have looped. Skip all deliberation and produce the next tool call or concrete output directly."
+        }
+        _ => {
+            "[INTERRUPT \u{2014} automated proxy notice] Final attempt \u{2014} emit only the next required action, no thinking, no commentary."
+        }
     }
 }
 

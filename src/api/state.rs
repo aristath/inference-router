@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Serialize;
 
 use crate::config::{ModelState, WeightsFormat};
@@ -98,10 +98,10 @@ struct ModelResponse {
 }
 
 /// Returns a complete system status snapshot.
-/// 
+///
 /// # Endpoint
 /// `GET /api/status`
-/// 
+///
 /// # Response
 /// Returns a `StatusResponse` containing:
 /// - System metrics (CPU, RAM, temperature)
@@ -109,7 +109,7 @@ struct ModelResponse {
 /// - All model configurations and runtime states
 /// - Recent orchestrator events
 /// - Server port
-/// 
+///
 /// # Used by
 /// - Dashboard polling (every 500ms)
 /// - CLI status commands

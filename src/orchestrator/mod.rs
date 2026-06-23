@@ -1,7 +1,7 @@
 //! # Model Orchestration
 //!
 //! Core system for managing model lifecycles, VRAM admission, and GPU allocation.
-//! 
+//!
 //! ## Key Components
 //! - `engine.rs`: Main `Orchestrator` struct with mutable state and locking
 //! - `allocation.rs`: Pure GPU allocation logic (greedy best-fit with 5% headroom)

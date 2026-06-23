@@ -1,7 +1,7 @@
 //! # Backend Process Management
 //!
 //! Spawns, monitors, and kills inference-server processes (llama-server, vLLM).
-//! 
+//!
 //! ## Key Components
 //! - `manager.rs`: `ProcessManager` with PID tracking and health checking
 //! - `RequestGuard`: RAII handle for active request counting

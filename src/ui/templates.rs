@@ -186,6 +186,9 @@ pub struct ModelDisplay {
     pub is_loaded: bool,
     pub loaded_sort_key: u8,
     pub primary_action_sort: String,
+    /// Running instances for this model, from the live runtime (not config).
+    /// Defaults to 0; set by the handler via [`ModelDisplay::with_runtime`].
+    pub running_instances: usize,
     /// In-flight requests for this model, from the live runtime (not config).
     /// Defaults to 0; set by the handler via [`ModelDisplay::with_runtime`].
     pub active_requests: usize,
@@ -230,22 +233,43 @@ impl ModelDisplay {
             is_loaded,
             loaded_sort_key: if is_loaded { 0 } else { 1 },
             primary_action_sort: primary_action_sort.into(),
+            running_instances: 0,
             active_requests: 0,
             pending_instances: 0,
         }
     }
 
-    /// Overlays live runtime counters (active requests / pending instances)
-    /// onto a display built from static config.
-    pub fn with_runtime(mut self, active_requests: usize, pending_instances: usize) -> Self {
+    /// Overlays live runtime counters (running instances / active requests /
+    /// pending instances) onto a display built from static config.
+    pub fn with_runtime(
+        mut self,
+        running_instances: usize,
+        active_requests: usize,
+        pending_instances: usize,
+    ) -> Self {
+        self.running_instances = running_instances;
         self.active_requests = active_requests;
         self.pending_instances = pending_instances;
         self
     }
 
-    /// Combined activity used by the "Activity" column and its sort key.
+    /// Combined activity used by the activity sort key.
     pub fn total_activity(&self) -> usize {
         self.active_requests + self.pending_instances
+    }
+
+    /// Sort weight for the merged "Status" column: higher = busier. Ranks
+    /// running models (by in-flight requests, then instance count) above
+    /// loading, then idle, then errored. `loaded_sort_key` still floats all
+    /// loaded rows to the top first; this orders within those groups.
+    pub fn status_sort_key(&self) -> u64 {
+        let base = match self.state_sort_key {
+            0 => 1_000_000, // Running
+            1 => 10_000,    // Loading
+            2 => 100,       // Idle
+            _ => 0,         // Error
+        };
+        base + (self.active_requests as u64) * 100 + self.running_instances as u64
     }
 }
 
@@ -341,6 +365,7 @@ fn compare_key(a: &ModelDisplay, b: &ModelDisplay, key: &str, dir: i32) -> std::
 
     match key {
         "state" => apply((a.state_sort_key).cmp(&b.state_sort_key)),
+        "status" => apply((a.status_sort_key()).cmp(&b.status_sort_key())),
         "context" => apply((a.context_tokens).cmp(&b.context_tokens)),
         "file-size" => num(
             a.file_size_bytes == 0,
@@ -363,9 +388,9 @@ fn compare_key(a: &ModelDisplay, b: &ModelDisplay, key: &str, dir: i32) -> std::
 
 fn format_context(ctx: u32) -> String {
     if ctx >= 1024 {
-        format!("{}K ctx", ctx / 1024)
+        format!("{}K", ctx / 1024)
     } else {
-        format!("{} ctx", ctx)
+        format!("{}", ctx)
     }
 }
 
@@ -603,12 +628,27 @@ mod tests {
     #[test]
     fn activity_sort_uses_active_plus_pending() {
         let rows = vec![
-            model("idle", "Idle", ModelState::Running, 1).with_runtime(0, 0),
-            model("busy", "Busy", ModelState::Running, 1).with_runtime(2, 1),
-            model("warm", "Warm", ModelState::Running, 1).with_runtime(1, 0),
+            model("idle", "Idle", ModelState::Running, 1).with_runtime(1, 0, 0),
+            model("busy", "Busy", ModelState::Running, 1).with_runtime(1, 2, 1),
+            model("warm", "Warm", ModelState::Running, 1).with_runtime(1, 1, 0),
         ];
         let out = sort_and_filter(rows, ModelSort::new("activity", "desc"), "");
         assert_eq!(ids(&out), ["busy", "warm", "idle"]);
+    }
+
+    #[test]
+    fn status_sort_ranks_running_by_requests_then_groups_by_state() {
+        let rows = vec![
+            model("err", "Err", ModelState::Error("boom".into()), 1),
+            model("idle", "Idle", ModelState::Idle, 1),
+            model("loading", "Loading", ModelState::Loading, 1).with_runtime(0, 0, 1),
+            model("warm", "Warm", ModelState::Running, 1).with_runtime(1, 0, 0),
+            model("busy", "Busy", ModelState::Running, 1).with_runtime(1, 3, 0),
+        ];
+        // desc = busiest first; loaded rows (running/loading) still float above
+        // idle/error via loaded_sort_key.
+        let out = sort_and_filter(rows, ModelSort::new("status", "desc"), "");
+        assert_eq!(ids(&out), ["busy", "warm", "loading", "idle", "err"]);
     }
 
     #[test]

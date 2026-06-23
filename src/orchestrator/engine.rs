@@ -3,15 +3,15 @@ use crate::config::{
     WeightsFormat,
 };
 use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
-use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
+use crate::orchestrator::eviction::{EvictionAction, decide_eviction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
 use crate::system::stats::{SystemStats, SystemTracker};
 use crate::vram::estimator::VramEstimate;
 use crate::vram::tracker::{GpuInfo, VRAMTracker};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -710,6 +710,9 @@ impl Orchestrator {
                         }
                     }
                 }
+                if m.binary.as_os_str().is_empty() {
+                    return Err(LoadError::NoBinary(id.into()));
+                }
                 // Resolve the draft reference now so any missing/
                 // role-mismatched draft surfaces as a load-time error
                 // rather than a cryptic spawn failure.
@@ -974,6 +977,9 @@ impl Orchestrator {
                         None => return Err(LoadError::PresetNotFound(preset_id.clone())),
                     }
                 }
+                if model.binary.as_os_str().is_empty() {
+                    return Err(LoadError::NoBinary(id.into()));
+                }
                 let draft =
                     if let Some(ref did) = model.draft_model_id {
                         let d = data.models.get(did).cloned().ok_or_else(|| {
@@ -1223,9 +1229,9 @@ impl Orchestrator {
         }
 
         if self.settings_dirty.swap(false, Ordering::Relaxed) {
-        if let Some(store) = self.settings_store.clone() {
-            let snapshot: AppSettings = self.settings.lock().await.clone();
-            store.replace(snapshot);
+            if let Some(store) = self.settings_store.clone() {
+                let snapshot: AppSettings = self.settings.lock().await.clone();
+                store.replace(snapshot);
                 match tokio::task::spawn_blocking(move || store.save()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -1260,6 +1266,11 @@ pub enum LoadError {
         "binary preset '{0}' not found — edit the model and pick an existing preset or a custom path"
     )]
     PresetNotFound(String),
+
+    #[error(
+        "model '{0}' has no binary configured — edit the model and pick a binary preset or a custom path"
+    )]
+    NoBinary(String),
 
     #[error("model references draft '{id}', but no model '{id}' exists (target: '{target}')")]
     DraftNotFound { id: String, target: String },
@@ -1320,8 +1331,9 @@ pub enum MutationError {
 fn is_valid_alias_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+        && s.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 /// Follow the alias chain from `name` to a concrete model id.
@@ -1502,8 +1514,12 @@ fn should_plan_tensor_split(model: &ModelConfig, device_count: usize) -> bool {
 fn model_visible_gpus(model: &ModelConfig, gpus: Vec<GpuInfo>) -> Vec<GpuInfo> {
     let Some(devices) = configured_llama_devices(model) else {
         // No explicit device: automatic placement. Integrated GPUs are kept out
-        // of this pool — they only run a model that names them explicitly.
-        return gpus.into_iter().filter(|gpu| !gpu.integrated).collect();
+        // of this pool, and raw accounting-only records stay out until the
+        // selected backend has a real device name for them.
+        return gpus
+            .into_iter()
+            .filter(|gpu| !gpu.integrated && automatic_backend_candidate(model, gpu))
+            .collect();
     };
     if devices.is_empty() {
         return Vec::new();
@@ -1516,6 +1532,26 @@ fn model_visible_gpus(model: &ModelConfig, gpus: Vec<GpuInfo>) -> Vec<GpuInfo> {
                 .cloned()
         })
         .collect()
+}
+
+fn automatic_backend_candidate(model: &ModelConfig, gpu: &GpuInfo) -> bool {
+    if model_uses_cuda_backend(model) {
+        return gpu.cuda_device.is_some();
+    }
+    gpu.vulkan_index.is_some()
+}
+
+fn model_uses_cuda_backend(model: &ModelConfig) -> bool {
+    model
+        .binary_preset
+        .as_deref()
+        .map(|preset| preset.to_ascii_lowercase().contains("cuda"))
+        .unwrap_or(false)
+        || model
+            .binary
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("cuda")
 }
 
 fn configured_llama_devices(model: &ModelConfig) -> Option<Vec<String>> {
@@ -1661,6 +1697,7 @@ fn is_configuration_load_error(e: &LoadError) -> bool {
         e,
         LoadError::ModelNotFound(_)
             | LoadError::PresetNotFound(_)
+            | LoadError::NoBinary(_)
             | LoadError::DraftNotFound { .. }
     )
 }
@@ -1795,6 +1832,47 @@ mod tests {
         let selected = model_visible_gpus(&m, gpus);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].cuda_device.as_deref(), Some("CUDA0"));
+    }
+
+    #[test]
+    fn automatic_vulkan_pool_excludes_accounting_only_gpus() {
+        let mut raw = gpu("0", "0000:1e:00.0", 4);
+        raw.vulkan_device = None;
+        raw.vulkan_index = None;
+        let amd = gpu("1", "0000:03:00.0", 0);
+
+        let mut auto = model("auto");
+        auto.binary_preset = Some("llama-vulkan".into());
+
+        let visible = model_visible_gpus(&auto, vec![raw, amd]);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].pci_bus_id.as_deref(), Some("0000:03:00.0"));
+    }
+
+    #[test]
+    fn automatic_cuda_pool_uses_cuda_devices() {
+        let cuda = GpuInfo {
+            id: "cuda0".into(),
+            pci_bus_id: Some("0000:1c:00.0".into()),
+            vulkan_device: None,
+            vulkan_index: None,
+            cuda_device: Some("CUDA0".into()),
+            cuda_index: Some(0),
+            integrated: false,
+            total_vram: 24 * 1024 * 1024 * 1024,
+            used_vram: 0,
+            busy_pct: 0,
+            temp_c: None,
+        };
+        let vulkan = gpu("1", "0000:03:00.0", 0);
+        let mut auto = model("auto-cuda");
+        auto.binary_preset = Some("llama-cuda".into());
+
+        let visible = model_visible_gpus(&auto, vec![cuda, vulkan]);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].cuda_device.as_deref(), Some("CUDA0"));
     }
 
     #[test]
@@ -2395,7 +2473,12 @@ mod tests {
         assert_eq!(o.resolve_model_id("coder").await, "llama");
         assert_eq!(o.resolve_model_id("planner").await, "llama");
         // The referencing aliases still store the reference, not the model.
-        let coder = o.list_aliases().await.into_iter().find(|a| a.alias == "coder").unwrap();
+        let coder = o
+            .list_aliases()
+            .await
+            .into_iter()
+            .find(|a| a.alias == "coder")
+            .unwrap();
         assert_eq!(coder.target, "default");
     }
 
@@ -2431,8 +2514,16 @@ mod tests {
         o.add_alias(alias("coder", "default")).await.unwrap();
 
         o.remove_alias("default").await.unwrap();
-        let coder = o.list_aliases().await.into_iter().find(|a| a.alias == "coder").unwrap();
-        assert_eq!(coder.target, "", "coder should be unassigned after default is deleted");
+        let coder = o
+            .list_aliases()
+            .await
+            .into_iter()
+            .find(|a| a.alias == "coder")
+            .unwrap();
+        assert_eq!(
+            coder.target, "",
+            "coder should be unassigned after default is deleted"
+        );
     }
 
     #[tokio::test]

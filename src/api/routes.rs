@@ -1,7 +1,7 @@
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::path::Path as StdPath;
 use std::time::Duration;
@@ -28,7 +28,7 @@ pub async fn update_settings(
 }
 
 /// Response from model validation endpoint (`/api/models/validate`).
-/// 
+///
 /// Returned when validating a model configuration before saving.
 #[derive(Serialize)]
 struct ValidationResponse {
@@ -86,18 +86,18 @@ pub async fn validate_model(
 }
 
 /// Converts mutation errors into appropriate HTTP responses.
-/// 
+///
 /// # Purpose
 /// Centralizes error handling for all CRUD operations to ensure consistent
 /// error responses across the API.
-/// 
+///
 /// # Error Mapping
 /// | Error Type | HTTP Status | Response Body |
 /// |------------|-------------|----------------|
 /// | NotFound   | 404          | {"error": "'id' not found"} |
 /// | Conflict   | 409          | {"error": "'id' already exists"} |
 /// | InvalidConfig | 422      | {"error": "validation message"} |
-/// 
+///
 /// # Used by
 /// All model/preset create/update/delete handlers
 fn mutation_response(e: MutationError) -> axum::response::Response {
@@ -303,7 +303,11 @@ pub async fn load_model(
             Json(serde_json::json!({"error": format!("model '{id}' not found")})),
         )
             .into_response(),
-        Err(e @ (LoadError::PresetNotFound(_) | LoadError::DraftNotFound { .. })) => (
+        Err(
+            e @ (LoadError::PresetNotFound(_)
+            | LoadError::NoBinary(_)
+            | LoadError::DraftNotFound { .. }),
+        ) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": e.to_string()})),
         )
@@ -378,7 +382,11 @@ pub async fn create_alias(
 ) -> impl IntoResponse {
     let name = alias.alias.clone();
     match state.add_alias(alias).await {
-        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({"alias": name}))).into_response(),
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"alias": name})),
+        )
+            .into_response(),
         Err(e) => mutation_response(e),
     }
 }

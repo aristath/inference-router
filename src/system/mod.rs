@@ -1,7 +1,7 @@
 //! # System Monitoring
 //!
 //! Host system metrics collection (CPU, RAM, temperature).
-//! 
+//!
 //! ## Key Components
 //! - `stats.rs`: `SystemTracker` with delta-based CPU utilization
 //!

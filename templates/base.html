@@ -232,6 +232,7 @@
     <header class="topbar">
         <div class="brand"><span class="dot"></span> Inference Router</div>
         <div class="actions">
+            <button type="button" class="icon-btn" id="scan-models-btn" title="Scan models folder" onclick="scanModelsFolder()">⌕</button>
             <button type="button" class="icon-btn" id="restart-service-btn" title="Restart service" onclick="restartService()">↻</button>
             <button type="button" class="icon-btn" title="Settings" onclick="openSettingsModal()">⚙</button>
         </div>
@@ -271,6 +272,7 @@
         openModal('settings-modal');
         if (typeof refreshPresetList === 'function') await refreshPresetList();
         if (typeof syncPollIntervalField === 'function') syncPollIntervalField();
+        if (typeof refreshModelsFolderSetting === 'function') await refreshModelsFolderSetting();
         if (typeof refreshLoopGuardSettings === 'function') await refreshLoopGuardSettings();
     }
     async function restartService() {

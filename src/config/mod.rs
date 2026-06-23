@@ -1,7 +1,7 @@
 //! # Configuration Management
 //!
 //! Handles all persistent configuration for models, binary presets, and application settings.
-//! 
+//!
 //! ## Key Components
 //! - `model.rs`: `ModelConfig` with 30+ fields covering sampling, GPU allocation, speculative decoding
 //! - `preset.rs`: `BinaryPreset` for reusable inference-server binary paths

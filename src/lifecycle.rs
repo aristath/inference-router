@@ -9,6 +9,7 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{any, get, post, put};
 use tracing::{error, info};
 
+use crate::api::model_scan::{reconcile_models_folder, scan_models_folder};
 use crate::api::proxy;
 use crate::api::routes::*;
 use crate::api::state::get_app_state;
@@ -146,6 +147,8 @@ pub fn build_router(app_state: AppState) -> axum::Router {
         .route("/api/status", get(get_app_state))
         .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/models", get(list_models).post(create_model))
+        .route("/api/models/scan", post(scan_models_folder))
+        .route("/api/models/reconcile", post(reconcile_models_folder))
         .route("/api/models/validate", post(validate_model))
         .route("/api/models/{id}", put(update_model).delete(delete_model))
         .route("/api/models/{id}/load", post(load_model))
@@ -210,7 +213,7 @@ async fn collect_live_data(state: &AppState, sort: &str, dir: &str, query: &str)
         .iter()
         .map(|m| {
             let rt = runtimes.get(&m.id).copied().unwrap_or_default();
-            ModelDisplay::from_model(m).with_runtime(rt.active, rt.pending)
+            ModelDisplay::from_model(m).with_runtime(rt.instances, rt.active, rt.pending)
         })
         .collect();
 

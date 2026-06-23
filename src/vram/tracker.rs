@@ -58,6 +58,7 @@ impl VRAMTracker {
         let mut gpus = self.refresh_from("/sys/class/drm");
         append_nvidia_gpus(&mut gpus);
         append_intel_gpus(&mut gpus);
+        append_vulkan_gpus(&mut gpus);
         gpus.sort_by(|a, b| a.id.cmp(&b.id));
         gpus
     }
@@ -154,12 +155,8 @@ fn append_nvidia_gpus(gpus: &mut Vec<GpuInfo>) {
     }
 }
 
-/// Give an NVIDIA GPU (enumerated via `nvidia-smi`) its Vulkan identity too,
-/// when the same card is also a Vulkan device. The card keeps its CUDA name for
-/// CUDA-only runs, but now also carries a `VulkanN` name + index so it can join
-/// a Vulkan tensor-split alongside the AMD cards — a single Vulkan llama.cpp
-/// process drives the AMD RADV devices and the NVIDIA ICD together. No-op if the
-/// card has no Vulkan device or already has a Vulkan index.
+/// Give a GPU found through a non-Vulkan accounting path its Vulkan identity
+/// too, when the same PCI device is also exposed by the Vulkan loader.
 fn merge_vulkan_identity(gpu: &mut GpuInfo, vulkan: &HashMap<String, VulkanDevice>) {
     if gpu.vulkan_index.is_some() {
         return;
@@ -232,14 +229,43 @@ fn parse_nvidia_smi_line(line: &str) -> Option<GpuInfo> {
 /// the card's PCI — the same source `intel_gpu_top` uses. Deduped against
 /// existing entries by PCI bus id so a card already seen isn't double-counted.
 fn append_intel_gpus(gpus: &mut Vec<GpuInfo>) {
-    for gpu in intel_xe_gpus("/sys/class/drm", "/proc") {
+    let vulkan = vulkan_devices_by_pci();
+    for mut gpu in intel_xe_gpus("/sys/class/drm", "/proc", vulkan) {
         if gpu.pci_bus_id.as_deref().is_some_and(|pci| {
             gpus.iter()
                 .any(|existing| existing.pci_bus_id.as_deref() == Some(pci))
         }) {
             continue;
         }
+        merge_vulkan_identity(&mut gpu, vulkan);
         gpus.push(gpu);
+    }
+}
+
+fn append_vulkan_gpus(gpus: &mut Vec<GpuInfo>) {
+    for (pci, vk) in vulkan_devices_by_pci() {
+        if vk.integrated || vk.total_vram < MIN_USABLE_GPU_VRAM_BYTES {
+            continue;
+        }
+        if gpus
+            .iter()
+            .any(|existing| existing.pci_bus_id.as_deref() == Some(pci.as_str()))
+        {
+            continue;
+        }
+        gpus.push(GpuInfo {
+            id: format!("vulkan{}", vk.index),
+            pci_bus_id: Some(pci.clone()),
+            vulkan_device: Some(format!("Vulkan{}", vk.index)),
+            vulkan_index: Some(vk.index),
+            cuda_device: None,
+            cuda_index: None,
+            integrated: false,
+            total_vram: vk.total_vram,
+            used_vram: 0,
+            busy_pct: 0,
+            temp_c: None,
+        });
     }
 }
 
@@ -276,7 +302,11 @@ fn read_driver_name(device: &Path) -> Option<String> {
         .map(|s| s.to_string_lossy().into_owned())
 }
 
-fn intel_xe_gpus(drm_root: &str, proc_root: &str) -> Vec<GpuInfo> {
+fn intel_xe_gpus(
+    drm_root: &str,
+    proc_root: &str,
+    vulkan: &HashMap<String, VulkanDevice>,
+) -> Vec<GpuInfo> {
     let Ok(entries) = std::fs::read_dir(drm_root) else {
         return Vec::new();
     };
@@ -298,11 +328,22 @@ fn intel_xe_gpus(drm_root: &str, proc_root: &str) -> Vec<GpuInfo> {
             continue;
         };
 
-        // No total-VRAM sysfs for xe — resolve by model (env override wins).
+        // No total-VRAM sysfs for xe. Prefer the Vulkan device-local heap,
+        // with explicit env/table fallbacks for drivers that omit it.
         let device_id = read_pci_hex_id(&device.join("device"));
-        let Some(total_mib) =
-            intel_vram_mib_override().or_else(|| device_id.and_then(intel_vram_mib_for_device))
-        else {
+        let total_vram = intel_vram_mib_override()
+            .map(|mib| mib.saturating_mul(1024 * 1024))
+            .or_else(|| {
+                vulkan
+                    .get(&pci_bus_id)
+                    .and_then(|vk| (vk.total_vram > 0).then_some(vk.total_vram))
+            })
+            .or_else(|| {
+                device_id
+                    .and_then(intel_vram_mib_for_device)
+                    .map(|mib| mib.saturating_mul(1024 * 1024))
+            });
+        let Some(total_vram) = total_vram else {
             let id_str = device_id
                 .map(|d| format!("{d:#06x}"))
                 .unwrap_or_else(|| "unknown".into());
@@ -319,14 +360,12 @@ fn intel_xe_gpus(drm_root: &str, proc_root: &str) -> Vec<GpuInfo> {
             id: name.trim_start_matches("card").to_string(),
             used_vram: intel_used_vram_bytes(proc_root, &pci_bus_id),
             pci_bus_id: Some(pci_bus_id),
-            // SYCL/level-zero device selection is by ONEAPI_DEVICE_SELECTOR,
-            // not a Vulkan/CUDA index, so those stay unset.
             vulkan_device: None,
             vulkan_index: None,
             cuda_device: None,
             cuda_index: None,
             integrated: false,
-            total_vram: total_mib.saturating_mul(1024 * 1024),
+            total_vram,
             busy_pct: 0,
             temp_c: read_gpu_junction_temp(&device),
         });
@@ -444,6 +483,7 @@ fn normalize_pci_bus_id(raw: &str) -> Option<String> {
 struct VulkanDevice {
     index: usize,
     integrated: bool,
+    total_vram: u64,
 }
 
 fn vulkan_devices_by_pci() -> &'static HashMap<String, VulkanDevice> {
@@ -484,6 +524,8 @@ fn parse_vulkaninfo(output: &str) -> HashMap<String, VulkanDevice> {
     let mut domain: u32 = 0;
     let mut bus: Option<u32> = None;
     let mut device: Option<u32> = None;
+    let mut current_pci: Option<String> = None;
+    let mut heap_size: Option<u64> = None;
 
     for line in output.lines().map(str::trim) {
         if line.starts_with("Device Properties and Extensions") {
@@ -500,6 +542,8 @@ fn parse_vulkaninfo(output: &str) -> HashMap<String, VulkanDevice> {
                 domain = 0;
                 bus = None;
                 device = None;
+                current_pci = None;
+                heap_size = None;
             }
             continue;
         }
@@ -527,7 +571,25 @@ fn parse_vulkaninfo(output: &str) -> HashMap<String, VulkanDevice> {
             {
                 let pci = format!("{domain:04x}:{bus:02x}:{device:02x}.{func:x}");
                 if is_pci_bus_id(&pci) {
-                    out.insert(pci, VulkanDevice { index: idx, integrated });
+                    current_pci = Some(pci.clone());
+                    out.insert(
+                        pci,
+                        VulkanDevice {
+                            index: idx,
+                            integrated,
+                            total_vram: 0,
+                        },
+                    );
+                }
+            }
+        } else if line.starts_with("memoryHeaps[") {
+            heap_size = None;
+        } else if let Some(size) = parse_vulkaninfo_heap_size(line) {
+            heap_size = Some(size);
+        } else if line == "MEMORY_HEAP_DEVICE_LOCAL_BIT" {
+            if let (Some(pci), Some(size)) = (current_pci.as_deref(), heap_size) {
+                if let Some(vk) = out.get_mut(pci) {
+                    vk.total_vram = vk.total_vram.max(size);
                 }
             }
         }
@@ -543,6 +605,14 @@ fn parse_vulkaninfo_pci_field(line: &str, key: &str) -> Option<u32> {
         .filter(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('='))
         .and_then(|s| s.split('=').nth(1))
         .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+fn parse_vulkaninfo_heap_size(line: &str) -> Option<u64> {
+    line.strip_prefix("size")
+        .filter(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('='))
+        .and_then(|s| s.split('=').nth(1))
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Reads the AMD junction temperature from `device/hwmon/hwmonN/temp2_input`
@@ -803,6 +873,7 @@ mod tests {
             VulkanDevice {
                 index: 0,
                 integrated: false,
+                total_vram: MIN_USABLE_GPU_VRAM_BYTES,
             },
         );
         vulkan.insert(
@@ -810,6 +881,7 @@ mod tests {
             VulkanDevice {
                 index: 1,
                 integrated: true,
+                total_vram: 2 * 1024 * 1024 * 1024,
             },
         );
 
@@ -849,6 +921,11 @@ VkPhysicalDevicePCIBusInfoPropertiesEXT:
 	pciBus      = 13
 	pciDevice   = 0
 	pciFunction = 0
+memoryHeaps: count = 1
+	memoryHeaps[0]:
+		size   = 34208743424 (0x7f7000000) (31.86 GiB)
+		flags: count = 1
+			MEMORY_HEAP_DEVICE_LOCAL_BIT
 GPU1:
 VkPhysicalDeviceProperties:
 ---------------------------
@@ -872,6 +949,25 @@ VkPhysicalDevicePCIBusInfoPropertiesEXT:
 GPU3:
 VkPhysicalDeviceProperties:
 ---------------------------
+	deviceType        = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	deviceName        = Intel(R) Arc(tm) Pro B60 Graphics (BMG G21)
+VkPhysicalDevicePCIBusInfoPropertiesEXT:
+	pciDomain   = 0
+	pciBus      = 30
+	pciDevice   = 0
+	pciFunction = 0
+memoryHeaps: count = 2
+	memoryHeaps[0]:
+		size   = 25669140480 (0x5fa000000) (23.91 GiB)
+		flags: count = 1
+			MEMORY_HEAP_DEVICE_LOCAL_BIT
+	memoryHeaps[1]:
+		size   = 50219685888 (0xbb1539800) (46.77 GiB)
+		flags:
+			None
+GPU4:
+VkPhysicalDeviceProperties:
+---------------------------
 	deviceType        = PHYSICAL_DEVICE_TYPE_CPU
 	deviceName        = llvmpipe (LLVM 22.1.5, 256 bits)
 "#;
@@ -884,7 +980,8 @@ VkPhysicalDeviceProperties:
             map.get("0000:0d:00.0"),
             Some(&VulkanDevice {
                 index: 0,
-                integrated: false
+                integrated: false,
+                total_vram: 34208743424
             })
         );
         // NVIDIA discrete: decimal bus 28 → hex 1c. The whole point — NVIDIA is
@@ -893,7 +990,8 @@ VkPhysicalDeviceProperties:
             map.get("0000:1c:00.0"),
             Some(&VulkanDevice {
                 index: 1,
-                integrated: false
+                integrated: false,
+                total_vram: 0
             })
         );
         // Integrated GPU is mapped (addressable) but flagged.
@@ -901,11 +999,21 @@ VkPhysicalDeviceProperties:
             map.get("0000:08:00.0"),
             Some(&VulkanDevice {
                 index: 2,
-                integrated: true
+                integrated: true,
+                total_vram: 0
+            })
+        );
+        // Intel discrete: decimal bus 30 -> hex 1e.
+        assert_eq!(
+            map.get("0000:1e:00.0"),
+            Some(&VulkanDevice {
+                index: 3,
+                integrated: false,
+                total_vram: 25669140480
             })
         );
         // CPU/virtual device has no usable PCI mapping and is skipped.
-        assert_eq!(map.len(), 3);
+        assert_eq!(map.len(), 4);
     }
 
     #[test]
@@ -929,6 +1037,29 @@ VkPhysicalDeviceProperties:
         assert_eq!(nvidia.cuda_device.as_deref(), Some("CUDA0"));
         assert_eq!(nvidia.vulkan_index, Some(1));
         assert_eq!(nvidia.vulkan_device.as_deref(), Some("Vulkan1"));
+    }
+
+    #[test]
+    fn merge_vulkan_identity_gives_intel_a_vulkan_slot() {
+        let map = parse_vulkaninfo(VULKANINFO_FIXTURE);
+        let mut intel = GpuInfo {
+            id: "0".into(),
+            pci_bus_id: Some("0000:1e:00.0".into()),
+            vulkan_device: None,
+            vulkan_index: None,
+            cuda_device: None,
+            cuda_index: None,
+            integrated: false,
+            total_vram: 24 * 1024 * 1024 * 1024,
+            used_vram: 0,
+            busy_pct: 0,
+            temp_c: None,
+        };
+
+        merge_vulkan_identity(&mut intel, &map);
+
+        assert_eq!(intel.vulkan_index, Some(3));
+        assert_eq!(intel.vulkan_device.as_deref(), Some("Vulkan3"));
     }
 
     #[test]

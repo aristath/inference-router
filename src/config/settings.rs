@@ -1,30 +1,53 @@
 use serde::{Deserialize, Serialize};
 
 /// Global application settings.
-/// 
+///
 /// Configured via environment variables or the dashboard Settings modal.
 /// Changes are persisted to `~/.config/inference-router/settings.json`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
+    /// Folder scanned by the dashboard model-discovery action.
+    pub models_folder: String,
     /// Loop guard configuration for both streaming and tool loops
     pub loop_guards: LoopGuardSettings,
     /// Which set of model names is advertised on `/v1/models`.
     pub model_exposure: ModelExposure,
 }
 
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            models_folder: default_models_folder(),
+            loop_guards: LoopGuardSettings::default(),
+            model_exposure: ModelExposure::default(),
+        }
+    }
+}
+
 impl AppSettings {
     pub fn from_env() -> Self {
         Self {
+            models_folder: std::env::var("INFERENCE_ROUTER_MODELS_FOLDER")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(default_models_folder),
             loop_guards: LoopGuardSettings::from_env(),
             model_exposure: ModelExposure::from_env(),
         }
     }
 
     pub fn sanitized(mut self) -> Self {
+        if self.models_folder.trim().is_empty() {
+            self.models_folder = default_models_folder();
+        }
         self.loop_guards.sanitize();
         self
     }
+}
+
+fn default_models_folder() -> String {
+    "~/models".into()
 }
 
 /// Which set of model names the OpenAI-compatible `/v1/models` endpoint
@@ -89,7 +112,7 @@ pub enum StreamingLoopAction {
 }
 
 /// Configuration for streaming response loop detection.
-/// 
+///
 /// Monitors SSE chunks for repeated text patterns using a sliding window.
 /// When a loop is detected, takes the configured action (heal, abort, or log).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -166,7 +189,7 @@ impl StreamingLoopSettings {
 }
 
 /// Configuration for cross-turn tool loop detection.
-/// 
+///
 /// Analyzes message history for repeating tool call sequences.
 /// When detected, injects a corrective user message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -240,6 +263,7 @@ mod tests {
     #[test]
     fn defaults_match_loop_guard_runtime_defaults() {
         let settings = AppSettings::default();
+        assert_eq!(settings.models_folder, "~/models");
         assert!(settings.loop_guards.streaming.enabled);
         assert_eq!(settings.loop_guards.streaming.window_bytes, 65_536);
         assert_eq!(settings.loop_guards.streaming.repeats, 10);
