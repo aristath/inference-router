@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
+
+use crate::config::Backend;
 
 const MIN_USABLE_GPU_VRAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -22,6 +24,20 @@ pub struct GpuInfo {
     pub cuda_device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuda_index: Option<usize>,
+    /// Device index inside the ROCm/HIP backend (`ROCm0`, `ROCm1`, …), in HIP
+    /// enumeration order. This is what `--tensor-split` / `--device` are
+    /// positional over for a ROCm model — distinct from `vulkan_index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rocm_index: Option<usize>,
+    /// Device index inside the SYCL backend (`SYCL0`, …). Reserved for the
+    /// pending SYCL backend; discovery not yet wired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sycl_index: Option<usize>,
+    /// Backends that can drive this GPU. Auto-seeded from discovery (a backend
+    /// that produced an index for the GPU → that tag) and overridable per GPU by
+    /// the operator via `gpus.json`. Drives which models may be placed here.
+    #[serde(default)]
+    pub tags: BTreeSet<Backend>,
     /// True for integrated GPUs (Vulkan `PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU`).
     /// Such devices are enumerated and addressable so a model can target them
     /// explicitly, but they are kept out of the automatic placement pool — they
@@ -44,21 +60,71 @@ impl GpuInfo {
     pub fn free_vram(&self) -> u64 {
         self.total_vram.saturating_sub(self.used_vram)
     }
+
+    /// This GPU's device index within `backend`, if the backend enumerates it.
+    pub fn backend_index(&self, backend: Backend) -> Option<usize> {
+        match backend {
+            Backend::Vulkan => self.vulkan_index,
+            Backend::Cuda => self.cuda_index,
+            Backend::Rocm => self.rocm_index,
+            Backend::Sycl => self.sycl_index,
+        }
+    }
+
+    /// The llama.cpp device name for this GPU under `backend` (e.g. `ROCm2`),
+    /// for use in an explicit `--device` list. `None` if the backend can't see
+    /// it.
+    pub fn backend_device_name(&self, backend: Backend) -> Option<String> {
+        self.backend_index(backend)
+            .map(|idx| format!("{}{idx}", backend.device_prefix()))
+    }
+
+    /// Whether `backend` may drive this GPU: it must enumerate the GPU *and* the
+    /// GPU must be tagged for it (operator can untag to keep it out of a pool).
+    pub fn supports(&self, backend: Backend) -> bool {
+        self.backend_index(backend).is_some() && self.tags.contains(&backend)
+    }
+
+    /// Capability tags derived purely from discovery — the backends that
+    /// produced a device index for this GPU. Used as the default when the
+    /// operator hasn't overridden tags in `gpus.json`.
+    fn discovered_tags(&self) -> BTreeSet<Backend> {
+        Backend::ALL
+            .into_iter()
+            .filter(|b| self.backend_index(*b).is_some())
+            .collect()
+    }
 }
 
-/// Reads AMD GPU VRAM from sysfs. Pure — holds no state.
+/// Reads GPU VRAM/topology from sysfs + backend tooling. Holds only the
+/// operator's per-GPU tag overrides (interior-mutable so `refresh` stays `&self`
+/// while the override set can be updated when `gpus.json` changes).
 #[derive(Default)]
-pub struct VRAMTracker;
+pub struct VRAMTracker {
+    tag_overrides: RwLock<HashMap<String, BTreeSet<Backend>>>,
+}
 
 impl VRAMTracker {
+    /// Replace the per-PCI tag overrides applied on top of discovered defaults.
+    /// Called at startup and whenever the operator edits a GPU's tags.
+    pub fn set_tag_overrides(&self, overrides: HashMap<String, BTreeSet<Backend>>) {
+        if let Ok(mut guard) = self.tag_overrides.write() {
+            *guard = overrides;
+        }
+    }
+
     /// Scans `/sys/class/drm/card*` for real GPU entries (excluding connector
     /// and writeback sub-nodes like `card1-DP-1`) and returns their VRAM stats,
-    /// sorted by card id.
+    /// sorted by card id, with per-backend indices and capability tags resolved.
     pub fn refresh(&self) -> Vec<GpuInfo> {
         let mut gpus = self.refresh_from("/sys/class/drm");
         append_nvidia_gpus(&mut gpus);
         append_intel_gpus(&mut gpus);
         append_vulkan_gpus(&mut gpus);
+        attach_rocm_indices(&mut gpus);
+        attach_sycl_indices(&mut gpus);
+        let overrides = self.tag_overrides.read().ok();
+        apply_tags(&mut gpus, overrides.as_deref());
         gpus.sort_by(|a, b| a.id.cmp(&b.id));
         gpus
     }
@@ -128,6 +194,9 @@ impl VRAMTracker {
                 vulkan_index,
                 cuda_device: None,
                 cuda_index: None,
+                rocm_index: None,
+                sycl_index: None,
+                tags: BTreeSet::new(),
                 integrated,
                 total_vram: total,
                 used_vram: used,
@@ -213,6 +282,9 @@ fn parse_nvidia_smi_line(line: &str) -> Option<GpuInfo> {
         vulkan_index: None,
         cuda_device: Some(format!("CUDA{cuda_index}")),
         cuda_index: Some(cuda_index),
+        rocm_index: None,
+        sycl_index: None,
+        tags: BTreeSet::new(),
         integrated: false,
         total_vram: total_mib.saturating_mul(1024 * 1024),
         used_vram: used_mib.saturating_mul(1024 * 1024),
@@ -260,12 +332,132 @@ fn append_vulkan_gpus(gpus: &mut Vec<GpuInfo>) {
             vulkan_index: Some(vk.index),
             cuda_device: None,
             cuda_index: None,
+            rocm_index: None,
+            sycl_index: None,
+            tags: BTreeSet::new(),
             integrated: false,
             total_vram: vk.total_vram,
             used_vram: 0,
             busy_pct: 0,
             temp_c: None,
         });
+    }
+}
+
+/// Fills in each GPU's `rocm_index` by correlating the ROCm/HIP enumeration
+/// (`rocm-smi --showbus`, whose `GPU[N]` order is the HIP device order that
+/// `--tensor-split` is positional over) to the physical GPU by PCI bus id.
+fn attach_rocm_indices(gpus: &mut [GpuInfo]) {
+    let by_pci = rocm_pci_to_index();
+    if by_pci.is_empty() {
+        return;
+    }
+    for gpu in gpus.iter_mut() {
+        if let Some(idx) = gpu.pci_bus_id.as_deref().and_then(|pci| by_pci.get(pci)) {
+            gpu.rocm_index = Some(*idx);
+        }
+    }
+}
+
+/// Fills in each GPU's `sycl_index`. SYCL (oneAPI / Level Zero) targets Intel
+/// GPUs, so we enumerate the Intel-vendor GPUs in PCI order and assign device
+/// indices `SYCL0..N`. This is deterministic and needs no oneAPI install; once a
+/// SYCL `llama.cpp` build + `sycl-ls` are present, that authoritative ordering
+/// can refine this — but the tag/placement plumbing is live now either way.
+fn attach_sycl_indices(gpus: &mut [GpuInfo]) {
+    let by_pci = sycl_pci_to_index();
+    if by_pci.is_empty() {
+        return;
+    }
+    for gpu in gpus.iter_mut() {
+        if let Some(idx) = gpu.pci_bus_id.as_deref().and_then(|pci| by_pci.get(pci)) {
+            gpu.sycl_index = Some(*idx);
+        }
+    }
+}
+
+/// `pci -> SYCL index` for Intel GPUs, in PCI-ascending order. Cached for the
+/// process (fixed topology; `refresh()` runs every poll).
+fn sycl_pci_to_index() -> &'static HashMap<String, usize> {
+    static CACHE: OnceLock<HashMap<String, usize>> = OnceLock::new();
+    CACHE.get_or_init(|| discover_sycl_pci_to_index("/sys/class/drm"))
+}
+
+/// Scan `drm_root` for Intel-vendor (`0x8086`) GPU cards and assign SYCL device
+/// indices in PCI-bus order.
+fn discover_sycl_pci_to_index(drm_root: &str) -> HashMap<String, usize> {
+    let Ok(entries) = std::fs::read_dir(drm_root) else {
+        return HashMap::new();
+    };
+    let mut pcis: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device = entry.path().join("device");
+        if read_pci_hex_id(&device.join("vendor")) != Some(0x8086) {
+            continue;
+        }
+        if let Some(pci) = read_pci_bus_id(&device) {
+            pcis.push(pci);
+        }
+    }
+    pcis.sort();
+    pcis.into_iter().enumerate().map(|(i, pci)| (pci, i)).collect()
+}
+
+/// `pci -> HIP index` from `rocm-smi --showbus`. Cached for the process: the
+/// HIP enumeration order is fixed hardware topology, and `refresh()` runs on
+/// every poll — we must not fork `rocm-smi` each time.
+fn rocm_pci_to_index() -> &'static HashMap<String, usize> {
+    static CACHE: OnceLock<HashMap<String, usize>> = OnceLock::new();
+    CACHE.get_or_init(discover_rocm_pci_to_index)
+}
+
+/// Parse `rocm-smi --showbus` into `pci -> HIP index`. Each device line reads
+/// `GPU[N]  : PCI Bus: 0000:03:00.0` (whitespace-separated). PCI is normalised
+/// to the lowercase sysfs form so it matches `GpuInfo::pci_bus_id`.
+fn discover_rocm_pci_to_index() -> HashMap<String, usize> {
+    let Ok(output) = Command::new("rocm-smi").arg("--showbus").output() else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+    parse_rocm_showbus(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_rocm_showbus(text: &str) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let Some(open) = line.find("GPU[") else { continue };
+        let Some(close) = line[open..].find(']') else {
+            continue;
+        };
+        let Some(idx) = line[open + 4..open + close].trim().parse::<usize>().ok() else {
+            continue;
+        };
+        let Some(pci_start) = line.find("PCI Bus:") else {
+            continue;
+        };
+        let raw = line[pci_start + "PCI Bus:".len()..].trim();
+        if let Some(pci) = normalize_pci_bus_id(raw) {
+            map.insert(pci, idx);
+        }
+    }
+    map
+}
+
+/// Resolve each GPU's capability tags: the operator's per-PCI override if set,
+/// otherwise the tags discovered from hardware (backends that enumerate it).
+fn apply_tags(gpus: &mut [GpuInfo], overrides: Option<&HashMap<String, BTreeSet<Backend>>>) {
+    for gpu in gpus.iter_mut() {
+        let override_tags = overrides
+            .and_then(|o| gpu.pci_bus_id.as_deref().and_then(|pci| o.get(pci)))
+            .cloned();
+        gpu.tags = override_tags.unwrap_or_else(|| gpu.discovered_tags());
     }
 }
 
@@ -364,6 +556,9 @@ fn intel_xe_gpus(
             vulkan_index: None,
             cuda_device: None,
             cuda_index: None,
+            rocm_index: None,
+            sycl_index: None,
+            tags: BTreeSet::new(),
             integrated: false,
             total_vram,
             busy_pct: 0,
@@ -639,6 +834,77 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn parses_rocm_showbus_to_pci_index_map() {
+        let out = "======================================= PCI Bus ID =======================================\n\
+            GPU[0]\t\t: PCI Bus: 0000:03:00.0\n\
+            GPU[1]\t\t: PCI Bus: 0000:07:00.0\n\
+            GPU[2]\t\t: PCI Bus: 0000:0A:00.0\n";
+        let map = parse_rocm_showbus(out);
+        // HIP index keyed by lowercase-normalised PCI (matches sysfs form).
+        assert_eq!(map.get("0000:03:00.0"), Some(&0));
+        assert_eq!(map.get("0000:07:00.0"), Some(&1));
+        assert_eq!(map.get("0000:0a:00.0"), Some(&2));
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn sycl_indices_assigned_to_intel_gpus_in_pci_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // An Intel card (0x8086) at 1e and an AMD card (0x1002) at 03. The real
+        // device dir is named by PCI so `read_pci_bus_id` (which canonicalises
+        // `card*/device`) recovers the bus id, as in actual sysfs.
+        for (card, pci, vendor) in [
+            ("card0", "0000:1e:00.0", "0x8086"),
+            ("card1", "0000:03:00.0", "0x1002"),
+        ] {
+            let devdir = root.join(pci);
+            fs::create_dir_all(&devdir).unwrap();
+            fs::write(devdir.join("vendor"), format!("{vendor}\n")).unwrap();
+            let card_dir = root.join(card);
+            fs::create_dir_all(&card_dir).unwrap();
+            std::os::unix::fs::symlink(&devdir, card_dir.join("device")).unwrap();
+        }
+        let map = discover_sycl_pci_to_index(root.to_str().unwrap());
+        assert_eq!(map.get("0000:1e:00.0"), Some(&0)); // Intel GPU → SYCL0
+        assert!(!map.contains_key("0000:03:00.0")); // AMD excluded from SYCL
+    }
+
+    #[test]
+    fn discovered_tags_follow_backend_indices() {
+        let mut g = GpuInfo {
+            id: "x".into(),
+            pci_bus_id: Some("0000:03:00.0".into()),
+            vulkan_device: None,
+            vulkan_index: Some(1),
+            cuda_device: None,
+            cuda_index: None,
+            rocm_index: Some(0),
+            sycl_index: None,
+            tags: BTreeSet::new(),
+            integrated: false,
+            total_vram: 32 << 30,
+            used_vram: 0,
+            busy_pct: 0,
+            temp_c: None,
+        };
+        apply_tags(std::slice::from_mut(&mut g), None);
+        // An AMD card seen by both ROCm and Vulkan is tagged for both.
+        assert!(g.tags.contains(&Backend::Rocm));
+        assert!(g.tags.contains(&Backend::Vulkan));
+        assert!(!g.tags.contains(&Backend::Cuda));
+        assert!(g.supports(Backend::Rocm));
+        assert_eq!(g.backend_device_name(Backend::Rocm).as_deref(), Some("ROCm0"));
+
+        // An operator override replaces the discovered set (ROCm-only).
+        let mut over = HashMap::new();
+        over.insert("0000:03:00.0".to_string(), [Backend::Rocm].into_iter().collect());
+        apply_tags(std::slice::from_mut(&mut g), Some(&over));
+        assert!(!g.supports(Backend::Vulkan));
+        assert!(g.supports(Backend::Rocm));
+    }
+
+    #[test]
     fn parses_intel_fdinfo_resident_vram() {
         let block = "drm-driver:\txe\n\
             drm-pdev:\t0000:03:00.0\n\
@@ -687,6 +953,9 @@ mod tests {
             vulkan_index: None,
             cuda_device: None,
             cuda_index: None,
+            rocm_index: None,
+            sycl_index: None,
+            tags: Default::default(),
             integrated: false,
             total_vram: 100,
             used_vram: 150,
@@ -713,7 +982,7 @@ mod tests {
         fs::write(hwmon.join("temp1_input"), "41000").unwrap();
         fs::write(hwmon.join("temp2_input"), "43500").unwrap();
 
-        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker::default().refresh_from(root.to_str().unwrap());
         assert_eq!(gpus[0].temp_c, Some(43.5));
     }
 
@@ -732,7 +1001,7 @@ mod tests {
         fs::create_dir_all(&card2).unwrap();
         fs::write(card2.join("mem_info_vram_total"), "34208743424").unwrap();
 
-        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker::default().refresh_from(root.to_str().unwrap());
         assert_eq!(gpus[0].busy_pct, 42);
         assert_eq!(gpus[1].busy_pct, 0);
     }
@@ -749,7 +1018,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dev.join("gpu_busy_percent"), "250").unwrap();
-        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker::default().refresh_from(root.to_str().unwrap());
         assert_eq!(gpus[0].busy_pct, 100);
     }
 
@@ -788,7 +1057,7 @@ mod tests {
         fs::create_dir_all(&card2).unwrap();
         fs::write(card2.join("mem_info_vram_total"), "34208743424").unwrap();
 
-        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker::default().refresh_from(root.to_str().unwrap());
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].id, "1");
         assert_eq!(gpus[0].total_vram, 32061259776);
@@ -805,7 +1074,7 @@ mod tests {
         // Non-GPU card (integrated display w/o vram files).
         fs::create_dir_all(root.join("card0").join("device")).unwrap();
 
-        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker::default().refresh_from(root.to_str().unwrap());
         assert!(gpus.is_empty());
     }
 
@@ -830,7 +1099,7 @@ mod tests {
         )
         .unwrap();
 
-        let gpus = VRAMTracker.refresh_from(root.to_str().unwrap());
+        let gpus = VRAMTracker::default().refresh_from(root.to_str().unwrap());
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].id, "1");
     }
@@ -885,7 +1154,7 @@ mod tests {
             },
         );
 
-        let gpus = VRAMTracker.refresh_from_with_vulkan(root.to_str().unwrap(), &vulkan);
+        let gpus = VRAMTracker::default().refresh_from_with_vulkan(root.to_str().unwrap(), &vulkan);
         // card0 (integrated, kept) and card2 (discrete) survive; card1 dropped.
         assert_eq!(gpus.len(), 2);
         let igpu = gpus.iter().find(|g| g.id == "0").unwrap();
@@ -1026,6 +1295,9 @@ VkPhysicalDeviceProperties:
             vulkan_index: None,
             cuda_device: Some("CUDA0".into()),
             cuda_index: Some(0),
+            rocm_index: None,
+            sycl_index: None,
+            tags: Default::default(),
             integrated: false,
             total_vram: 24 * 1024 * 1024 * 1024,
             used_vram: 0,
@@ -1049,6 +1321,9 @@ VkPhysicalDeviceProperties:
             vulkan_index: None,
             cuda_device: None,
             cuda_index: None,
+            rocm_index: None,
+            sycl_index: None,
+            tags: Default::default(),
             integrated: false,
             total_vram: 24 * 1024 * 1024 * 1024,
             used_vram: 0,
@@ -1073,6 +1348,9 @@ VkPhysicalDeviceProperties:
             vulkan_index: None,
             cuda_device: Some("CUDA0".into()),
             cuda_index: Some(0),
+            rocm_index: None,
+            sycl_index: None,
+            tags: Default::default(),
             integrated: false,
             total_vram: 24 * 1024 * 1024 * 1024,
             used_vram: 0,

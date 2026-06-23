@@ -12,6 +12,10 @@ use crate::vram::tracker::GpuInfo;
 pub struct GpuDisplay {
     pub id: String,
     pub label: String,
+    /// Stable PCI bus id, used as the key when editing this GPU's tags.
+    pub pci_bus_id: String,
+    /// Backend capability tags joined for display, e.g. "vulkan · rocm".
+    pub tags_str: String,
     pub used_gib_str: String,
     pub total_gib_str: String,
     pub free_gib_str: String,
@@ -47,6 +51,13 @@ impl GpuDisplay {
                     None => dev.clone(),
                 })
                 .unwrap_or_else(|| gpu.id.clone()),
+            pci_bus_id: gpu.pci_bus_id.clone().unwrap_or_default(),
+            tags_str: gpu
+                .tags
+                .iter()
+                .map(|b| b.as_str())
+                .collect::<Vec<_>>()
+                .join(" · "),
             used_gib_str: format!("{:.1}", used_gib),
             total_gib_str: format!("{:.1}", total_gib),
             free_gib_str: format!("{:.1}", free_gib),
@@ -698,6 +709,9 @@ mod tests {
             vulkan_index: None,
             cuda_device: None,
             cuda_index: None,
+            rocm_index: None,
+            sycl_index: None,
+            tags: Default::default(),
             integrated: false,
             total_vram: total,
             used_vram: used,

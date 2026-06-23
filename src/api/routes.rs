@@ -7,7 +7,9 @@ use std::path::Path as StdPath;
 use std::time::Duration;
 use tokio::process::Command;
 
-use crate::config::{AppSettings, BinaryPreset, CacheType, ModelAlias, ModelConfig, WeightsFormat};
+use crate::config::{
+    AppSettings, Backend, BinaryPreset, CacheType, ModelAlias, ModelConfig, WeightsFormat,
+};
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
 use crate::vram::estimator::GgufMeta;
 
@@ -322,6 +324,27 @@ pub async fn load_model(
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+// ===== GPU backend tags =====
+
+#[derive(Debug, Deserialize)]
+pub struct GpuTagsRequest {
+    pub pci_bus_id: String,
+    #[serde(default)]
+    pub tags: Vec<Backend>,
+}
+
+/// Set the operator's backend capability tags for one GPU (by PCI bus id).
+pub async fn update_gpu_tags(
+    State(state): State<AppState>,
+    Json(req): Json<GpuTagsRequest>,
+) -> impl IntoResponse {
+    let tags: std::collections::BTreeSet<Backend> = req.tags.into_iter().collect();
+    match state.set_gpu_tags(&req.pci_bus_id, tags).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => mutation_response(e),
     }
 }
 

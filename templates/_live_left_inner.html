@@ -77,6 +77,13 @@
                     <span class="gpu-temp">{{ gpu.temp_c_str }}</span>°C
                 </span>
             </div>
+            <div class="gpu-tags-row">
+                <span class="gpu-tags" title="Backends that may drive this GPU">{{ gpu.tags_str }}</span>
+                {% if !gpu.pci_bus_id.is_empty() %}
+                <button type="button" class="gpu-tags-edit" title="Edit backend tags"
+                        onclick="openGpuTagsModal('{{ gpu.pci_bus_id }}')">edit</button>
+                {% endif %}
+            </div>
             <div class="gpu-metric" id="gpu-vram-{{ gpu.id }}" style="margin-top: 0.5rem;">
                 <div class="gpu-metric-head">
                     <span class="gpu-metric-label">VRAM</span>

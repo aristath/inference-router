@@ -13,7 +13,7 @@ use crate::api::model_scan::{reconcile_models_folder, scan_models_folder};
 use crate::api::proxy;
 use crate::api::routes::*;
 use crate::api::state::get_app_state;
-use crate::config::{AppSettings, BinaryPreset, JsonStore, ModelAlias, ModelConfig};
+use crate::config::{AppSettings, BinaryPreset, GpuTagOverride, JsonStore, ModelAlias, ModelConfig};
 use crate::orchestrator::{AppState, Orchestrator};
 use crate::ui::templates::{
     sort_and_filter, DashboardFragmentTemplate, DashboardTemplate, EventDisplay, GpuDisplay,
@@ -59,12 +59,15 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     if !settings_exists {
         settings_store.replace(AppSettings::from_env());
     }
+    let gpu_tags_store: Arc<JsonStore<Vec<GpuTagOverride>>> =
+        Arc::new(JsonStore::new(config_dir.join("gpus.json")));
 
     let orchestrator = Arc::new(Orchestrator::new_with_settings_store(
         models_store.clone(),
         presets_store.clone(),
         aliases_store.clone(),
         settings_store.clone(),
+        gpu_tags_store.clone(),
         config.port,
     ));
 
@@ -156,6 +159,7 @@ pub fn build_router(app_state: AppState) -> axum::Router {
         .route("/api/service/restart", post(restart_service))
         .route("/api/files", get(list_files))
         .route("/api/gguf-info", get(gguf_info))
+        .route("/api/gpus/tags", put(update_gpu_tags))
         .route("/api/presets", get(list_presets).post(create_preset))
         .route(
             "/api/presets/{id}",

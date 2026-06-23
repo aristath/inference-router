@@ -1,8 +1,8 @@
 use crate::config::{
-    AppSettings, BinaryPreset, ConfigError, JsonStore, ModelAlias, ModelConfig, ModelState,
-    WeightsFormat,
+    AppSettings, Backend, BinaryPreset, ConfigError, GpuTagOverride, JsonStore, ModelAlias,
+    ModelConfig, ModelState, SplitMode, WeightsFormat, tag_overrides_by_pci,
 };
-use crate::orchestrator::allocation::{gpus_used, plan_tensor_split};
+use crate::orchestrator::allocation::plan_backend_split;
 use crate::orchestrator::eviction::{EvictionAction, decide_eviction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
 use crate::system::stats::{SystemStats, SystemTracker};
@@ -60,6 +60,10 @@ pub struct Orchestrator {
     pub store: Arc<JsonStore<Vec<ModelConfig>>>,
     pub presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
     pub aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
+    /// Operator overrides of per-GPU backend tags (`gpus.json`). `None` in
+    /// minimal/test constructors. Applied to `vram_tracker` at startup and on
+    /// every edit.
+    pub gpu_tags_store: Option<Arc<JsonStore<Vec<GpuTagOverride>>>>,
     pub settings_store: Option<Arc<JsonStore<AppSettings>>>,
     pub dirty: Arc<AtomicBool>,
     /// Set when presets change so reconcile persists presets.json.
@@ -89,6 +93,7 @@ impl Orchestrator {
             presets_store,
             aliases_store,
             None,
+            None,
             AppSettings::from_env(),
             server_port,
         )
@@ -99,6 +104,7 @@ impl Orchestrator {
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
         aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
         settings_store: Arc<JsonStore<AppSettings>>,
+        gpu_tags_store: Arc<JsonStore<Vec<GpuTagOverride>>>,
         server_port: u16,
     ) -> Self {
         let settings = settings_store.snapshot();
@@ -107,6 +113,7 @@ impl Orchestrator {
             presets_store,
             aliases_store,
             Some(settings_store),
+            Some(gpu_tags_store),
             settings.sanitized(),
             server_port,
         )
@@ -117,6 +124,7 @@ impl Orchestrator {
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
         aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
         settings_store: Option<Arc<JsonStore<AppSettings>>>,
+        gpu_tags_store: Option<Arc<JsonStore<Vec<GpuTagOverride>>>>,
         settings: AppSettings,
         server_port: u16,
     ) -> Self {
@@ -165,6 +173,13 @@ impl Orchestrator {
             .map(|a| (a.alias.clone(), a))
             .collect();
 
+        // Seed the tracker with any persisted per-GPU tag overrides so the very
+        // first refresh already reflects the operator's choices.
+        let vram_tracker = Arc::new(VRAMTracker::default());
+        if let Some(ref store) = gpu_tags_store {
+            vram_tracker.set_tag_overrides(tag_overrides_by_pci(&store.snapshot()));
+        }
+
         Self {
             data: Arc::new(Mutex::new(AppData {
                 models,
@@ -173,7 +188,7 @@ impl Orchestrator {
                 aliases,
             })),
             process_manager: Arc::new(Mutex::new(ProcessManager::default())),
-            vram_tracker: Arc::new(VRAMTracker),
+            vram_tracker,
             system_tracker: Arc::new(SystemTracker::default()),
             admission: Arc::new(Mutex::new(())),
             reserved_vram: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -181,6 +196,7 @@ impl Orchestrator {
             store,
             presets_store,
             aliases_store,
+            gpu_tags_store,
             settings_store,
             dirty: Arc::new(AtomicBool::new(migrated_any)),
             presets_dirty: Arc::new(AtomicBool::new(false)),
@@ -253,6 +269,37 @@ impl Orchestrator {
     #[cfg(test)]
     pub async fn get_model(&self, id: &str) -> Option<ModelConfig> {
         self.data.lock().await.models.get(id).cloned()
+    }
+
+    // ----- GPU capability tags -----
+
+    /// Set (or clear) the operator's backend tags for one GPU, keyed by PCI bus
+    /// id. Persists `gpus.json` and re-applies the override set to the tracker
+    /// so the next refresh reflects it immediately.
+    pub async fn set_gpu_tags(
+        &self,
+        pci_bus_id: &str,
+        tags: std::collections::BTreeSet<Backend>,
+    ) -> Result<(), MutationError> {
+        let Some(store) = self.gpu_tags_store.clone() else {
+            return Err(MutationError::NotFound("gpu tags store".into()));
+        };
+        store.with_mut(|list| {
+            list.retain(|o| o.pci_bus_id != pci_bus_id);
+            list.push(GpuTagOverride {
+                pci_bus_id: pci_bus_id.to_string(),
+                tags,
+            });
+        });
+        let _ = store.save();
+        self.vram_tracker
+            .set_tag_overrides(tag_overrides_by_pci(&store.snapshot()));
+        // Refresh so data.gpus reflects the new tags right away.
+        let gpus = self.vram_tracker.refresh();
+        self.data.lock().await.gpus = gpus;
+        self.record_event("info", format!("updated GPU tags for {pci_bus_id}"))
+            .await;
+        Ok(())
     }
 
     // ----- Presets -----
@@ -694,8 +741,8 @@ impl Orchestrator {
                 data.gpus = gpus.clone();
             }
 
-            // Snapshot the model + resolve preset → binary path + draft.
-            let (mut model, mut draft) = {
+            // Snapshot the model + resolve preset → binary path + backends + draft.
+            let (mut model, mut draft, target_backends) = {
                 let data = self.data.lock().await;
                 let mut m = data
                     .models
@@ -713,6 +760,7 @@ impl Orchestrator {
                 if m.binary.as_os_str().is_empty() {
                     return Err(LoadError::NoBinary(id.into()));
                 }
+                let target_backends = resolve_targets(&m, &data.presets);
                 // Resolve the draft reference now so any missing/
                 // role-mismatched draft surfaces as a load-time error
                 // rather than a cryptic spawn failure.
@@ -728,7 +776,7 @@ impl Orchestrator {
                     } else {
                         None
                     };
-                (m, draft)
+                (m, draft, target_backends)
             };
             normalize_model_device_for_llama(&mut model, &gpus);
             if let Some(ref mut d) = draft {
@@ -788,71 +836,52 @@ impl Orchestrator {
                 }
             }
 
-            // Evict if needed.
-            // Subtract VRAM already reserved by concurrent in-flight loads:
-            // their processes exist but haven't yet faulted weights into VRAM,
-            // so sysfs still reports the full free figure.
+            // Place the model on its backend's GPUs, evicting idle models and
+            // retrying once if it doesn't fit. `try_place` sets an explicit
+            // `--device` + aligned `--tensor-split` for auto-placed GGUF models.
+            // Reserved VRAM (concurrent in-flight loads whose weights haven't
+            // faulted in yet) is subtracted inside `try_place`.
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-            let adjusted_gpus = model_visible_gpus(
-                &model,
-                subtract_reserved_from_gpus(gpus.clone(), already_reserved),
-            );
-            let mut free: u64 = adjusted_gpus.iter().map(|g| g.free_vram()).sum();
-            if model.estimated_vram > free {
-                let snapshot = self.data.lock().await.models.clone();
-                let idle_models = self.process_manager.lock().await.idle_model_ids();
-                for EvictionAction::Evict(victim) in
-                    decide_eviction(&snapshot, free, model.estimated_vram, &idle_models)
-                {
-                    info!(victim = victim, "evicting to make room");
-                    self.record_event("info", format!("evicting {victim} to load {id}"))
-                        .await;
-                    if let Err(e) = self.stop_model_inner(&victim).await {
-                        warn!(model = victim, error = %e, "eviction stop failed");
-                    }
+            match try_place(&mut model, &target_backends, &gpus, already_reserved) {
+                PlaceOutcome::Placed {
+                    backend,
+                    gpus_used,
+                } => {
+                    info!(
+                        model = id,
+                        ?backend,
+                        gpus_used,
+                        device = ?model.device,
+                        tensor_split = ?model.tensor_split,
+                        "auto-placed on backend devices"
+                    );
                 }
-                // Re-read VRAM after eviction so the allocator sees the freed space.
-                let gpus_after = self.vram_tracker.refresh();
-                let adjusted_after = model_visible_gpus(
-                    &model,
-                    subtract_reserved_from_gpus(gpus_after.clone(), already_reserved),
-                );
-                free = adjusted_after.iter().map(|g| g.free_vram()).sum();
-                self.data.lock().await.gpus = gpus_after;
-            }
-            if model.estimated_vram > 0 && model.estimated_vram > free {
-                return Err(LoadError::InsufficientVram {
-                    model: id.into(),
-                    needed: model.estimated_vram,
-                    free,
-                });
-            }
-
-            // Auto-allocate across the smallest viable GPU subset. If the
-            // configured split length no longer matches the selected backend
-            // devices, replan instead of passing a stale positional split.
-            if model.weights_format == WeightsFormat::Gguf {
-                let snapshot = self.data.lock().await.gpus.clone();
-                let adjusted = model_visible_gpus(
-                    &model,
-                    subtract_reserved_from_gpus(snapshot, already_reserved),
-                );
-                if should_plan_tensor_split(&model, adjusted.len()) && model.estimated_vram > 0 {
-                    if let Some(split) = plan_tensor_split(&adjusted, model.estimated_vram) {
-                        info!(
-                            model = id,
-                            gpus_used = gpus_used(&split),
-                            tensor_split = split,
-                            "auto-allocated across minimum GPU subset"
-                        );
-                        model.tensor_split = Some(split);
-                    } else if model.tensor_split.is_some() {
-                        model.tensor_split = None;
-                        return Err(LoadError::InsufficientVram {
-                            model: id.into(),
-                            needed: model.estimated_vram,
-                            free,
-                        });
+                PlaceOutcome::Fits => {}
+                PlaceOutcome::DoesNotFit { free } => {
+                    let snapshot = self.data.lock().await.models.clone();
+                    let idle_models = self.process_manager.lock().await.idle_model_ids();
+                    for EvictionAction::Evict(victim) in
+                        decide_eviction(&snapshot, free, model.estimated_vram, &idle_models)
+                    {
+                        info!(victim = victim, "evicting to make room");
+                        self.record_event("info", format!("evicting {victim} to load {id}"))
+                            .await;
+                        if let Err(e) = self.stop_model_inner(&victim).await {
+                            warn!(model = victim, error = %e, "eviction stop failed");
+                        }
+                    }
+                    // Re-read VRAM after eviction so placement sees freed space.
+                    let gpus_after = self.vram_tracker.refresh();
+                    self.data.lock().await.gpus = gpus_after.clone();
+                    match try_place(&mut model, &target_backends, &gpus_after, already_reserved) {
+                        PlaceOutcome::Placed { .. } | PlaceOutcome::Fits => {}
+                        PlaceOutcome::DoesNotFit { free } => {
+                            return Err(LoadError::InsufficientVram {
+                                model: id.into(),
+                                needed: model.estimated_vram,
+                                free,
+                            });
+                        }
                     }
                 }
             }
@@ -963,7 +992,7 @@ impl Orchestrator {
                 self.data.lock().await.gpus = gpus.clone();
             }
 
-            let (mut model, mut draft) = {
+            let (mut model, mut draft, target_backends) = {
                 let data = self.data.lock().await;
                 let m = data
                     .models
@@ -980,6 +1009,7 @@ impl Orchestrator {
                 if model.binary.as_os_str().is_empty() {
                     return Err(LoadError::NoBinary(id.into()));
                 }
+                let target_backends = resolve_targets(&model, &data.presets);
                 let draft =
                     if let Some(ref did) = model.draft_model_id {
                         let d = data.models.get(did).cloned().ok_or_else(|| {
@@ -992,33 +1022,32 @@ impl Orchestrator {
                     } else {
                         None
                     };
-                (model, draft)
+                (model, draft, target_backends)
             };
             normalize_model_device_for_llama(&mut model, &gpus);
             if let Some(ref mut d) = draft {
                 normalize_model_device_for_llama(d, &gpus);
             }
 
+            // Best-effort scale-out: place this extra instance on its backend's
+            // GPUs that have room *right now* (e.g. the GPUs the first instance
+            // left free). No eviction — if nothing fits, reuse the busy instance.
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-            let adjusted_gpus = model_visible_gpus(
-                &model,
-                subtract_reserved_from_gpus(gpus.clone(), already_reserved),
-            );
-            let free: u64 = adjusted_gpus.iter().map(|g| g.free_vram()).sum();
-            if model.estimated_vram == 0 || free < model.estimated_vram {
-                return Ok(None);
-            }
-
-            if model.weights_format == WeightsFormat::Gguf
-                && should_plan_tensor_split(&model, adjusted_gpus.len())
-                && model.estimated_vram > 0
-            {
-                if let Some(split) = plan_tensor_split(&adjusted_gpus, model.estimated_vram) {
-                    model.tensor_split = Some(split);
-                } else if model.tensor_split.is_some() {
-                    model.tensor_split = None;
-                    return Ok(None);
+            match try_place(&mut model, &target_backends, &gpus, already_reserved) {
+                PlaceOutcome::Placed {
+                    backend,
+                    gpus_used,
+                } => {
+                    info!(
+                        model = id,
+                        ?backend,
+                        gpus_used,
+                        device = ?model.device,
+                        "scaling out onto free backend devices"
+                    );
                 }
+                PlaceOutcome::Fits => {}
+                PlaceOutcome::DoesNotFit { .. } => return Ok(None),
             }
 
             let pending = match self
@@ -1502,13 +1531,84 @@ fn subtract_reserved_from_gpus(mut gpus: Vec<GpuInfo>, mut reserved: u64) -> Vec
     gpus
 }
 
-fn should_plan_tensor_split(model: &ModelConfig, device_count: usize) -> bool {
-    device_count > 0
-        && model
-            .tensor_split
-            .as_deref()
-            .map(|split| split.split(',').count() != device_count)
-            .unwrap_or(true)
+/// The ordered backends a model may run on, from its preset's `targets`
+/// (or a single backend inferred from a legacy preset). Falls back to Vulkan —
+/// the historical implicit backend — for models with no preset at all.
+fn resolve_targets(model: &ModelConfig, presets: &HashMap<String, BinaryPreset>) -> Vec<Backend> {
+    model
+        .binary_preset
+        .as_deref()
+        .and_then(|id| presets.get(id))
+        .map(BinaryPreset::effective_targets)
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| vec![Backend::Vulkan])
+}
+
+/// Result of attempting to place a model on the current GPUs.
+enum PlaceOutcome {
+    /// GGUF auto-placement succeeded; `model.device`/`tensor_split` were set.
+    Placed { backend: Backend, gpus_used: usize },
+    /// Explicit-device or non-GGUF model that fits by total free VRAM.
+    Fits,
+    /// Doesn't fit anywhere; `free` is the best-case free VRAM seen across the
+    /// model's target backends (for the error message).
+    DoesNotFit { free: u64 },
+}
+
+/// Decide where `model` runs on `gpus` (reserved VRAM subtracted inside).
+///
+/// For an auto-placed GGUF model, walks `targets` in priority order and, on the
+/// first backend whose tagged GPUs hold the model, sets an explicit `--device`
+/// list + a `--tensor-split` aligned to it. Because the device list is explicit,
+/// placement is correct even when backends enumerate GPUs in different orders.
+/// Explicit-device and non-GGUF models keep their config and are only VRAM-checked.
+fn try_place(
+    model: &mut ModelConfig,
+    targets: &[Backend],
+    gpus: &[GpuInfo],
+    reserved: u64,
+) -> PlaceOutcome {
+    let adjusted = subtract_reserved_from_gpus(gpus.to_vec(), reserved);
+
+    // Explicit pin or non-GGUF: trust the config, just check it fits.
+    if model.weights_format != WeightsFormat::Gguf
+        || configured_llama_device_value(model).is_some()
+    {
+        let eligible = model_visible_gpus(model, adjusted);
+        let free: u64 = eligible.iter().map(|g| g.free_vram()).sum();
+        return if model.estimated_vram == 0 || free >= model.estimated_vram {
+            PlaceOutcome::Fits
+        } else {
+            PlaceOutcome::DoesNotFit { free }
+        };
+    }
+
+    // No estimate (gguf parse failed): can't plan; let the backend default place it.
+    if model.estimated_vram == 0 {
+        return PlaceOutcome::Fits;
+    }
+
+    let mut best_free = 0u64;
+    for &backend in targets {
+        let candidates: Vec<GpuInfo> = adjusted
+            .iter()
+            .filter(|g| !g.integrated && g.supports(backend))
+            .cloned()
+            .collect();
+        best_free = best_free.max(candidates.iter().map(|g| g.free_vram()).sum());
+        if let Some(p) = plan_backend_split(backend, &candidates, model.estimated_vram) {
+            model.device = Some(p.device);
+            model.tensor_split = Some(p.tensor_split);
+            if p.gpus_used > 1 && model.split_mode.is_none() {
+                model.split_mode = Some(SplitMode::Layer);
+            }
+            return PlaceOutcome::Placed {
+                backend,
+                gpus_used: p.gpus_used,
+            };
+        }
+    }
+    PlaceOutcome::DoesNotFit { free: best_free }
 }
 
 fn model_visible_gpus(model: &ModelConfig, gpus: Vec<GpuInfo>) -> Vec<GpuInfo> {
@@ -1744,6 +1844,9 @@ mod tests {
             vulkan_index: Some(vulkan_index),
             cuda_device: None,
             cuda_index: None,
+            rocm_index: None,
+            sycl_index: None,
+            tags: Default::default(),
             integrated: false,
             total_vram: 32 * 1024 * 1024 * 1024,
             used_vram: 0,
@@ -1817,6 +1920,9 @@ mod tests {
             vulkan_index: None,
             cuda_device: Some("CUDA0".into()),
             cuda_index: Some(0),
+            rocm_index: None,
+            sycl_index: None,
+            tags: Default::default(),
             integrated: false,
             total_vram: 24 * 1024 * 1024 * 1024,
             used_vram: 0,
@@ -1859,6 +1965,9 @@ mod tests {
             vulkan_index: None,
             cuda_device: Some("CUDA0".into()),
             cuda_index: Some(0),
+            rocm_index: None,
+            sycl_index: None,
+            tags: Default::default(),
             integrated: false,
             total_vram: 24 * 1024 * 1024 * 1024,
             used_vram: 0,
@@ -1894,16 +2003,6 @@ mod tests {
         assert_eq!(visible.len(), 1);
         assert!(visible[0].integrated);
         assert_eq!(visible[0].pci_bus_id.as_deref(), Some("0000:08:00.0"));
-    }
-
-    #[test]
-    fn should_replan_stale_tensor_split_lengths() {
-        let mut m = model("a");
-        assert!(should_plan_tensor_split(&m, 4));
-        m.tensor_split = Some("0.5,0,0.5".into());
-        assert!(should_plan_tensor_split(&m, 4));
-        m.tensor_split = Some("0.25,0.25,0.25,0.25".into());
-        assert!(!should_plan_tensor_split(&m, 4));
     }
 
     #[tokio::test]
@@ -2263,6 +2362,9 @@ mod tests {
                 vulkan_index: None,
                 cuda_device: None,
                 cuda_index: None,
+                rocm_index: None,
+                sycl_index: None,
+                tags: Default::default(),
                 integrated: false,
                 total_vram: 10 * 1024 * 1024 * 1024,
                 used_vram: 0,
@@ -2346,8 +2448,11 @@ mod tests {
             tmp.path().join("aliases.json"),
         ));
         let settings = Arc::new(JsonStore::<AppSettings>::new(settings_path.clone()));
+        let gpu_tags = Arc::new(JsonStore::<Vec<GpuTagOverride>>::new(
+            tmp.path().join("gpus.json"),
+        ));
         let o = Arc::new(Orchestrator::new_with_settings_store(
-            store, presets, aliases, settings, 8080,
+            store, presets, aliases, settings, gpu_tags, 8080,
         ));
 
         let mut next = o.settings().await;

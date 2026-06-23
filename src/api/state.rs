@@ -50,6 +50,12 @@ struct GpuResponse {
     cuda_device: Option<String>,
     /// CUDA device index if available
     cuda_index: Option<usize>,
+    /// ROCm/HIP device index if available
+    rocm_index: Option<usize>,
+    /// SYCL device index if available
+    sycl_index: Option<usize>,
+    /// Backend capability tags (which backends may drive this GPU)
+    tags: Vec<crate::config::Backend>,
     /// Total VRAM in bytes
     total_vram: u64,
     /// Used VRAM in bytes
@@ -139,6 +145,9 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
                 vulkan_index: g.vulkan_index,
                 cuda_device: g.cuda_device,
                 cuda_index: g.cuda_index,
+                rocm_index: g.rocm_index,
+                sycl_index: g.sycl_index,
+                tags: g.tags.into_iter().collect(),
                 total_vram: g.total_vram,
                 used_vram: g.used_vram,
                 busy_pct: g.busy_pct,

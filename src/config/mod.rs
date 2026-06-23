@@ -15,12 +15,16 @@
 //! - `settings.json`: Application settings
 
 pub mod alias;
+pub mod backend;
+pub mod gpu_tags;
 pub mod model;
 pub mod preset;
 pub mod settings;
 pub mod store;
 
 pub use alias::*;
+pub use backend::*;
+pub use gpu_tags::*;
 pub use model::*;
 pub use preset::*;
 pub use settings::*;

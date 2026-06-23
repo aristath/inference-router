@@ -1,85 +1,86 @@
 //! Pick the smallest subset of GPUs that fits a model + build the backend
 //! positional `--tensor-split` string llama.cpp expects.
 
+use crate::config::Backend;
 use crate::vram::tracker::GpuInfo;
 
 /// Headroom multiplier on top of estimated VRAM — smooths over our formula's
 /// imprecision and leaves a little room for compute buffers.
 const HEADROOM: f64 = 1.05;
 
-/// Returns `Some(tensor_split_string)` if the model fits, or `None` if even
-/// using every GPU doesn't cover `needed_vram`.
+/// A concrete placement on one backend: an explicit `--device` list and a
+/// `--tensor-split` whose values are positionally aligned to that list (verified
+/// against the ROCm binary: `--tensor-split` follows `--device` order, not the
+/// backend's global enumeration order). Emitting the device list explicitly is
+/// what makes placement correct on a box where Vulkan and ROCm enumerate GPUs
+/// in different orders.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendPlacement {
+    pub backend: Backend,
+    /// e.g. `ROCm2,ROCm3`.
+    pub device: String,
+    /// e.g. `0.514,0.486`, aligned to `device`.
+    pub tensor_split: String,
+    pub gpus_used: usize,
+}
+
+/// Choose GPUs for `backend` from `candidates` (already filtered to GPUs the
+/// backend may drive, reserved-adjusted) to fit `needed_vram`, and emit the
+/// explicit `--device` + aligned `--tensor-split`.
 ///
-/// Strategy: sort GPUs by free VRAM descending, greedily add the most-free
-/// GPU until the cumulative free ≥ `needed_vram * 1.05`. Build the
-/// `--tensor-split` string in llama.cpp's Vulkan device order when that
-/// mapping is known, putting `0` for GPUs not in the chosen set and
-/// proportional shares for the chosen ones.
-///
-/// If only one GPU is chosen, returns a string with `1.0` in that slot and
-/// zeros elsewhere — callers may pair that with `--split-mode none` but it's
-/// not required.
-pub fn plan_tensor_split(gpus: &[GpuInfo], needed_vram: u64) -> Option<String> {
-    if gpus.is_empty() || needed_vram == 0 {
+/// Strategy mirrors `plan_tensor_split`: greedily take the most-free GPU until
+/// the model fits, then order the chosen devices by the backend's own index so
+/// the emitted list is stable. Returns `None` if even all of the backend's GPUs
+/// don't fit it.
+pub fn plan_backend_split(
+    backend: Backend,
+    candidates: &[GpuInfo],
+    needed_vram: u64,
+) -> Option<BackendPlacement> {
+    if candidates.is_empty() || needed_vram == 0 {
         return None;
     }
-
     let target = (needed_vram as f64 * HEADROOM) as u64;
 
-    // Index+GPU pairs sorted by free VRAM desc.
-    let mut ordered: Vec<(usize, &GpuInfo)> = gpus.iter().enumerate().collect();
-    ordered.sort_by(|a, b| b.1.free_vram().cmp(&a.1.free_vram()));
+    let mut by_free: Vec<&GpuInfo> = candidates
+        .iter()
+        .filter(|g| g.free_vram() > 0 && g.backend_index(backend).is_some())
+        .collect();
+    by_free.sort_by(|a, b| b.free_vram().cmp(&a.free_vram()));
 
-    // Greedy fill.
-    let mut chosen: Vec<(usize, u64)> = Vec::new();
+    let mut chosen: Vec<&GpuInfo> = Vec::new();
     let mut acc: u64 = 0;
-    for (idx, g) in ordered {
-        if g.free_vram() == 0 {
-            continue;
-        }
-        chosen.push((idx, g.free_vram()));
+    for g in by_free {
+        chosen.push(g);
         acc = acc.saturating_add(g.free_vram());
         if acc >= target {
             break;
         }
     }
-
     if acc < target {
         return None;
     }
 
-    // Emit fractions in backend device order. llama.cpp's `--tensor-split`
-    // is positional: the i-th value applies to the i-th selected/offload
-    // device, not Linux DRM card i.
-    let mut fracs = vec![0f32; gpus.len()];
-    for (idx, free) in &chosen {
-        fracs[*idx] = (*free as f64 / acc as f64) as f32;
-    }
-    let slots = tensor_split_order(gpus);
-    Some(
-        slots
-            .iter()
-            .map(|idx| format!("{:.3}", fracs[*idx]))
-            .collect::<Vec<_>>()
-            .join(","),
-    )
-}
-
-/// Number of GPUs assigned a non-zero share by `plan_tensor_split`. Useful
-/// to decide whether to emit `--split-mode none`.
-pub fn gpus_used(split: &str) -> usize {
-    split
-        .split(',')
-        .filter(|s| s.trim().parse::<f32>().map(|v| v > 0.0).unwrap_or(false))
-        .count()
-}
-
-fn tensor_split_order(gpus: &[GpuInfo]) -> Vec<usize> {
-    let mut slots: Vec<usize> = (0..gpus.len()).collect();
-    if gpus.iter().all(|g| g.vulkan_index.is_some()) {
-        slots.sort_by_key(|idx| gpus[*idx].vulkan_index.unwrap_or(usize::MAX));
-    }
-    slots
+    // List devices in the backend's index order (cosmetic — the split aligns to
+    // whatever order we list — but keeps output deterministic and legible).
+    chosen.sort_by_key(|g| g.backend_index(backend).unwrap_or(usize::MAX));
+    let total: u64 = chosen.iter().map(|g| g.free_vram()).sum();
+    let device = chosen
+        .iter()
+        .filter_map(|g| g.backend_device_name(backend))
+        .collect::<Vec<_>>()
+        .join(",");
+    let tensor_split = chosen
+        .iter()
+        .map(|g| format!("{:.3}", g.free_vram() as f64 / total as f64))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(BackendPlacement {
+        backend,
+        device,
+        tensor_split,
+        gpus_used: chosen.len(),
+    })
 }
 
 #[cfg(test)]
@@ -94,6 +95,9 @@ mod tests {
             vulkan_index: None,
             cuda_device: None,
             cuda_index: None,
+            rocm_index: None,
+            sycl_index: None,
+            tags: Default::default(),
             integrated: false,
             total_vram: free + 1_000_000_000,
             used_vram: 1_000_000_000,
@@ -102,91 +106,61 @@ mod tests {
         }
     }
 
+    fn rocm_gpu(rocm_index: usize, free: u64) -> GpuInfo {
+        let mut g = gpu(&format!("rocm{rocm_index}"), free);
+        g.rocm_index = Some(rocm_index);
+        g.tags = [Backend::Rocm].into_iter().collect();
+        g
+    }
+
     #[test]
-    fn single_gpu_fits_alone() {
+    fn backend_split_emits_explicit_device_in_index_order() {
+        // ROCm0 nearly full, ROCm2 + ROCm3 free. A 40 GB model must land on the
+        // two free cards, named explicitly, with the split aligned to the list.
         let gpus = vec![
-            gpu("0", 40_000_000_000),
-            gpu("1", 40_000_000_000),
-            gpu("2", 40_000_000_000),
+            rocm_gpu(0, 2_000_000_000),
+            rocm_gpu(2, 32_000_000_000),
+            rocm_gpu(3, 32_000_000_000),
         ];
-        // 10 GB model fits on first GPU alone (biggest-free wins ties by
-        // insertion order via stable sort).
-        let s = plan_tensor_split(&gpus, 10_000_000_000).unwrap();
-        let parts: Vec<&str> = s.split(',').collect();
-        assert_eq!(parts.len(), 3);
-        assert_eq!(gpus_used(&s), 1);
-        // Exactly one of them is 1.000, the other two 0.000.
-        let ones = parts.iter().filter(|p| **p == "1.000").count();
-        let zeros = parts.iter().filter(|p| **p == "0.000").count();
-        assert_eq!((ones, zeros), (1, 2));
+        let p = plan_backend_split(Backend::Rocm, &gpus, 40_000_000_000).unwrap();
+        assert_eq!(p.device, "ROCm2,ROCm3");
+        assert_eq!(p.gpus_used, 2);
+        // Equal free → ~0.5/0.5, and the split has exactly one value per device.
+        assert_eq!(p.tensor_split.split(',').count(), 2);
+        assert!(!p.device.contains("ROCm0"), "must skip the busy card");
     }
 
     #[test]
-    fn prefers_fewer_gpus_when_two_suffice() {
-        // Three GPUs, 30 GB free each. 45 GB model fits on 2.
-        let gpus = vec![
-            gpu("a", 30_000_000_000),
-            gpu("b", 30_000_000_000),
-            gpu("c", 30_000_000_000),
-        ];
-        let s = plan_tensor_split(&gpus, 45_000_000_000).unwrap();
-        assert_eq!(gpus_used(&s), 2);
+    fn backend_split_none_when_backend_has_no_devices() {
+        // GPUs are Vulkan-only; a ROCm placement finds nothing.
+        let gpus = vec![gpu("a", 40_000_000_000)];
+        assert!(plan_backend_split(Backend::Rocm, &gpus, 10_000_000_000).is_none());
     }
 
     #[test]
-    fn falls_back_to_all_when_needed() {
-        let gpus = vec![
-            gpu("a", 10_000_000_000),
-            gpu("b", 10_000_000_000),
-            gpu("c", 10_000_000_000),
-        ];
-        let s = plan_tensor_split(&gpus, 25_000_000_000).unwrap();
-        assert_eq!(gpus_used(&s), 3);
+    fn backend_split_single_gpu_when_it_fits_alone() {
+        // A 10 GB model fits on one 40 GB card → single device, full share.
+        let gpus = vec![rocm_gpu(0, 40_000_000_000), rocm_gpu(1, 40_000_000_000)];
+        let p = plan_backend_split(Backend::Rocm, &gpus, 10_000_000_000).unwrap();
+        assert_eq!(p.gpus_used, 1);
+        assert_eq!(p.tensor_split, "1.000");
     }
 
     #[test]
-    fn returns_none_when_does_not_fit() {
-        let gpus = vec![gpu("a", 5_000_000_000), gpu("b", 5_000_000_000)];
-        assert!(plan_tensor_split(&gpus, 50_000_000_000).is_none());
+    fn backend_split_returns_none_when_total_free_too_small() {
+        let gpus = vec![rocm_gpu(0, 5_000_000_000), rocm_gpu(1, 5_000_000_000)];
+        assert!(plan_backend_split(Backend::Rocm, &gpus, 50_000_000_000).is_none());
     }
 
     #[test]
-    fn picks_biggest_free_first() {
-        // GPU 1 has the most headroom; should be the lone chosen GPU.
-        let gpus = vec![
-            gpu("a", 5_000_000_000),
-            gpu("b", 60_000_000_000),
-            gpu("c", 20_000_000_000),
-        ];
-        let s = plan_tensor_split(&gpus, 30_000_000_000).unwrap();
-        let parts: Vec<&str> = s.split(',').collect();
-        // Only index 1 has non-zero share.
-        assert_eq!(parts[0], "0.000");
-        assert_eq!(parts[1], "1.000");
-        assert_eq!(parts[2], "0.000");
-    }
-
-    #[test]
-    fn shares_reflect_free_vram_proportions() {
-        // Two chosen GPUs with 40 GB and 60 GB free respectively.
-        // Needed 80 GB → both picked, shares ~0.4 / 0.6.
-        let gpus = vec![gpu("a", 40_000_000_000), gpu("b", 60_000_000_000)];
-        let s = plan_tensor_split(&gpus, 80_000_000_000).unwrap();
-        let parts: Vec<f32> = s.split(',').map(|p| p.parse().unwrap()).collect();
+    fn backend_split_shares_reflect_free_vram_proportions() {
+        // 40 GB + 60 GB free, 80 GB model → both picked, shares ~0.4 / 0.6 in
+        // device-index order (ROCm0 then ROCm1).
+        let gpus = vec![rocm_gpu(0, 40_000_000_000), rocm_gpu(1, 60_000_000_000)];
+        let p = plan_backend_split(Backend::Rocm, &gpus, 80_000_000_000).unwrap();
+        assert_eq!(p.device, "ROCm0,ROCm1");
+        let parts: Vec<f32> = p.tensor_split.split(',').map(|s| s.parse().unwrap()).collect();
         assert!((parts[0] - 0.4).abs() < 0.01, "{parts:?}");
         assert!((parts[1] - 0.6).abs() < 0.01, "{parts:?}");
-        let sum: f32 = parts.iter().sum();
-        assert!((sum - 1.0).abs() < 0.005, "sum={sum}");
-    }
-
-    #[test]
-    fn emits_split_in_vulkan_order_when_known() {
-        let mut sysfs_first = gpu("card1", 40_000_000_000);
-        sysfs_first.vulkan_index = Some(1);
-        let mut sysfs_second = gpu("card4", 60_000_000_000);
-        sysfs_second.vulkan_index = Some(0);
-
-        let s = plan_tensor_split(&[sysfs_first, sysfs_second], 80_000_000_000).unwrap();
-        assert_eq!(s, "0.600,0.400");
     }
 }

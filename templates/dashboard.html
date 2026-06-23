@@ -475,6 +475,30 @@
     </div>
 </div>
 
+<!-- ===== GPU backend tags modal ===== -->
+<div class="modal-overlay" id="gpu-tags-modal">
+    <div class="modal">
+        <div class="modal-header">
+            <h2>GPU Backend Tags</h2>
+            <button type="button" class="modal-close" onclick="closeModal('gpu-tags-modal')">×</button>
+        </div>
+        <div class="modal-body">
+            <p class="field-help" style="margin-top:0;">
+                Which compute backends may drive this GPU. A backend can only be enabled
+                if it actually enumerates the device (greyed out otherwise). Models are
+                placed on the GPUs whose tags match their preset's target backends.
+            </p>
+            <div id="gpu-tags-title" style="font-weight:600; color:#e2e8f0; margin:0.5rem 0;"></div>
+            <div id="gpu-tags-options" class="gpu-tags-options"></div>
+            <div id="gpu-tags-state" class="model-muted" style="margin-top:0.75rem;"></div>
+            <div style="display:flex; gap:0.75rem; margin-top:1rem; padding-top:0.75rem; border-top:1px solid #334155;">
+                <button type="button" class="btn btn-primary" id="gpu-tags-save-btn" onclick="saveGpuTags()">Save</button>
+                <button type="button" class="btn btn-secondary" onclick="closeModal('gpu-tags-modal')">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- ===== Settings modal ===== -->
 <div class="modal-overlay" id="settings-modal">
     <div class="modal">
@@ -509,6 +533,16 @@
                     <div class="form-group">
                         <label for="preset-binary">Binary path</label>
                         <input type="text" id="preset-binary" data-path-field placeholder="/home/you/llama.cpp/build-vulkan/bin/llama-server">
+                    </div>
+                    <div class="form-group">
+                        <label>Target backends</label>
+                        <div class="preset-targets" id="preset-targets">
+                            <label><input type="checkbox" value="vulkan"> Vulkan</label>
+                            <label><input type="checkbox" value="cuda"> CUDA</label>
+                            <label><input type="checkbox" value="rocm"> ROCm</label>
+                            <label><input type="checkbox" value="sycl"> SYCL</label>
+                        </div>
+                        <small class="field-help">GPUs this binary may use, in priority order (checked → first tries that backend). A ROCm build targets ROCm; a Vulkan build targets Vulkan (all GPUs).</small>
                     </div>
                     <div style="display: flex; gap: 0.75rem; margin-top: 0.75rem;">
                         <button type="button" class="btn btn-primary btn-sm" onclick="savePreset()">Save</button>
@@ -894,6 +928,56 @@ async function applyModelScan() {
     } catch (err) {
         if (state) { state.textContent = `Apply failed: ${err.message || err}`; state.style.color = '#fca5a5'; }
         if (applyBtn) applyBtn.disabled = false;
+    }
+}
+
+// ----- GPU backend tags -----
+const GPU_BACKENDS = ['vulkan', 'cuda', 'rocm', 'sycl'];
+let gpuTagsEditingPci = null;
+
+async function openGpuTagsModal(pci) {
+    gpuTagsEditingPci = pci;
+    const optsEl = document.getElementById('gpu-tags-options');
+    const titleEl = document.getElementById('gpu-tags-title');
+    const stateEl = document.getElementById('gpu-tags-state');
+    stateEl.textContent = '';
+    optsEl.innerHTML = 'Loading…';
+    openModal('gpu-tags-modal');
+    let gpu = null;
+    try {
+        const status = await (await fetch('/api/status')).json();
+        gpu = (status.gpus || []).find(g => g.pci_bus_id === pci);
+    } catch (e) {}
+    if (!gpu) { optsEl.innerHTML = '<span class="model-muted">GPU not found.</span>'; return; }
+    titleEl.textContent = (gpu.vulkan_device || gpu.id) + '  ·  ' + pci;
+    const idxKey = { vulkan: 'vulkan_index', cuda: 'cuda_index', rocm: 'rocm_index', sycl: 'sycl_index' };
+    const enabled = new Set(gpu.tags || []);
+    optsEl.innerHTML = GPU_BACKENDS.map(b => {
+        const drivable = gpu[idxKey[b]] !== null && gpu[idxKey[b]] !== undefined;
+        const checked = enabled.has(b) ? 'checked' : '';
+        const dis = drivable ? '' : 'disabled';
+        const cls = drivable ? '' : 'disabled';
+        const note = drivable ? '' : ' <small>(not enumerated)</small>';
+        return `<label class="${cls}"><input type="checkbox" value="${b}" ${checked} ${dis}> ${b}${note}</label>`;
+    }).join('');
+}
+
+async function saveGpuTags() {
+    if (!gpuTagsEditingPci) return;
+    const stateEl = document.getElementById('gpu-tags-state');
+    const tags = Array.from(document.querySelectorAll('#gpu-tags-options input:checked')).map(i => i.value);
+    stateEl.textContent = 'Saving…'; stateEl.style.color = '#94a3b8';
+    try {
+        const res = await fetch('/api/gpus/tags', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pci_bus_id: gpuTagsEditingPci, tags }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        closeModal('gpu-tags-modal');
+        if (typeof window.poll === 'function') window.poll();
+    } catch (e) {
+        stateEl.textContent = 'Save failed: ' + e.message; stateEl.style.color = '#fca5a5';
     }
 }
 
@@ -1654,6 +1738,8 @@ function openPresetEditor(existing) {
     idEl.readOnly = !!existing;
     document.getElementById('preset-name').value = existing ? existing.name : '';
     document.getElementById('preset-binary').value = existing ? existing.binary : '';
+    const wanted = new Set((existing && existing.targets) ? existing.targets : []);
+    document.querySelectorAll('#preset-targets input').forEach(cb => { cb.checked = wanted.has(cb.value); });
     setTimeout(() => (existing ? document.getElementById('preset-name') : idEl).focus(), 20);
 }
 
@@ -1666,7 +1752,8 @@ async function savePreset() {
     const name = document.getElementById('preset-name').value.trim();
     const binary = document.getElementById('preset-binary').value.trim();
     if (!id || !name || !binary) { alert('All fields are required.'); return; }
-    const body = JSON.stringify({ id, name, binary });
+    const targets = Array.from(document.querySelectorAll('#preset-targets input:checked')).map(cb => cb.value);
+    const body = JSON.stringify({ id, name, binary, targets });
     const url = _presetEditorMode === 'add' ? '/api/presets' : `/api/presets/${encodeURIComponent(id)}`;
     const method = _presetEditorMode === 'add' ? 'POST' : 'PUT';
     const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body });
