@@ -43,6 +43,13 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         )
         .init();
 
+    // Cap the router + all the llama.cpp instances it will spawn (they share
+    // this service's cgroup) at total RAM minus the system reserve, before any
+    // model can load. Best-effort; recomputed from detected RAM each start.
+    crate::system::memcap::enforce_user_memory_cap(
+        crate::system::memcap::configured_reserve_bytes(),
+    );
+
     let expanded = shellexpand::tilde(&config.config_dir.to_string_lossy()).to_string();
     let config_dir = PathBuf::from(expanded);
     std::fs::create_dir_all(&config_dir)?;

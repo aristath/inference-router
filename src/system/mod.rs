@@ -11,4 +11,5 @@
 //! - CPU temp: `/sys/class/hwmon/` or `/sys/class/thermal/`
 //! - Zero dependencies, cheap enough to poll every second
 
+pub mod memcap;
 pub mod stats;
