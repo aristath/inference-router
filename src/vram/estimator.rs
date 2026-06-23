@@ -12,12 +12,31 @@ use std::path::{Path, PathBuf};
 /// Result of a VRAM estimation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VramEstimate {
-    /// VRAM occupied by model weights (file size).
+    /// VRAM occupied by the GPU-resident model weights (the offloaded layers).
     pub weight_vram: u64,
-    /// VRAM for the KV cache at the chosen context.
+    /// VRAM for the KV cache of the GPU-resident layers.
     pub kv_cache_vram: u64,
     /// Total VRAM with 10% runtime overhead.
     pub total_vram: u64,
+    /// Anonymous CPU-side RAM for the *non*-offloaded layers' KV cache. The
+    /// non-offloaded *weights* stay mmap'd (file-backed, reclaimable) so they
+    /// don't count here. Zero when the model is fully GPU-resident.
+    pub cpu_kv_ram: u64,
+}
+
+/// Fraction (0.0..=1.0) of the model's repeating layers that live on the GPU,
+/// given the configured `-ngl`. llama.cpp's `-ngl N` puts N layers on the GPU
+/// and the rest on the CPU. `None` (no `-ngl` passed) or `N >= n_layers` (e.g.
+/// the `99` "all" convention) means fully offloaded.
+pub fn gpu_layer_fraction(n_layers: u32, n_gpu_layers: Option<u32>) -> f64 {
+    if n_layers == 0 {
+        return 1.0;
+    }
+    match n_gpu_layers {
+        None => 1.0,
+        Some(n) if n >= n_layers => 1.0,
+        Some(n) => n as f64 / n_layers as f64,
+    }
 }
 
 /// Bytes-per-element for the K and V caches, expressed as a rational
@@ -50,19 +69,35 @@ impl KvPerElement {
 }
 
 impl VramEstimate {
-    /// Combine weight size and pre-computed KV cache bytes into a
-    /// total that includes a 10% runtime overhead. The KV-cache
-    /// computation itself lives on `GgufInfo::kv_cache_bytes`, which
-    /// knows how to handle sliding-window attention, per-layer KV
-    /// head counts, and mixed-quantization caches.
-    pub fn compute(file_size: u64, kv_cache_bytes: u64) -> Self {
-        let total = (file_size + kv_cache_bytes).saturating_mul(11) / 10;
+    /// Combine weight size and pre-computed KV cache bytes into a VRAM total
+    /// (with 10% runtime overhead), accounting for partial GPU offload.
+    ///
+    /// Only the offloaded fraction of weights + KV counts as VRAM; the
+    /// remainder's KV becomes CPU RAM (`cpu_kv_ram`) while its weights stay
+    /// mmap'd (not counted). With full offload (`n_gpu_layers` ≥ `n_layers` or
+    /// `None`) this reduces to "everything is VRAM", matching the old behaviour.
+    /// The KV-cache computation itself lives on [`GgufInfo::kv_cache_bytes`].
+    pub fn compute(
+        file_size: u64,
+        kv_cache_bytes: u64,
+        n_layers: u32,
+        n_gpu_layers: Option<u32>,
+    ) -> Self {
+        let frac = gpu_layer_fraction(n_layers, n_gpu_layers);
+        let weight_vram = scale_bytes(file_size, frac);
+        let kv_vram = scale_bytes(kv_cache_bytes, frac);
+        let total = (weight_vram + kv_vram).saturating_mul(11) / 10;
         Self {
-            weight_vram: file_size,
-            kv_cache_vram: kv_cache_bytes,
+            weight_vram,
+            kv_cache_vram: kv_vram,
             total_vram: total,
+            cpu_kv_ram: kv_cache_bytes.saturating_sub(kv_vram),
         }
     }
+}
+
+fn scale_bytes(bytes: u64, fraction: f64) -> u64 {
+    (bytes as f64 * fraction.clamp(0.0, 1.0)).round() as u64
 }
 
 /// All the GGUF metadata fields the orchestrator + form UI care about.
@@ -916,7 +951,7 @@ mod tests {
         let info = uniform_info(32, 32, 128, FILE_SIZE);
         let kv = info.kv_cache_bytes(0, KvPerElement::FP16_BOTH);
         assert_eq!(kv, 0);
-        let e = VramEstimate::compute(FILE_SIZE, kv);
+        let e = VramEstimate::compute(FILE_SIZE, kv, 32, None);
         assert_eq!(e.total_vram, (FILE_SIZE * 11) / 10);
     }
 
@@ -924,8 +959,28 @@ mod tests {
     fn overhead_is_ten_percent() {
         let info = uniform_info(32, 32, 128, FILE_SIZE);
         let kv = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
-        let e = VramEstimate::compute(FILE_SIZE, kv);
+        let e = VramEstimate::compute(FILE_SIZE, kv, 32, None);
         assert_eq!(e.total_vram, (FILE_SIZE + kv) * 11 / 10);
+    }
+
+    #[test]
+    fn partial_offload_scales_vram_by_gpu_layer_fraction() {
+        // 51-layer model, only 14 layers on GPU → ~27% of weights+KV is VRAM,
+        // and the other 37 layers' KV becomes CPU RAM (weights stay mmap'd).
+        let info = uniform_info(51, 8, 128, FILE_SIZE);
+        let kv = info.kv_cache_bytes(8192, KvPerElement::FP16_BOTH);
+        let full = VramEstimate::compute(FILE_SIZE, kv, 51, Some(99));
+        let partial = VramEstimate::compute(FILE_SIZE, kv, 51, Some(14));
+
+        // Full offload is unchanged from the old behaviour.
+        assert_eq!(full.total_vram, (FILE_SIZE + kv) * 11 / 10);
+        assert_eq!(full.cpu_kv_ram, 0);
+
+        // Partial offload is far smaller and frees most of the KV to CPU RAM.
+        assert!(partial.total_vram < full.total_vram / 3, "{partial:?}");
+        let frac = 14.0 / 51.0;
+        let expect_cpu_kv = kv - (kv as f64 * frac).round() as u64;
+        assert_eq!(partial.cpu_kv_ram, expect_cpu_kv);
     }
 
     #[test]

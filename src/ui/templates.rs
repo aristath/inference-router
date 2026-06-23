@@ -443,7 +443,8 @@ fn compute_sizes(m: &ModelConfig) -> (u64, u64) {
                         m.cache_type_v.unwrap_or(CacheType::F16),
                     );
                     let kv = info.kv_cache_bytes(m.context, kv_bytes);
-                    let estimate = VramEstimate::compute(info.file_size, kv);
+                    let estimate =
+                        VramEstimate::compute(info.file_size, kv, info.n_layers, m.n_gpu_layers);
                     (info.file_size, estimate.total_vram)
                 }
                 // Header unreadable (missing file, non-GGUF, etc.) — show a

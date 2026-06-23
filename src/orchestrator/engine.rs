@@ -797,7 +797,12 @@ impl Orchestrator {
                     Ok(info) => {
                         weight_file_size = info.file_size;
                         let kv = info.kv_cache_bytes(model.context, kv_bytes);
-                        let est = VramEstimate::compute(info.file_size, kv);
+                        let est = VramEstimate::compute(
+                            info.file_size,
+                            kv,
+                            info.n_layers,
+                            model.n_gpu_layers,
+                        );
                         model.estimated_vram = est.total_vram;
                     }
                     Err(e) => {
@@ -819,7 +824,12 @@ impl Orchestrator {
                         Ok(info) => {
                             weight_file_size += info.file_size;
                             let kv = info.kv_cache_bytes(d.context, d_kv);
-                            let est = VramEstimate::compute(info.file_size, kv);
+                            let est = VramEstimate::compute(
+                                info.file_size,
+                                kv,
+                                info.n_layers,
+                                d.n_gpu_layers,
+                            );
                             model.estimated_vram =
                                 model.estimated_vram.saturating_add(est.total_vram);
                         }
