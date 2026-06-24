@@ -788,7 +788,7 @@ impl Orchestrator {
                 // KV-cache portion of the estimate matches what the
                 // backend will actually allocate at run time.
                 use crate::config::CacheType;
-                use crate::vram::estimator::{GgufInfo, KvPerElement};
+                use crate::vram::estimator::{auto_n_cpu_moe, GgufInfo, KvPerElement};
                 let kv_bytes = KvPerElement::from_types(
                     model.cache_type_k.unwrap_or(CacheType::F16),
                     model.cache_type_v.unwrap_or(CacheType::F16),
@@ -797,13 +797,61 @@ impl Orchestrator {
                     Ok(info) => {
                         weight_file_size = info.file_size;
                         let kv = info.kv_cache_bytes(model.context, kv_bytes);
-                        let est = VramEstimate::compute(
-                            info.file_size,
-                            kv,
-                            info.n_layers,
-                            model.n_gpu_layers,
-                        );
-                        model.estimated_vram = est.total_vram;
+                        if info.is_moe() {
+                            // MoE: dense + KV stay on GPU, experts split via
+                            // --n-cpu-moe. Auto-tune N to pack as many experts
+                            // into the preferred backend's free VRAM as fit,
+                            // unless the operator pinned n_cpu_moe.
+                            let reserved =
+                                self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
+                            let backend =
+                                target_backends.first().copied().unwrap_or(Backend::Vulkan);
+                            let dense = info.dense_weight_bytes();
+                            let free: u64 = subtract_reserved_from_gpus(gpus.clone(), reserved)
+                                .iter()
+                                .filter(|g| !g.integrated && g.supports(backend))
+                                .map(|g| g.free_vram())
+                                .sum();
+                            let n_cpu_moe = model.n_cpu_moe.unwrap_or_else(|| {
+                                auto_n_cpu_moe(
+                                    dense,
+                                    info.expert_weight_bytes,
+                                    kv,
+                                    info.n_layers,
+                                    free,
+                                )
+                                .unwrap_or(info.n_layers)
+                            });
+                            // Force all dense/attention onto the GPU; experts are
+                            // governed by --n-cpu-moe. Applied to this spawn only.
+                            model.n_gpu_layers = Some(99);
+                            model.n_cpu_moe = Some(n_cpu_moe);
+                            let est = VramEstimate::compute_moe(
+                                dense,
+                                info.expert_weight_bytes,
+                                kv,
+                                info.n_layers,
+                                n_cpu_moe,
+                            );
+                            model.estimated_vram = est.total_vram;
+                            info!(
+                                model = id,
+                                dense_gib = dense >> 30,
+                                experts_gib = info.expert_weight_bytes >> 30,
+                                n_layers = info.n_layers,
+                                n_cpu_moe,
+                                est_gib = est.total_vram >> 30,
+                                "MoE offload plan (experts on CPU for first N layers)"
+                            );
+                        } else {
+                            let est = VramEstimate::compute(
+                                info.file_size,
+                                kv,
+                                info.n_layers,
+                                model.n_gpu_layers,
+                            );
+                            model.estimated_vram = est.total_vram;
+                        }
                     }
                     Err(e) => {
                         warn!(model = id, error = %e, "gguf parse failed; loading without estimate")

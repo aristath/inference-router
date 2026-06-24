@@ -421,6 +421,14 @@ pub fn build_command_args(
                 args.push("-ngl".into());
                 args.push(n.to_string());
             }
+            // MoE expert offload: keep the first N layers' experts on CPU. Only
+            // emitted when > 0 (0 = all experts on GPU = no flag needed).
+            if let Some(n) = model.n_cpu_moe {
+                if n > 0 {
+                    args.push("--n-cpu-moe".into());
+                    args.push(n.to_string());
+                }
+            }
             if model.mlock {
                 args.push("--mlock".into());
             }
@@ -919,6 +927,21 @@ mod tests {
         m.device = Some("Vulkan1,Vulkan2".into());
         let args = build_command_args(&m, None, 9001);
         assert_eq!(find_flag(&args, "--device"), Some("Vulkan1,Vulkan2"));
+    }
+
+    #[test]
+    fn gguf_argv_emits_n_cpu_moe_only_when_positive() {
+        let mut m = gguf_model();
+        m.n_cpu_moe = Some(13);
+        assert_eq!(
+            find_flag(&build_command_args(&m, None, 9001), "--n-cpu-moe"),
+            Some("13")
+        );
+        // 0 = all experts on GPU → no flag.
+        m.n_cpu_moe = Some(0);
+        assert!(!build_command_args(&m, None, 9001).join(" ").contains("--n-cpu-moe"));
+        m.n_cpu_moe = None;
+        assert!(!build_command_args(&m, None, 9001).join(" ").contains("--n-cpu-moe"));
     }
 
     #[test]

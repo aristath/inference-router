@@ -94,6 +94,52 @@ impl VramEstimate {
             cpu_kv_ram: kv_cache_bytes.saturating_sub(kv_vram),
         }
     }
+
+    /// MoE-aware estimate. Dense/attention weights and the full KV cache are
+    /// GPU-resident (all attention runs on GPU every token); the routed experts
+    /// are split by `n_cpu_moe` — the first `n_cpu_moe` of `n_layers` layers'
+    /// experts go to CPU (mmap'd, file-backed) and the rest stay on GPU.
+    pub fn compute_moe(
+        dense_bytes: u64,
+        expert_bytes: u64,
+        kv_cache_bytes: u64,
+        n_layers: u32,
+        n_cpu_moe: u32,
+    ) -> Self {
+        let n_cpu = n_cpu_moe.min(n_layers);
+        let gpu_expert_frac = if n_layers == 0 {
+            0.0
+        } else {
+            (n_layers - n_cpu) as f64 / n_layers as f64
+        };
+        let experts_on_gpu = scale_bytes(expert_bytes, gpu_expert_frac);
+        let weight_vram = dense_bytes.saturating_add(experts_on_gpu);
+        let total = (weight_vram + kv_cache_bytes).saturating_mul(11) / 10;
+        Self {
+            weight_vram,
+            kv_cache_vram: kv_cache_bytes,
+            total_vram: total,
+            // CPU-resident experts are mmap'd weights (file-backed, reclaimable),
+            // not anonymous RAM, so they don't count against the admission RAM.
+            cpu_kv_ram: 0,
+        }
+    }
+}
+
+/// Smallest `n_cpu_moe` (fewest CPU-expert layers → most experts packed into
+/// VRAM) whose MoE estimate fits `free_vram`. `None` if even all-experts-on-CPU
+/// (`n_cpu_moe = n_layers`, i.e. only dense + KV on GPU) doesn't fit.
+pub fn auto_n_cpu_moe(
+    dense_bytes: u64,
+    expert_bytes: u64,
+    kv_cache_bytes: u64,
+    n_layers: u32,
+    free_vram: u64,
+) -> Option<u32> {
+    (0..=n_layers).find(|&n| {
+        VramEstimate::compute_moe(dense_bytes, expert_bytes, kv_cache_bytes, n_layers, n).total_vram
+            <= free_vram
+    })
 }
 
 fn scale_bytes(bytes: u64, fraction: f64) -> u64 {
@@ -150,6 +196,13 @@ pub struct GgufInfo {
     /// file size for a single-file GGUF, but sums all sibling shards for
     /// multi-file GGUFs named like `foo.gguf-00001-of-00005.gguf`.
     pub file_size: u64,
+    /// Total bytes of the Mixture-of-Experts weight tensors (`*_exps*`),
+    /// summed across shards. `> 0` iff the model is MoE. These weights can be
+    /// offloaded to CPU independently of the dense/attention weights via
+    /// llama.cpp's `--n-cpu-moe`, which is the key to running huge MoE models:
+    /// the experts are most of the bytes but only a few are active per token.
+    #[serde(default)]
+    pub expert_weight_bytes: u64,
 }
 
 impl GgufInfo {
@@ -224,7 +277,20 @@ impl GgufInfo {
             sliding_window,
             full_attention_interval,
             file_size,
+            expert_weight_bytes: read_expert_weight_bytes(path),
         })
+    }
+
+    /// Whether this is a Mixture-of-Experts model (has expert weight tensors).
+    pub fn is_moe(&self) -> bool {
+        self.expert_weight_bytes > 0
+    }
+
+    /// Non-expert ("dense") weight bytes: attention, norms, embeddings, output,
+    /// router, and shared experts — everything that isn't a routed expert. For
+    /// a MoE model these stay GPU-resident while experts can spill to CPU.
+    pub fn dense_weight_bytes(&self) -> u64 {
+        self.file_size.saturating_sub(self.expert_weight_bytes)
     }
 
     /// Per-head dimension for full-context attention layers. Prefers
@@ -304,6 +370,7 @@ impl From<&GgufMeta> for GgufInfo {
             sliding_window: m.sliding_window,
             full_attention_interval: m.full_attention_interval,
             file_size: m.file_size,
+            expert_weight_bytes: m.expert_weight_bytes,
         }
     }
 }
@@ -385,6 +452,10 @@ pub struct GgufMeta {
     pub kv_heads_total: u64,
     pub sliding_window: u32,
     pub file_size: u64,
+    /// MoE expert weight bytes across shards (`> 0` iff MoE). See
+    /// [`GgufInfo::expert_weight_bytes`].
+    #[serde(default)]
+    pub expert_weight_bytes: u64,
     // Identity
     pub architecture: Option<String>,
     pub name: Option<String>,
@@ -537,6 +608,7 @@ impl GgufMeta {
             kv_heads_total,
             sliding_window,
             file_size,
+            expert_weight_bytes: read_expert_weight_bytes(path),
             architecture: arch,
             name,
             basename,
@@ -854,6 +926,80 @@ fn sharded_total_size(path: &Path) -> Option<u64> {
     Some(sum)
 }
 
+/// All on-disk shard paths for a model (just `[path]` for a single-file GGUF).
+fn shard_paths(path: &Path) -> Vec<PathBuf> {
+    let single = || vec![path.to_path_buf()];
+    let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+        return single();
+    };
+    let Some(rest) = fname.strip_suffix(".gguf") else {
+        return single();
+    };
+    let Some((stem_and_idx, total_str)) = rest.rsplit_once("-of-") else {
+        return single();
+    };
+    let Ok(total) = total_str.parse::<u32>() else {
+        return single();
+    };
+    let Some((stem, idx_str)) = stem_and_idx.rsplit_once('-') else {
+        return single();
+    };
+    if total == 0 || idx_str.parse::<u32>().is_err() {
+        return single();
+    }
+    let width = idx_str.len();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    (1..=total)
+        .map(|i| parent.join(format!("{stem}-{i:0width$}-of-{total:0width$}.gguf")))
+        .collect()
+}
+
+/// True for a routed Mixture-of-Experts weight tensor — the exact set
+/// llama.cpp's `--n-cpu-moe` / `--cpu-moe` move to CPU. These are named
+/// `blk.<i>.ffn_{gate,up,down}_exps.weight`; matching the `_exps` marker covers
+/// them while excluding the small router (`ffn_gate_inp`) and shared-expert
+/// (`*_shexp`) tensors that stay GPU-resident.
+fn is_expert_tensor(name: &str) -> bool {
+    name.contains("_exps")
+}
+
+/// Sum the byte size of the MoE expert tensors across all shards. Returns 0 for
+/// a dense model (no `*_exps*` tensors) or if the tensor sections can't be read.
+fn read_expert_weight_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    for shard in shard_paths(path) {
+        let Ok(file) = File::open(&shard) else { continue };
+        // Safety: read-only for the duration of this call; not mutated concurrently.
+        let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
+            continue;
+        };
+        total = total.saturating_add(sum_shard_expert_bytes(&mmap).unwrap_or(0));
+    }
+    total
+}
+
+/// Expert-tensor bytes in one shard: read the header, skip the metadata KVs,
+/// then walk the tensor descriptors summing those whose name is an expert
+/// tensor.
+fn sum_shard_expert_bytes(data: &[u8]) -> Result<u64, EstimateError> {
+    let mut reader = GGufReader::new(data);
+    let header = reader.read_header().map_err(read_err)?;
+    if !header.is_magic_correct() || !header.is_native_endian() {
+        return Ok(0);
+    }
+    for _ in 0..header.metadata_kv_count {
+        reader.read_meta_kv().map_err(read_err)?;
+    }
+    let mut sum = 0u64;
+    for _ in 0..header.tensor_count {
+        let meta = reader.read_tensor_meta().map_err(read_err)?;
+        if is_expert_tensor(meta.name()) {
+            sum = sum.saturating_add(meta.to_info().nbytes() as u64);
+        }
+    }
+    Ok(sum)
+}
+
 /// Reads the GGUF header + metadata KV block into a (key → (ty, value_bytes))
 /// map. Ignores tensor descriptors and data.
 fn read_metadata_kvs(data: &[u8]) -> Result<HashMap<String, (Ty, Vec<u8>)>, EstimateError> {
@@ -926,6 +1072,7 @@ mod tests {
             sliding_window: 0,
             full_attention_interval: None,
             file_size,
+            expert_weight_bytes: 0,
         }
     }
 
@@ -961,6 +1108,75 @@ mod tests {
         let kv = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
         let e = VramEstimate::compute(FILE_SIZE, kv, 32, None);
         assert_eq!(e.total_vram, (FILE_SIZE + kv) * 11 / 10);
+    }
+
+    #[test]
+    fn moe_estimate_keeps_dense_and_kv_on_gpu_and_splits_experts() {
+        let dense = 20 << 30; // 20 GiB attention/dense
+        let experts = 160 << 30; // 160 GiB routed experts
+        let kv = 10 << 30; // 10 GiB KV
+        let layers = 51;
+
+        // All experts on GPU → dense + experts + KV, ×1.1.
+        let all_gpu = VramEstimate::compute_moe(dense, experts, kv, layers, 0);
+        assert_eq!(all_gpu.total_vram, (dense + experts + kv) * 11 / 10);
+        // All experts on CPU → only dense + KV count as VRAM (experts mmap'd).
+        let all_cpu = VramEstimate::compute_moe(dense, experts, kv, layers, layers);
+        assert_eq!(all_cpu.total_vram, (dense + kv) * 11 / 10);
+        assert_eq!(all_cpu.cpu_kv_ram, 0); // experts are file-backed, not anon RAM
+        // More CPU-expert layers → less VRAM.
+        let half = VramEstimate::compute_moe(dense, experts, kv, layers, 25);
+        assert!(half.total_vram < all_gpu.total_vram && half.total_vram > all_cpu.total_vram);
+    }
+
+    #[test]
+    fn auto_n_cpu_moe_packs_max_experts_into_free_vram() {
+        let dense = 20 << 30;
+        let experts = 160 << 30;
+        let kv = 10 << 30;
+        let layers = 51;
+        // 128 GiB free: dense(20)+kv(10)=30 must stay, leaving ~98 GiB for
+        // experts → a chunk of layers' experts spill to CPU, but not all.
+        let free = 128u64 << 30;
+        let n = auto_n_cpu_moe(dense, experts, kv, layers, free).unwrap();
+        assert!(n > 0 && n < layers, "n_cpu_moe={n}");
+        // The chosen plan actually fits, and one fewer CPU layer would not.
+        assert!(VramEstimate::compute_moe(dense, experts, kv, layers, n).total_vram <= free);
+        assert!(VramEstimate::compute_moe(dense, experts, kv, layers, n - 1).total_vram > free);
+
+        // Too little VRAM even for dense+KV → None.
+        assert!(auto_n_cpu_moe(dense, experts, kv, layers, 5 << 30).is_none());
+    }
+
+    #[test]
+    #[ignore = "reads a real multi-GB sharded GGUF; run explicitly with --ignored"]
+    fn real_mimo_expert_split_is_sane() {
+        let path = Path::new(
+            "/home/aristath/models/mimo-v2.5/UD-Q4_K_XL/MiMo-V2.5-UD-Q4_K_XL-00001-of-00005.gguf",
+        );
+        let info = GgufInfo::read(path).unwrap();
+        let gib = 1u64 << 30;
+        eprintln!(
+            "file={} GiB  experts={} GiB  dense={} GiB  moe={}",
+            info.file_size / gib,
+            info.expert_weight_bytes / gib,
+            info.dense_weight_bytes() / gib,
+            info.is_moe()
+        );
+        assert!(info.is_moe());
+        // Experts dominate but are a strict subset of the file.
+        assert!(info.expert_weight_bytes > 100 * gib);
+        assert!(info.expert_weight_bytes < info.file_size);
+        assert!(info.dense_weight_bytes() > 0);
+    }
+
+    #[test]
+    fn expert_tensor_classifier_matches_llama_naming() {
+        assert!(is_expert_tensor("blk.5.ffn_gate_exps.weight"));
+        assert!(is_expert_tensor("blk.12.ffn_down_exps.weight"));
+        assert!(!is_expert_tensor("blk.5.attn_q.weight"));
+        assert!(!is_expert_tensor("blk.5.ffn_gate_inp.weight")); // router stays on GPU
+        assert!(!is_expert_tensor("token_embd.weight"));
     }
 
     #[test]
@@ -1033,6 +1249,7 @@ mod tests {
             sliding_window: 0,
             full_attention_interval: None,
             file_size: 0,
+            expert_weight_bytes: 0,
         }
     }
 
@@ -1086,6 +1303,7 @@ mod tests {
             sliding_window: 1024,
             full_attention_interval: None,
             file_size: 0,
+            expert_weight_bytes: 0,
         }
     }
 
@@ -1156,6 +1374,7 @@ mod tests {
             sliding_window: 0,
             full_attention_interval: Some(4),
             file_size: 0,
+            expert_weight_bytes: 0,
         };
 
         let kv = info.kv_cache_bytes(262_144, KvPerElement::FP16_BOTH);

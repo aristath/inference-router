@@ -185,6 +185,12 @@ pub struct ModelConfig {
     pub flash_attn: bool,
     #[serde(default)]
     pub n_gpu_layers: Option<u32>,
+    /// MoE expert offload: keep the first N layers' expert weights on CPU
+    /// (`--n-cpu-moe N`). For MoE models the router auto-tunes this at load time
+    /// to pack as many experts into VRAM as fit, unless the operator pins a
+    /// value here. `None` = auto (MoE) / unused (dense). Ignored for non-MoE.
+    #[serde(default)]
+    pub n_cpu_moe: Option<u32>,
     #[serde(default)]
     pub mlock: bool,
     #[serde(default)]
@@ -312,6 +318,7 @@ impl Default for ModelConfig {
             repeat_penalty: default_repeat_penalty(),
             flash_attn: false,
             n_gpu_layers: None,
+            n_cpu_moe: None,
             mlock: false,
             no_mmap: false,
             parallel_slots: None,

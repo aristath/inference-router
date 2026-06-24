@@ -308,7 +308,7 @@
                                     <small class="field-help">Concurrent request slots. 0 = llama.cpp default.</small>
                                 </div>
                             </div>
-                            <div class="form-group">
+                            <div class="form-group" id="n_gpu_layers_group">
                                 <label for="n_gpu_layers">
                                     GPU layers (<code>-ngl</code>)
                                     <span id="ngl_display" style="color:#38bdf8; font-weight:normal; margin-left:0.5rem;"></span>
@@ -318,6 +318,14 @@
                                     <input type="hidden" id="n_gpu_layers" name="n_gpu_layers" value="">
                                 </div>
                                 <small class="field-help" id="ngl_help">Layers to offload to GPU. 0 = leave flag off (default).</small>
+                            </div>
+                            <div class="form-group" id="n_cpu_moe_group" style="display:none;">
+                                <label for="n_cpu_moe">
+                                    MoE expert offload (<code>--n-cpu-moe</code>)
+                                    <span id="moe_badge" style="color:#34d399; font-weight:normal; margin-left:0.5rem;"></span>
+                                </label>
+                                <input type="number" id="n_cpu_moe" name="n_cpu_moe" min="0" placeholder="auto" style="width:8rem;">
+                                <small class="field-help">First N layers' experts on CPU. <strong>Blank = auto</strong> (router packs as many experts into VRAM as fit). Higher N = less VRAM, more CPU.</small>
                             </div>
                             <div class="form-row">
                                 <div class="form-group">
@@ -763,7 +771,7 @@ const MODEL_DEFAULTS = {
     context: 4096,
     temperature: 0.6, top_p: 0.95, top_k: 40, min_p: 0.0,
     presence_penalty: 0.0, repeat_penalty: 1.0,
-    flash_attn: false, n_gpu_layers: null, mlock: false, no_mmap: false,
+    flash_attn: false, n_gpu_layers: null, n_cpu_moe: null, mlock: false, no_mmap: false,
     parallel_slots: null, cache_type_k: null, cache_type_v: null,
     split_mode: null, main_gpu: null, tensor_split: null,
     threads: null, cache_ram_mib: null,
@@ -1345,6 +1353,8 @@ function populateModelForm(m, mode) {
     f.mlock.checked = !!m.mlock;
     f.no_mmap.checked = !!m.no_mmap;
     setOptionalSlider('n_gpu_layers', m.n_gpu_layers);
+    f.n_cpu_moe.value = m.n_cpu_moe == null ? '' : String(m.n_cpu_moe);
+    applyMoeVisibility(m.gguf_meta || (mode === 'edit' ? _editingModelGgufMeta : _currentGgufMeta));
     setOptionalSlider('parallel_slots', m.parallel_slots);
     f.cache_type_k.value = m.cache_type_k ?? '';
     f.cache_type_v.value = m.cache_type_v ?? '';
@@ -1397,6 +1407,25 @@ function setPair(name, value) {
     const slider = document.getElementById(`${name}-slider`);
     if (num) num.value = value;
     if (slider) slider.value = value;
+}
+
+// The GPU-offload knob differs by architecture, so show only the one that
+// actually drives placement: `--n-cpu-moe` for MoE models (where the router
+// forces `-ngl 99` and tunes experts), plain `-ngl` for dense models. Showing
+// both would misrepresent what the backend does.
+function applyMoeVisibility(meta) {
+    const moeGroup = document.getElementById('n_cpu_moe_group');
+    const nglGroup = document.getElementById('n_gpu_layers_group');
+    const badge = document.getElementById('moe_badge');
+    const experts = (meta && meta.expert_count) || 0;
+    const isMoe = experts > 0;
+    if (moeGroup) moeGroup.style.display = isMoe ? '' : 'none';
+    if (nglGroup) nglGroup.style.display = isMoe ? 'none' : '';
+    if (badge) {
+        badge.textContent = isMoe
+            ? `MoE · ${experts} experts` + (meta.expert_used_count ? ` (${meta.expert_used_count} active)` : '')
+            : '';
+    }
 }
 
 function setOptionalSlider(name, value) {
@@ -2249,6 +2278,7 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         repeat_penalty: parseFloat(f.repeat_penalty.value),
         flash_attn: f.flash_attn.checked,
         n_gpu_layers: toOptInt(f.n_gpu_layers.value),
+        n_cpu_moe: toOptInt(f.n_cpu_moe.value),
         mlock: f.mlock.checked,
         no_mmap: f.no_mmap.checked,
         parallel_slots: toOptInt(f.parallel_slots.value),

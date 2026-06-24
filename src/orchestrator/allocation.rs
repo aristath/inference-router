@@ -4,10 +4,6 @@
 use crate::config::Backend;
 use crate::vram::tracker::GpuInfo;
 
-/// Headroom multiplier on top of estimated VRAM — smooths over our formula's
-/// imprecision and leaves a little room for compute buffers.
-const HEADROOM: f64 = 1.05;
-
 /// A concrete placement on one backend: an explicit `--device` list and a
 /// `--tensor-split` whose values are positionally aligned to that list (verified
 /// against the ROCm binary: `--tensor-split` follows `--device` order, not the
@@ -28,10 +24,15 @@ pub struct BackendPlacement {
 /// backend may drive, reserved-adjusted) to fit `needed_vram`, and emit the
 /// explicit `--device` + aligned `--tensor-split`.
 ///
-/// Strategy mirrors `plan_tensor_split`: greedily take the most-free GPU until
-/// the model fits, then order the chosen devices by the backend's own index so
-/// the emitted list is stable. Returns `None` if even all of the backend's GPUs
-/// don't fit it.
+/// Strategy: greedily take the most-free GPU until the cumulative free VRAM
+/// covers `needed_vram`, then order the chosen devices by the backend's own
+/// index so the emitted list is stable. Returns `None` if even all of the
+/// backend's GPUs don't fit it.
+///
+/// `needed_vram` is the model's `estimated_vram`, which already carries a 10%
+/// runtime-overhead margin (see [`crate::vram::estimator::VramEstimate`]), so we
+/// fit it directly — no extra multiplier. That keeps the admission gate exactly
+/// `free >= need`, matching the number reported to the operator.
 pub fn plan_backend_split(
     backend: Backend,
     candidates: &[GpuInfo],
@@ -40,7 +41,7 @@ pub fn plan_backend_split(
     if candidates.is_empty() || needed_vram == 0 {
         return None;
     }
-    let target = (needed_vram as f64 * HEADROOM) as u64;
+    let target = needed_vram;
 
     let mut by_free: Vec<&GpuInfo> = candidates
         .iter()
@@ -144,6 +145,18 @@ mod tests {
         let p = plan_backend_split(Backend::Rocm, &gpus, 10_000_000_000).unwrap();
         assert_eq!(p.gpus_used, 1);
         assert_eq!(p.tensor_split, "1.000");
+    }
+
+    #[test]
+    fn backend_split_fits_when_need_equals_free_no_hidden_headroom() {
+        // Regression: the estimate already carries overhead, so a model whose
+        // need is at-or-just-under total free VRAM must fit — no extra ×1.05
+        // gate that rejects "need 136 < have 141".
+        let gpus = vec![rocm_gpu(0, 70_000_000_000), rocm_gpu(1, 71_300_000_000)];
+        let free: u64 = gpus.iter().map(|g| g.free_vram()).sum(); // 141.3 GB
+        // need just below free would previously fail (× 1.05 → above free).
+        let need = free - 5_000_000_000; // 136.3 GB
+        assert!(plan_backend_split(Backend::Rocm, &gpus, need).is_some());
     }
 
     #[test]
