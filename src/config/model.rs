@@ -191,6 +191,12 @@ pub struct ModelConfig {
     /// value here. `None` = auto (MoE) / unused (dense). Ignored for non-MoE.
     #[serde(default)]
     pub n_cpu_moe: Option<u32>,
+    /// Computed at load time for MoE models: an `--override-tensor` value that
+    /// pins the offloaded layers' experts to CPU, spread *evenly* across layers
+    /// so VRAM fills evenly (vs `--n-cpu-moe`, which clusters the first N). Not
+    /// persisted; set per-spawn by the placement logic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_tensor: Option<String>,
     #[serde(default)]
     pub mlock: bool,
     #[serde(default)]
@@ -319,6 +325,7 @@ impl Default for ModelConfig {
             flash_attn: false,
             n_gpu_layers: None,
             n_cpu_moe: None,
+            override_tensor: None,
             mlock: false,
             no_mmap: false,
             parallel_slots: None,

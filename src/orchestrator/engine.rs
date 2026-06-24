@@ -822,10 +822,17 @@ impl Orchestrator {
                                 )
                                 .unwrap_or(info.n_layers)
                             });
-                            // Force all dense/attention onto the GPU; experts are
-                            // governed by --n-cpu-moe. Applied to this spawn only.
+                            // Force all dense/attention onto the GPU; the CPU
+                            // experts are pinned via an *interleaved*
+                            // --override-tensor so VRAM fills evenly across GPUs
+                            // (not clustered like --n-cpu-moe). Applied to this
+                            // spawn only.
                             model.n_gpu_layers = Some(99);
                             model.n_cpu_moe = Some(n_cpu_moe);
+                            model.override_tensor = crate::vram::estimator::moe_cpu_override_tensor(
+                                info.n_layers,
+                                n_cpu_moe,
+                            );
                             let est = VramEstimate::compute_moe(
                                 dense,
                                 info.expert_weight_bytes,
@@ -841,7 +848,8 @@ impl Orchestrator {
                                 n_layers = info.n_layers,
                                 n_cpu_moe,
                                 est_gib = est.total_vram >> 30,
-                                "MoE offload plan (experts on CPU for first N layers)"
+                                override_tensor = ?model.override_tensor,
+                                "MoE offload plan (experts on CPU, interleaved across layers)"
                             );
                         } else {
                             let est = VramEstimate::compute(

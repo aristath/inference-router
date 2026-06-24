@@ -421,9 +421,14 @@ pub fn build_command_args(
                 args.push("-ngl".into());
                 args.push(n.to_string());
             }
-            // MoE expert offload: keep the first N layers' experts on CPU. Only
-            // emitted when > 0 (0 = all experts on GPU = no flag needed).
-            if let Some(n) = model.n_cpu_moe {
+            // MoE expert offload. Prefer the computed `--override-tensor` (it
+            // spreads the CPU-expert layers evenly so VRAM fills evenly); fall
+            // back to `--n-cpu-moe N` (first N layers) only if no override was
+            // planned. Emitting both would double-offload.
+            if let Some(ref ot) = model.override_tensor {
+                args.push("--override-tensor".into());
+                args.push(ot.clone());
+            } else if let Some(n) = model.n_cpu_moe {
                 if n > 0 {
                     args.push("--n-cpu-moe".into());
                     args.push(n.to_string());
@@ -927,6 +932,20 @@ mod tests {
         m.device = Some("Vulkan1,Vulkan2".into());
         let args = build_command_args(&m, None, 9001);
         assert_eq!(find_flag(&args, "--device"), Some("Vulkan1,Vulkan2"));
+    }
+
+    #[test]
+    fn gguf_argv_prefers_override_tensor_over_n_cpu_moe() {
+        let mut m = gguf_model();
+        m.n_cpu_moe = Some(23);
+        m.override_tensor = Some(r"blk\.(0|2)\.ffn_.*_exps=CPU".into());
+        let args = build_command_args(&m, None, 9001);
+        assert_eq!(
+            find_flag(&args, "--override-tensor"),
+            Some(r"blk\.(0|2)\.ffn_.*_exps=CPU")
+        );
+        // Must NOT also emit --n-cpu-moe (would double-offload).
+        assert!(!args.join(" ").contains("--n-cpu-moe"));
     }
 
     #[test]

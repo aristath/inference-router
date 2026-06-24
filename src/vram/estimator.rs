@@ -142,6 +142,41 @@ pub fn auto_n_cpu_moe(
     })
 }
 
+/// The `n_cpu` layer indices whose experts go to CPU, spread *evenly* across
+/// `[0, n_layers)` rather than taking the first N.
+///
+/// `--n-cpu-moe N` offloads the first N layers; combined with `--split-mode
+/// layer` (which assigns GPUs contiguous low→high layer ranges) that clusters
+/// all the light CPU-expert layers onto the first GPUs, leaving them half-empty
+/// while the GPU-expert layers fill the rest. Interleaving the offloaded layers
+/// gives every GPU's range a uniform light/heavy mix, so VRAM fills evenly and
+/// more experts fit on GPU.
+pub fn cpu_moe_layers(n_layers: u32, n_cpu: u32) -> Vec<u32> {
+    let n_cpu = n_cpu.min(n_layers);
+    if n_cpu == 0 {
+        return Vec::new();
+    }
+    (0..n_cpu)
+        .map(|j| ((j as u64 * n_layers as u64) / n_cpu as u64) as u32)
+        .collect()
+}
+
+/// Build the `--override-tensor` value pinning those layers' expert tensors to
+/// CPU: `blk\.(L1|L2|…)\.ffn_.*_exps=CPU`. `None` when nothing is offloaded.
+pub fn moe_cpu_override_tensor(n_layers: u32, n_cpu: u32) -> Option<String> {
+    let layers = cpu_moe_layers(n_layers, n_cpu);
+    if layers.is_empty() {
+        return None;
+    }
+    let alt = layers
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join("|");
+    // The trailing `\.` keeps `2` from matching `blk.21.…`.
+    Some(format!(r"blk\.({alt})\.ffn_.*_exps=CPU"))
+}
+
 fn scale_bytes(bytes: u64, fraction: f64) -> u64 {
     (bytes as f64 * fraction.clamp(0.0, 1.0)).round() as u64
 }
@@ -1168,6 +1203,30 @@ mod tests {
         assert!(info.expert_weight_bytes > 100 * gib);
         assert!(info.expert_weight_bytes < info.file_size);
         assert!(info.dense_weight_bytes() > 0);
+    }
+
+    #[test]
+    fn cpu_moe_layers_spread_evenly_not_clustered() {
+        // 23 of 51 layers → evenly distributed across the whole range, distinct,
+        // not the first 23 (which would cluster on the first GPUs).
+        let layers = cpu_moe_layers(51, 23);
+        assert_eq!(layers.len(), 23);
+        assert!(layers.iter().all(|&l| l < 51));
+        let mut sorted = layers.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 23, "all distinct");
+        assert!(*layers.last().unwrap() > 40, "must reach high layers, not just 0..22");
+        assert_eq!(cpu_moe_layers(51, 0), Vec::<u32>::new());
+        assert_eq!(cpu_moe_layers(51, 51).len(), 51);
+    }
+
+    #[test]
+    fn moe_override_tensor_builds_anchored_regex() {
+        let ot = moe_cpu_override_tensor(4, 2).unwrap();
+        assert!(ot.ends_with("=CPU"));
+        assert!(ot.contains("ffn_.*_exps"));
+        assert!(ot.contains(r"blk\."));
+        assert!(moe_cpu_override_tensor(4, 0).is_none());
     }
 
     #[test]
