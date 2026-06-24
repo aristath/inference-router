@@ -32,30 +32,63 @@ pub struct FitPlacement {
 /// regardless of how much a desktop/compositor is already using. A GPU driving
 /// a monitor uses `display_cap_pct` (lower) so the desktop keeps headroom.
 ///
+/// GPU *count* is minimized: greedily take the most-free GPU until the chosen
+/// subset's allocatable VRAM covers `needed_vram`, so a model that fits on one
+/// GPU runs on one GPU (no layer-split, no PCIe hops between layers). Picking
+/// the most-free GPUs first also keeps the count minimal and naturally avoids
+/// the display GPU and the smaller cards (less allocatable → sorted last). If no
+/// subset can cover the model — e.g. a huge MoE larger than all GPUs combined —
+/// we hand `-fit` every eligible GPU and let it spill the overflow to CPU.
+///
+/// `needed_vram` is the model's `estimated_vram`. A `0` estimate (gguf parse
+/// failed) can't be reasoned about, so we fall back to all eligible GPUs.
+///
 /// Returns `None` only when the backend has no eligible GPU with free VRAM.
 pub fn plan_fit_placement(
     backend: Backend,
     candidates: &[GpuInfo],
+    needed_vram: u64,
     gpu_cap_pct: u8,
     display_cap_pct: u8,
 ) -> Option<FitPlacement> {
-    let mut gpus: Vec<&GpuInfo> = candidates
+    let eligible: Vec<&GpuInfo> = candidates
         .iter()
         .filter(|g| !g.integrated && g.backend_index(backend).is_some() && g.free_vram() > 0)
         .collect();
-    if gpus.is_empty() {
+    if eligible.is_empty() {
         return None;
     }
+
+    let alloc = |g: &GpuInfo| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64);
+
+    // Greedy most-free-first: fewest GPUs that cover the model.
+    let mut by_alloc = eligible.clone();
+    by_alloc.sort_by_key(|g| std::cmp::Reverse(alloc(g)));
+    let mut chosen: Vec<&GpuInfo> = Vec::new();
+    let mut acc = 0u64;
+    for g in &by_alloc {
+        chosen.push(g);
+        acc = acc.saturating_add(alloc(g));
+        if needed_vram > 0 && acc >= needed_vram {
+            break;
+        }
+    }
+    // Couldn't cover it (or no usable estimate) → use every eligible GPU and let
+    // -fit spill the remainder to CPU.
+    if needed_vram == 0 || acc < needed_vram {
+        chosen = eligible;
+    }
+
     // Device order is cosmetic — the fit-target aligns to whatever order we list
     // — but the backend's own index keeps the emitted list deterministic.
-    gpus.sort_by_key(|g| g.backend_index(backend).unwrap_or(usize::MAX));
+    chosen.sort_by_key(|g| g.backend_index(backend).unwrap_or(usize::MAX));
 
-    let device = gpus
+    let device = chosen
         .iter()
         .filter_map(|g| g.backend_device_name(backend))
         .collect::<Vec<_>>()
         .join(",");
-    let fit_target = gpus
+    let fit_target = chosen
         .iter()
         .map(|g| fit_target_mib(g, gpu_cap_pct, display_cap_pct).to_string())
         .collect::<Vec<_>>()
@@ -65,7 +98,7 @@ pub fn plan_fit_placement(
         backend,
         device,
         fit_target,
-        gpus_used: gpus.len(),
+        gpus_used: chosen.len(),
     })
 }
 
@@ -115,14 +148,14 @@ mod tests {
 
     #[test]
     fn fit_emits_explicit_device_in_index_order() {
-        // ROCm0 full, ROCm2 + ROCm3 free → device list names only the free cards,
-        // in backend-index order, with one fit-target per device.
+        // ROCm0 full, ROCm2 + ROCm3 free → a 50 GB model needs both free cards,
+        // named in backend-index order, with one fit-target per device.
         let gpus = vec![
             rocm_gpu(0, 0),
             rocm_gpu(2, 32_000_000_000),
             rocm_gpu(3, 32_000_000_000),
         ];
-        let p = plan_fit_placement(Backend::Rocm, &gpus, 98, 80).unwrap();
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 50_000_000_000, 98, 80).unwrap();
         assert_eq!(p.device, "ROCm2,ROCm3");
         assert_eq!(p.gpus_used, 2);
         assert_eq!(p.fit_target.split(',').count(), 2);
@@ -133,14 +166,14 @@ mod tests {
     fn fit_none_when_backend_has_no_devices() {
         // GPUs are Vulkan-only; a ROCm placement finds nothing.
         let gpus = vec![gpu("a", 40_000_000_000)];
-        assert!(plan_fit_placement(Backend::Rocm, &gpus, 98, 80).is_none());
+        assert!(plan_fit_placement(Backend::Rocm, &gpus, 10_000_000_000, 98, 80).is_none());
     }
 
     #[test]
     fn fit_target_is_margin_to_leave_free() {
         // A 32 GiB card at 98% leaves 2% free ≈ 640 MiB.
         let gpus = vec![rocm_gpu(0, 30_000_000_000)];
-        let p = plan_fit_placement(Backend::Rocm, &gpus, 98, 80).unwrap();
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 10_000_000_000, 98, 80).unwrap();
         let total_mib = gpus[0].total_vram >> 20;
         let expect = total_mib * 2 / 100;
         assert_eq!(p.fit_target.parse::<u64>().unwrap(), expect);
@@ -148,12 +181,12 @@ mod tests {
 
     #[test]
     fn display_gpu_gets_a_larger_margin_than_a_normal_gpu() {
-        // Two equal GPUs, one driving a monitor → it must be told to leave more
-        // free (20% vs 2%) so the desktop keeps headroom.
+        // Two equal GPUs, one driving a monitor; a 45 GB model needs both → the
+        // display GPU must be told to leave more free (20% vs 2%).
         let a = rocm_gpu(0, 30_000_000_000);
         let mut b = rocm_gpu(1, 30_000_000_000);
         b.display_attached = true;
-        let p = plan_fit_placement(Backend::Rocm, &[a, b], 98, 80).unwrap();
+        let p = plan_fit_placement(Backend::Rocm, &[a, b], 45_000_000_000, 98, 80).unwrap();
         let parts: Vec<u64> = p.fit_target.split(',').map(|s| s.parse().unwrap()).collect();
         assert!(parts[1] > parts[0], "display GPU should leave more free: {parts:?}");
     }
@@ -162,8 +195,49 @@ mod tests {
     fn fit_skips_full_gpus_but_keeps_those_with_any_free() {
         // A card with even a sliver of free VRAM is still offered to -fit.
         let gpus = vec![rocm_gpu(0, 0), rocm_gpu(1, 1_000_000_000)];
-        let p = plan_fit_placement(Backend::Rocm, &gpus, 98, 80).unwrap();
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 500_000_000, 98, 80).unwrap();
         assert_eq!(p.device, "ROCm1");
         assert_eq!(p.gpus_used, 1);
+    }
+
+    #[test]
+    fn fit_uses_one_gpu_when_the_model_fits_on_one() {
+        // The core regression fix: a 20 GB model with three 32 GB cards free must
+        // land on ONE GPU, not be smeared across all three.
+        let gpus = vec![
+            rocm_gpu(0, 32_000_000_000),
+            rocm_gpu(1, 32_000_000_000),
+            rocm_gpu(2, 32_000_000_000),
+        ];
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 20_000_000_000, 98, 80).unwrap();
+        assert_eq!(p.gpus_used, 1, "must not split a 1-GPU model");
+        assert_eq!(p.device, "ROCm0");
+    }
+
+    #[test]
+    fn fit_picks_the_most_free_gpu_not_a_busy_one() {
+        // A 20 GB model: skip the nearly-full card, land on the free one.
+        let gpus = vec![rocm_gpu(0, 5_000_000_000), rocm_gpu(1, 32_000_000_000)];
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 20_000_000_000, 98, 80).unwrap();
+        assert_eq!(p.gpus_used, 1);
+        assert_eq!(p.device, "ROCm1");
+    }
+
+    #[test]
+    fn fit_falls_back_to_all_gpus_when_nothing_covers_it() {
+        // A huge MoE larger than all GPUs combined → use every eligible GPU and
+        // let -fit spill the overflow to CPU (NOT None, NOT a single GPU).
+        let gpus = vec![rocm_gpu(0, 32_000_000_000), rocm_gpu(1, 32_000_000_000)];
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 500_000_000_000, 98, 80).unwrap();
+        assert_eq!(p.gpus_used, 2);
+        assert_eq!(p.device, "ROCm0,ROCm1");
+    }
+
+    #[test]
+    fn fit_zero_estimate_uses_all_eligible_gpus() {
+        // No usable estimate (gguf parse failed) → can't size, so use everything.
+        let gpus = vec![rocm_gpu(0, 32_000_000_000), rocm_gpu(1, 32_000_000_000)];
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 0, 98, 80).unwrap();
+        assert_eq!(p.gpus_used, 2);
     }
 }

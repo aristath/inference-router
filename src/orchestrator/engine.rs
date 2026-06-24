@@ -1748,9 +1748,13 @@ fn try_place(
             .map(|g| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
             .sum();
         best_free = best_free.max(free);
-        if let Some(p) =
-            plan_fit_placement(backend, &candidates, gpu_cap_pct, display_cap_pct)
-        {
+        if let Some(p) = plan_fit_placement(
+            backend,
+            &candidates,
+            model.estimated_vram,
+            gpu_cap_pct,
+            display_cap_pct,
+        ) {
             model.device = Some(p.device);
             model.fit_target = Some(p.fit_target);
             // -fit owns -ngl / tensor-split / expert offload; clear any stale
