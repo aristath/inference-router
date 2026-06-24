@@ -54,11 +54,51 @@ pub struct GpuInfo {
     /// hwmon sensor was found.
     #[serde(default)]
     pub temp_c: Option<f32>,
+    /// True when a monitor is currently connected to this GPU (any DRM
+    /// connector reporting `connected`). Detected fresh on every refresh, so it
+    /// follows the operator moving cables between GPUs. Display GPUs get a
+    /// larger VRAM safety margin so the desktop/compositor never gets starved.
+    #[serde(default)]
+    pub display_attached: bool,
 }
+
+/// Fraction of a GPU's VRAM the router is willing to fill on a normal GPU.
+/// Overridable via `INFERENCE_ROUTER_GPU_VRAM_CAP_PCT`.
+const DEFAULT_VRAM_CAP_PCT: u64 = 95;
+/// Lower fill fraction for a GPU driving a monitor — leaves headroom for the
+/// desktop/compositor. Overridable via `INFERENCE_ROUTER_DISPLAY_VRAM_CAP_PCT`.
+const DISPLAY_VRAM_CAP_PCT: u64 = 75;
 
 impl GpuInfo {
     pub fn free_vram(&self) -> u64 {
         self.total_vram.saturating_sub(self.used_vram)
+    }
+
+    /// Percentage of total VRAM the router may fill on this GPU: lower for a
+    /// display-attached GPU. This is a placement guard, not a hard limit — it
+    /// keeps a safety margin so a fully-packed model can't OOM the GPU (or, on a
+    /// display GPU, starve the desktop).
+    pub fn vram_cap_pct(&self) -> u64 {
+        let (key, default) = if self.display_attached {
+            ("INFERENCE_ROUTER_DISPLAY_VRAM_CAP_PCT", DISPLAY_VRAM_CAP_PCT)
+        } else {
+            ("INFERENCE_ROUTER_GPU_VRAM_CAP_PCT", DEFAULT_VRAM_CAP_PCT)
+        };
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|p| *p > 0 && *p <= 100)
+            .unwrap_or(default)
+    }
+
+    /// VRAM (bytes) the router may still allocate on this GPU without crossing
+    /// its cap: `total * cap% - used`, clamped at 0. Placement and the MoE
+    /// auto-tune size against this, not raw `free_vram`, so a GPU is never
+    /// filled past its margin (and existing desktop usage on a display GPU is
+    /// already subtracted, since it's part of `used`).
+    pub fn allocatable_vram(&self) -> u64 {
+        let cap = self.total_vram.saturating_mul(self.vram_cap_pct()) / 100;
+        cap.saturating_sub(self.used_vram)
     }
 
     /// This GPU's device index within `backend`, if the backend enumerates it.
@@ -123,6 +163,7 @@ impl VRAMTracker {
         append_vulkan_gpus(&mut gpus);
         attach_rocm_indices(&mut gpus);
         attach_sycl_indices(&mut gpus);
+        attach_display_attachment(&mut gpus, "/sys/class/drm");
         let overrides = self.tag_overrides.read().ok();
         apply_tags(&mut gpus, overrides.as_deref());
         gpus.sort_by(|a, b| a.id.cmp(&b.id));
@@ -202,6 +243,7 @@ impl VRAMTracker {
                 used_vram: used,
                 busy_pct,
                 temp_c,
+                display_attached: false,
             });
         }
 
@@ -290,6 +332,7 @@ fn parse_nvidia_smi_line(line: &str) -> Option<GpuInfo> {
         used_vram: used_mib.saturating_mul(1024 * 1024),
         busy_pct,
         temp_c,
+        display_attached: false,
     })
 }
 
@@ -340,6 +383,7 @@ fn append_vulkan_gpus(gpus: &mut Vec<GpuInfo>) {
             used_vram: 0,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         });
     }
 }
@@ -357,6 +401,64 @@ fn attach_rocm_indices(gpus: &mut [GpuInfo]) {
             gpu.rocm_index = Some(*idx);
         }
     }
+}
+
+/// Marks each GPU whose DRM card currently has a connected monitor. Detected
+/// fresh (never cached, never hardcoded) so moving a cable between GPUs — or
+/// driving two GPUs from two monitors — is reflected on the next refresh.
+fn attach_display_attachment(gpus: &mut [GpuInfo], drm_root: &str) {
+    let display_pcis = display_attached_pcis(drm_root);
+    if display_pcis.is_empty() {
+        return;
+    }
+    for gpu in gpus.iter_mut() {
+        if let Some(pci) = gpu.pci_bus_id.as_deref() {
+            gpu.display_attached = display_pcis.contains(pci);
+        }
+    }
+}
+
+/// The PCI bus ids of GPUs with at least one connected DRM connector. Walks
+/// `/sys/class/drm`: connector sub-nodes are named `card<N>-<CONNECTOR>` and
+/// expose a `status` of `connected`/`disconnected`; we map the owning card back
+/// to its PCI bus id so the result survives the card↔PCI renumbering across
+/// vendors and reboots.
+fn display_attached_pcis(drm_root: &str) -> std::collections::HashSet<String> {
+    let mut connected_cards: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut card_pci: HashMap<String, String> = HashMap::new();
+
+    let Ok(entries) = std::fs::read_dir(drm_root) else {
+        return std::collections::HashSet::new();
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") {
+            continue;
+        }
+        match name.split_once('-') {
+            // Connector sub-node, e.g. `card4-DP-13`.
+            Some((card, _connector)) => {
+                if std::fs::read_to_string(entry.path().join("status"))
+                    .map(|s| s.trim() == "connected")
+                    .unwrap_or(false)
+                {
+                    connected_cards.insert(card.to_string());
+                }
+            }
+            // Real card node, e.g. `card4` — record its PCI.
+            None => {
+                if let Some(pci) = read_pci_bus_id(&entry.path().join("device")) {
+                    card_pci.insert(name.into_owned(), pci);
+                }
+            }
+        }
+    }
+
+    connected_cards
+        .into_iter()
+        .filter_map(|card| card_pci.get(&card).cloned())
+        .collect()
 }
 
 /// Fills in each GPU's `sycl_index`. SYCL (oneAPI / Level Zero) targets Intel
@@ -563,6 +665,7 @@ fn intel_xe_gpus(
             total_vram,
             busy_pct: 0,
             temp_c: read_gpu_junction_temp(&device),
+            display_attached: false,
         });
     }
     gpus
@@ -871,6 +974,59 @@ mod tests {
     }
 
     #[test]
+    fn display_detection_maps_connected_connector_to_card_pci() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // card4 → PCI 0d with a *connected* monitor; card1 → 03 disconnected.
+        for (card, pci, conn, status) in [
+            ("card4", "0000:0d:00.0", "card4-DP-13", "connected"),
+            ("card1", "0000:03:00.0", "card1-DP-1", "disconnected"),
+        ] {
+            let dev = root.join(pci);
+            fs::create_dir_all(&dev).unwrap();
+            fs::create_dir_all(root.join(card)).unwrap();
+            std::os::unix::fs::symlink(&dev, root.join(card).join("device")).unwrap();
+            let c = root.join(conn);
+            fs::create_dir_all(&c).unwrap();
+            fs::write(c.join("status"), format!("{status}\n")).unwrap();
+        }
+        let pcis = display_attached_pcis(root.to_str().unwrap());
+        assert!(pcis.contains("0000:0d:00.0"));
+        assert!(!pcis.contains("0000:03:00.0"));
+    }
+
+    #[test]
+    fn allocatable_vram_applies_caps_and_subtracts_used() {
+        let gib = 1u64 << 30;
+        let mut g = GpuInfo {
+            id: "x".into(),
+            pci_bus_id: None,
+            vulkan_device: None,
+            vulkan_index: None,
+            cuda_device: None,
+            cuda_index: None,
+            rocm_index: None,
+            sycl_index: None,
+            tags: BTreeSet::new(),
+            integrated: false,
+            total_vram: 32 * gib,
+            used_vram: 0,
+            busy_pct: 0,
+            temp_c: None,
+            display_attached: false,
+        };
+        // 95% cap on a normal GPU.
+        assert_eq!(g.allocatable_vram(), 32 * gib * 95 / 100);
+        // Existing usage is subtracted.
+        g.used_vram = 10 * gib;
+        assert_eq!(g.allocatable_vram(), 32 * gib * 95 / 100 - 10 * gib);
+        // Display GPU drops to the 75% cap.
+        g.display_attached = true;
+        g.used_vram = 0;
+        assert_eq!(g.allocatable_vram(), 32 * gib * 75 / 100);
+    }
+
+    #[test]
     fn discovered_tags_follow_backend_indices() {
         let mut g = GpuInfo {
             id: "x".into(),
@@ -887,6 +1043,7 @@ mod tests {
             used_vram: 0,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         };
         apply_tags(std::slice::from_mut(&mut g), None);
         // An AMD card seen by both ROCm and Vulkan is tagged for both.
@@ -961,6 +1118,7 @@ mod tests {
             used_vram: 150,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         };
         assert_eq!(g.free_vram(), 0);
     }
@@ -1303,6 +1461,7 @@ VkPhysicalDeviceProperties:
             used_vram: 0,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         };
         merge_vulkan_identity(&mut nvidia, &map);
         // Keeps its CUDA identity and gains the Vulkan one.
@@ -1329,6 +1488,7 @@ VkPhysicalDeviceProperties:
             used_vram: 0,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         };
 
         merge_vulkan_identity(&mut intel, &map);
@@ -1356,6 +1516,7 @@ VkPhysicalDeviceProperties:
             used_vram: 0,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         };
         merge_vulkan_identity(&mut gpu, &map);
         assert_eq!(gpu.vulkan_index, None);

@@ -16,6 +16,10 @@ pub struct GpuDisplay {
     pub pci_bus_id: String,
     /// Backend capability tags joined for display, e.g. "vulkan · rocm".
     pub tags_str: String,
+    /// True when a monitor is connected (gets the lower VRAM fill cap).
+    pub display_attached: bool,
+    /// The VRAM fill cap as a label, e.g. "95%" or "75%".
+    pub vram_cap_str: String,
     pub used_gib_str: String,
     pub total_gib_str: String,
     pub free_gib_str: String,
@@ -58,6 +62,8 @@ impl GpuDisplay {
                 .map(|b| b.as_str())
                 .collect::<Vec<_>>()
                 .join(" · "),
+            display_attached: gpu.display_attached,
+            vram_cap_str: format!("{}%", gpu.vram_cap_pct()),
             used_gib_str: format!("{:.1}", used_gib),
             total_gib_str: format!("{:.1}", total_gib),
             free_gib_str: format!("{:.1}", free_gib),
@@ -718,6 +724,7 @@ mod tests {
             used_vram: used,
             busy_pct: busy,
             temp_c: None,
+            display_attached: false,
         }
     }
 

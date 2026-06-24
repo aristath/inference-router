@@ -43,17 +43,21 @@ pub fn plan_backend_split(
     }
     let target = needed_vram;
 
+    // `allocatable_vram` (not raw free) so we never fill a GPU past its safety
+    // cap — 95% normally, 75% on a display GPU. The split fractions are
+    // proportional to allocatable too, so a display GPU receives a smaller
+    // slice of the model.
     let mut by_free: Vec<&GpuInfo> = candidates
         .iter()
-        .filter(|g| g.free_vram() > 0 && g.backend_index(backend).is_some())
+        .filter(|g| g.allocatable_vram() > 0 && g.backend_index(backend).is_some())
         .collect();
-    by_free.sort_by(|a, b| b.free_vram().cmp(&a.free_vram()));
+    by_free.sort_by(|a, b| b.allocatable_vram().cmp(&a.allocatable_vram()));
 
     let mut chosen: Vec<&GpuInfo> = Vec::new();
     let mut acc: u64 = 0;
     for g in by_free {
         chosen.push(g);
-        acc = acc.saturating_add(g.free_vram());
+        acc = acc.saturating_add(g.allocatable_vram());
         if acc >= target {
             break;
         }
@@ -65,7 +69,7 @@ pub fn plan_backend_split(
     // List devices in the backend's index order (cosmetic — the split aligns to
     // whatever order we list — but keeps output deterministic and legible).
     chosen.sort_by_key(|g| g.backend_index(backend).unwrap_or(usize::MAX));
-    let total: u64 = chosen.iter().map(|g| g.free_vram()).sum();
+    let total: u64 = chosen.iter().map(|g| g.allocatable_vram()).sum();
     let device = chosen
         .iter()
         .filter_map(|g| g.backend_device_name(backend))
@@ -73,7 +77,7 @@ pub fn plan_backend_split(
         .join(",");
     let tensor_split = chosen
         .iter()
-        .map(|g| format!("{:.3}", g.free_vram() as f64 / total as f64))
+        .map(|g| format!("{:.3}", g.allocatable_vram() as f64 / total as f64))
         .collect::<Vec<_>>()
         .join(",");
     Some(BackendPlacement {
@@ -104,6 +108,7 @@ mod tests {
             used_vram: 1_000_000_000,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         }
     }
 
@@ -148,15 +153,30 @@ mod tests {
     }
 
     #[test]
-    fn backend_split_fits_when_need_equals_free_no_hidden_headroom() {
-        // Regression: the estimate already carries overhead, so a model whose
-        // need is at-or-just-under total free VRAM must fit — no extra ×1.05
-        // gate that rejects "need 136 < have 141".
+    fn backend_split_fits_to_allocatable_and_honors_the_cap() {
+        // No hidden ×1.05 gate: a need at/just-under *allocatable* VRAM fits.
+        // But the per-GPU cap is enforced — a need above allocatable does not,
+        // even though it's below raw free.
         let gpus = vec![rocm_gpu(0, 70_000_000_000), rocm_gpu(1, 71_300_000_000)];
-        let free: u64 = gpus.iter().map(|g| g.free_vram()).sum(); // 141.3 GB
-        // need just below free would previously fail (× 1.05 → above free).
-        let need = free - 5_000_000_000; // 136.3 GB
-        assert!(plan_backend_split(Backend::Rocm, &gpus, need).is_some());
+        let alloc: u64 = gpus.iter().map(|g| g.allocatable_vram()).sum();
+        let free: u64 = gpus.iter().map(|g| g.free_vram()).sum();
+        assert!(alloc < free, "cap must hold back some of free");
+        assert!(plan_backend_split(Backend::Rocm, &gpus, alloc - 2_000_000_000).is_some());
+        assert!(plan_backend_split(Backend::Rocm, &gpus, alloc + 2_000_000_000).is_none());
+    }
+
+    #[test]
+    fn display_gpu_gets_a_smaller_share_than_a_normal_gpu() {
+        // Two equal GPUs, one driving a monitor → it must receive a strictly
+        // smaller slice of the model (75% cap vs 95%).
+        let a = rocm_gpu(0, 60_000_000_000);
+        let mut b = rocm_gpu(1, 60_000_000_000);
+        b.display_attached = true;
+        let p = plan_backend_split(Backend::Rocm, &[a.clone(), b.clone()], 80_000_000_000).unwrap();
+        let parts: Vec<f32> = p.tensor_split.split(',').map(|s| s.parse().unwrap()).collect();
+        assert!(parts[0] > parts[1], "display GPU (ROCm1) should get less: {parts:?}");
+        // The cap reduces the display GPU's allocatable below the normal one's.
+        assert!(b.allocatable_vram() < a.allocatable_vram());
     }
 
     #[test]

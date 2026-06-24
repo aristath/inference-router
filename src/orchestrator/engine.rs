@@ -810,7 +810,7 @@ impl Orchestrator {
                             let free: u64 = subtract_reserved_from_gpus(gpus.clone(), reserved)
                                 .iter()
                                 .filter(|g| !g.integrated && g.supports(backend))
-                                .map(|g| g.free_vram())
+                                .map(|g| g.allocatable_vram())
                                 .sum();
                             let n_cpu_moe = model.n_cpu_moe.unwrap_or_else(|| {
                                 auto_n_cpu_moe(
@@ -1633,7 +1633,7 @@ fn try_place(
         || configured_llama_device_value(model).is_some()
     {
         let eligible = model_visible_gpus(model, adjusted);
-        let free: u64 = eligible.iter().map(|g| g.free_vram()).sum();
+        let free: u64 = eligible.iter().map(|g| g.allocatable_vram()).sum();
         return if model.estimated_vram == 0 || free >= model.estimated_vram {
             PlaceOutcome::Fits
         } else {
@@ -1653,7 +1653,7 @@ fn try_place(
             .filter(|g| !g.integrated && g.supports(backend))
             .cloned()
             .collect();
-        best_free = best_free.max(candidates.iter().map(|g| g.free_vram()).sum());
+        best_free = best_free.max(candidates.iter().map(|g| g.allocatable_vram()).sum());
         if let Some(p) = plan_backend_split(backend, &candidates, model.estimated_vram) {
             model.device = Some(p.device);
             model.tensor_split = Some(p.tensor_split);
@@ -1910,6 +1910,7 @@ mod tests {
             used_vram: 0,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         }
     }
 
@@ -1986,6 +1987,7 @@ mod tests {
             used_vram: 0,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         }];
         let mut m = model("cuda-target");
         m.device = Some("CUDA0".into());
@@ -2031,6 +2033,7 @@ mod tests {
             used_vram: 0,
             busy_pct: 0,
             temp_c: None,
+            display_attached: false,
         };
         let vulkan = gpu("1", "0000:03:00.0", 0);
         let mut auto = model("auto-cuda");
@@ -2428,6 +2431,7 @@ mod tests {
                 used_vram: 0,
                 busy_pct: 0,
                 temp_c: None,
+                display_attached: false,
             }];
         }
 

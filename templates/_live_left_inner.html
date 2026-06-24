@@ -79,6 +79,11 @@
             </div>
             <div class="gpu-tags-row">
                 <span class="gpu-tags" title="Backends that may drive this GPU">{{ gpu.tags_str }}</span>
+                {% if gpu.display_attached %}
+                <span class="gpu-cap-chip" title="A monitor is connected to this GPU, so the router fills it only to {{ gpu.vram_cap_str }} (leaving headroom for the desktop)">🖥 {{ gpu.vram_cap_str }}</span>
+                {% else %}
+                <span class="gpu-cap-chip muted" title="VRAM fill cap (safety margin)">{{ gpu.vram_cap_str }}</span>
+                {% endif %}
                 {% if !gpu.pci_bus_id.is_empty() %}
                 <button type="button" class="gpu-tags-edit" title="Edit backend tags"
                         onclick="openGpuTagsModal('{{ gpu.pci_bus_id }}')">edit</button>

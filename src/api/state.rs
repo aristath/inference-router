@@ -64,6 +64,10 @@ struct GpuResponse {
     busy_pct: u8,
     /// GPU temperature in Celsius (None if unavailable)
     temp_c: Option<f32>,
+    /// True when a monitor is connected to this GPU (gets a larger VRAM margin)
+    display_attached: bool,
+    /// Percentage of VRAM the router will fill on this GPU (95, or 75 w/ display)
+    vram_cap_pct: u64,
 }
 
 /// Model configuration and runtime state.
@@ -138,20 +142,25 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
         },
         gpus: gpus
             .into_iter()
-            .map(|g| GpuResponse {
-                id: g.id,
-                pci_bus_id: g.pci_bus_id,
-                vulkan_device: g.vulkan_device,
-                vulkan_index: g.vulkan_index,
-                cuda_device: g.cuda_device,
-                cuda_index: g.cuda_index,
-                rocm_index: g.rocm_index,
-                sycl_index: g.sycl_index,
-                tags: g.tags.into_iter().collect(),
-                total_vram: g.total_vram,
-                used_vram: g.used_vram,
-                busy_pct: g.busy_pct,
-                temp_c: g.temp_c,
+            .map(|g| {
+                let vram_cap_pct = g.vram_cap_pct(); // borrow before moving fields
+                GpuResponse {
+                    id: g.id,
+                    pci_bus_id: g.pci_bus_id,
+                    vulkan_device: g.vulkan_device,
+                    vulkan_index: g.vulkan_index,
+                    cuda_device: g.cuda_device,
+                    cuda_index: g.cuda_index,
+                    rocm_index: g.rocm_index,
+                    sycl_index: g.sycl_index,
+                    tags: g.tags.into_iter().collect(),
+                    total_vram: g.total_vram,
+                    used_vram: g.used_vram,
+                    busy_pct: g.busy_pct,
+                    temp_c: g.temp_c,
+                    display_attached: g.display_attached,
+                    vram_cap_pct,
+                }
             })
             .collect(),
         models: models
