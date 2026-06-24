@@ -318,7 +318,7 @@ impl GgufInfo {
             sliding_window,
             full_attention_interval,
             file_size,
-            expert_weight_bytes: read_expert_weight_bytes(path),
+            expert_weight_bytes: read_expert_weight_bytes(path, file_size),
         })
     }
 
@@ -649,7 +649,7 @@ impl GgufMeta {
             kv_heads_total,
             sliding_window,
             file_size,
-            expert_weight_bytes: read_expert_weight_bytes(path),
+            expert_weight_bytes: read_expert_weight_bytes(path, file_size),
             architecture: arch,
             name,
             basename,
@@ -1004,41 +1004,55 @@ fn is_expert_tensor(name: &str) -> bool {
     name.contains("_exps")
 }
 
-/// Sum the byte size of the MoE expert tensors across all shards. Returns 0 for
-/// a dense model (no `*_exps*` tensors) or if the tensor sections can't be read.
-fn read_expert_weight_bytes(path: &Path) -> u64 {
-    let mut total = 0u64;
+/// MoE expert-weight bytes for a model, as the experts' **share of the actual
+/// on-disk size**. Returns 0 for a dense model.
+///
+/// We don't trust the absolute per-tensor `nbytes()`: the GGUF reader's quant
+/// size table can be wrong for newer/mixed quant types (e.g. "UD-Q2_K_XL"),
+/// which made the raw expert sum exceed the whole file. Instead we take the
+/// expert *fraction* of the summed tensor bytes and apply it to `file_size`, so
+/// a proportional size error cancels and the result is always ≤ `file_size`.
+fn read_expert_weight_bytes(path: &Path, file_size: u64) -> u64 {
+    let mut expert = 0u128;
+    let mut all = 0u128;
     for shard in shard_paths(path) {
         let Ok(file) = File::open(&shard) else { continue };
         // Safety: read-only for the duration of this call; not mutated concurrently.
         let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
             continue;
         };
-        total = total.saturating_add(sum_shard_expert_bytes(&mmap).unwrap_or(0));
+        if let Ok((e, a)) = sum_shard_tensor_bytes(&mmap) {
+            expert += e as u128;
+            all += a as u128;
+        }
     }
-    total
+    if all == 0 || expert == 0 {
+        return 0;
+    }
+    ((file_size as u128 * expert / all).min(file_size as u128)) as u64
 }
 
-/// Expert-tensor bytes in one shard: read the header, skip the metadata KVs,
-/// then walk the tensor descriptors summing those whose name is an expert
-/// tensor.
-fn sum_shard_expert_bytes(data: &[u8]) -> Result<u64, EstimateError> {
+/// `(expert_tensor_bytes, all_tensor_bytes)` in one shard: read the header, skip
+/// the metadata KVs, then walk the tensor descriptors.
+fn sum_shard_tensor_bytes(data: &[u8]) -> Result<(u64, u64), EstimateError> {
     let mut reader = GGufReader::new(data);
     let header = reader.read_header().map_err(read_err)?;
     if !header.is_magic_correct() || !header.is_native_endian() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     for _ in 0..header.metadata_kv_count {
         reader.read_meta_kv().map_err(read_err)?;
     }
-    let mut sum = 0u64;
+    let (mut expert, mut all) = (0u64, 0u64);
     for _ in 0..header.tensor_count {
         let meta = reader.read_tensor_meta().map_err(read_err)?;
+        let nbytes = meta.to_info().nbytes() as u64;
+        all = all.saturating_add(nbytes);
         if is_expert_tensor(meta.name()) {
-            sum = sum.saturating_add(meta.to_info().nbytes() as u64);
+            expert = expert.saturating_add(nbytes);
         }
     }
-    Ok(sum)
+    Ok((expert, all))
 }
 
 /// Reads the GGUF header + metadata KV block into a (key → (ty, value_bytes))
@@ -1207,6 +1221,25 @@ mod tests {
         assert!(info.is_moe());
         // Experts dominate but are a strict subset of the file.
         assert!(info.expert_weight_bytes > 100 * gib);
+        assert!(info.expert_weight_bytes < info.file_size);
+        assert!(info.dense_weight_bytes() > 0);
+    }
+
+    #[test]
+    #[ignore = "reads a real multi-GB sharded GGUF; run explicitly with --ignored"]
+    fn real_glm52_expert_split_never_exceeds_file() {
+        let path = Path::new(
+            "/home/aristath/models/glm-5.2/UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00001-of-00007.gguf",
+        );
+        let info = GgufInfo::read(path).unwrap();
+        let gib = 1u64 << 30;
+        eprintln!(
+            "file={} GiB  experts={} GiB  dense={} GiB",
+            info.file_size / gib,
+            info.expert_weight_bytes / gib,
+            info.dense_weight_bytes() / gib
+        );
+        // The bug: experts (309) once exceeded the file (236). Must not anymore.
         assert!(info.expert_weight_bytes < info.file_size);
         assert!(info.dense_weight_bytes() > 0);
     }
