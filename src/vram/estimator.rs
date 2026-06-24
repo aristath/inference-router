@@ -86,11 +86,10 @@ impl VramEstimate {
         let frac = gpu_layer_fraction(n_layers, n_gpu_layers);
         let weight_vram = scale_bytes(file_size, frac);
         let kv_vram = scale_bytes(kv_cache_bytes, frac);
-        let total = (weight_vram + kv_vram).saturating_mul(11) / 10;
         Self {
             weight_vram,
             kv_cache_vram: kv_vram,
-            total_vram: total,
+            total_vram: with_overhead(weight_vram + kv_vram),
             cpu_kv_ram: kv_cache_bytes.saturating_sub(kv_vram),
         }
     }
@@ -114,11 +113,10 @@ impl VramEstimate {
         };
         let experts_on_gpu = scale_bytes(expert_bytes, gpu_expert_frac);
         let weight_vram = dense_bytes.saturating_add(experts_on_gpu);
-        let total = (weight_vram + kv_cache_bytes).saturating_mul(11) / 10;
         Self {
             weight_vram,
             kv_cache_vram: kv_cache_bytes,
-            total_vram: total,
+            total_vram: with_overhead(weight_vram + kv_cache_bytes),
             // CPU-resident experts are mmap'd weights (file-backed, reclaimable),
             // not anonymous RAM, so they don't count against the admission RAM.
             cpu_kv_ram: 0,
@@ -179,6 +177,14 @@ pub fn moe_cpu_override_tensor(n_layers: u32, n_cpu: u32) -> Option<String> {
 
 fn scale_bytes(bytes: u64, fraction: f64) -> u64 {
     (bytes as f64 * fraction.clamp(0.0, 1.0)).round() as u64
+}
+
+/// Runtime-overhead margin on the weight+KV total (compute buffers, allocator
+/// slack). Kept small (5%) because the per-GPU VRAM cap (95% / 75% on display
+/// GPUs) is now the real safety margin — a blanket 10% here on top of the cap
+/// left ~10 GiB of VRAM unused on a packed MoE model.
+fn with_overhead(bytes: u64) -> u64 {
+    bytes.saturating_mul(21) / 20
 }
 
 /// All the GGUF metadata fields the orchestrator + form UI care about.
@@ -1134,15 +1140,15 @@ mod tests {
         let kv = info.kv_cache_bytes(0, KvPerElement::FP16_BOTH);
         assert_eq!(kv, 0);
         let e = VramEstimate::compute(FILE_SIZE, kv, 32, None);
-        assert_eq!(e.total_vram, (FILE_SIZE * 11) / 10);
+        assert_eq!(e.total_vram, (FILE_SIZE * 21) / 20);
     }
 
     #[test]
-    fn overhead_is_ten_percent() {
+    fn overhead_is_five_percent() {
         let info = uniform_info(32, 32, 128, FILE_SIZE);
         let kv = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
         let e = VramEstimate::compute(FILE_SIZE, kv, 32, None);
-        assert_eq!(e.total_vram, (FILE_SIZE + kv) * 11 / 10);
+        assert_eq!(e.total_vram, (FILE_SIZE + kv) * 21 / 20);
     }
 
     #[test]
@@ -1154,10 +1160,10 @@ mod tests {
 
         // All experts on GPU → dense + experts + KV, ×1.1.
         let all_gpu = VramEstimate::compute_moe(dense, experts, kv, layers, 0);
-        assert_eq!(all_gpu.total_vram, (dense + experts + kv) * 11 / 10);
+        assert_eq!(all_gpu.total_vram, (dense + experts + kv) * 21 / 20);
         // All experts on CPU → only dense + KV count as VRAM (experts mmap'd).
         let all_cpu = VramEstimate::compute_moe(dense, experts, kv, layers, layers);
-        assert_eq!(all_cpu.total_vram, (dense + kv) * 11 / 10);
+        assert_eq!(all_cpu.total_vram, (dense + kv) * 21 / 20);
         assert_eq!(all_cpu.cpu_kv_ram, 0); // experts are file-backed, not anon RAM
         // More CPU-expert layers → less VRAM.
         let half = VramEstimate::compute_moe(dense, experts, kv, layers, 25);
@@ -1248,7 +1254,7 @@ mod tests {
         let partial = VramEstimate::compute(FILE_SIZE, kv, 51, Some(14));
 
         // Full offload is unchanged from the old behaviour.
-        assert_eq!(full.total_vram, (FILE_SIZE + kv) * 11 / 10);
+        assert_eq!(full.total_vram, (FILE_SIZE + kv) * 21 / 20);
         assert_eq!(full.cpu_kv_ram, 0);
 
         // Partial offload is far smaller and frees most of the KV to CPU RAM.
