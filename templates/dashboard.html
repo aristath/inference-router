@@ -320,12 +320,16 @@
                                 <small class="field-help" id="ngl_help">Layers to offload to GPU. 0 = leave flag off (default).</small>
                             </div>
                             <div class="form-group" id="n_cpu_moe_group" style="display:none;">
-                                <label for="n_cpu_moe">
+                                <label for="n_cpu_moe_slider">
                                     MoE expert offload (<code>--n-cpu-moe</code>)
                                     <span id="moe_badge" style="color:#34d399; font-weight:normal; margin-left:0.5rem;"></span>
+                                    <span id="n_cpu_moe_display" style="color:#38bdf8; font-weight:normal; margin-left:0.5rem;"></span>
                                 </label>
-                                <input type="number" id="n_cpu_moe" name="n_cpu_moe" min="0" placeholder="auto" style="width:8rem;">
-                                <small class="field-help">First N layers' experts on CPU. <strong>Blank = auto</strong> (router packs as many experts into VRAM as fit). Higher N = less VRAM, more CPU.</small>
+                                <div class="slider-container">
+                                    <input type="range" id="n_cpu_moe_slider" min="0" max="99" step="1" value="0">
+                                    <input type="hidden" id="n_cpu_moe" name="n_cpu_moe" value="">
+                                </div>
+                                <small class="field-help">Layers whose experts run on CPU. <strong>0 = auto</strong> (router packs as many experts into VRAM as fit). Higher = less VRAM, slower.</small>
                             </div>
                             <div class="form-row">
                                 <div class="form-group">
@@ -1353,8 +1357,10 @@ function populateModelForm(m, mode) {
     f.mlock.checked = !!m.mlock;
     f.no_mmap.checked = !!m.no_mmap;
     setOptionalSlider('n_gpu_layers', m.n_gpu_layers);
-    f.n_cpu_moe.value = m.n_cpu_moe == null ? '' : String(m.n_cpu_moe);
+    // applyMoeVisibility sets the n_cpu_moe slider's max from the model's layer
+    // count, so apply its value afterwards (else it'd clamp to the stale max).
     applyMoeVisibility(m.gguf_meta || (mode === 'edit' ? _editingModelGgufMeta : _currentGgufMeta));
+    setOptionalSlider('n_cpu_moe', m.n_cpu_moe);
     setOptionalSlider('parallel_slots', m.parallel_slots);
     f.cache_type_k.value = m.cache_type_k ?? '';
     f.cache_type_v.value = m.cache_type_v ?? '';
@@ -1421,6 +1427,12 @@ function applyMoeVisibility(meta) {
     const isMoe = experts > 0;
     if (moeGroup) moeGroup.style.display = isMoe ? '' : 'none';
     if (nglGroup) nglGroup.style.display = isMoe ? 'none' : '';
+    // Cap the slider at the model's layer count so it reads "N of <layers>".
+    const moeSlider = document.getElementById('n_cpu_moe_slider');
+    if (moeSlider && isMoe && meta.n_layers) {
+        moeSlider.max = String(meta.n_layers);
+        moeSlider.dispatchEvent(new Event('input'));
+    }
     if (badge) {
         badge.textContent = isMoe
             ? `MoE · ${experts} experts` + (meta.expert_used_count ? ` (${meta.expert_used_count} active)` : '')
@@ -1512,6 +1524,7 @@ document.addEventListener('click', (e) => {
 (function bindOptionalSliders() {
     [
         { slider: 'n_gpu_layers_slider', hidden: 'n_gpu_layers', display: 'ngl_display', suffix: '' },
+        { slider: 'n_cpu_moe_slider', hidden: 'n_cpu_moe', display: 'n_cpu_moe_display', suffix: '', zeroLabel: 'auto', ofMax: true },
         { slider: 'parallel_slots_slider', hidden: 'parallel_slots', display: 'parallel_slots_display', suffix: ' slots' },
         { slider: 'mtp_tokens_slider', hidden: 'mtp_tokens', display: 'mtp_tokens_display', suffix: ' tokens', zeroLabel: '(disabled)' },
     ].forEach(spec => {
@@ -1519,6 +1532,7 @@ document.addEventListener('click', (e) => {
         const hidden = document.getElementById(spec.hidden);
         const disp = document.getElementById(spec.display);
         if (!slider || !hidden) return;
+        const ofMax = spec.ofMax || spec.slider === 'n_gpu_layers_slider';
         function sync() {
             const v = parseInt(slider.value, 10);
             if (v === 0) {
@@ -1526,7 +1540,7 @@ document.addEventListener('click', (e) => {
                 if (disp) disp.textContent = spec.zeroLabel || '(default)';
             } else {
                 hidden.value = String(v);
-                if (disp) disp.textContent = `${v}${spec.suffix}${spec.slider === 'n_gpu_layers_slider' && slider.max ? ` of ${slider.max}` : ''}`;
+                if (disp) disp.textContent = `${v}${spec.suffix}${ofMax && slider.max ? ` of ${slider.max}` : ''}`;
             }
         }
         slider.addEventListener('input', sync);
