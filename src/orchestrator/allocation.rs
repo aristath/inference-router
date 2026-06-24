@@ -1,91 +1,85 @@
-//! Pick the smallest subset of GPUs that fits a model + build the backend
-//! positional `--tensor-split` string llama.cpp expects.
+//! Delegate GPU placement to llama.cpp's `-fit`: pick the backend's eligible
+//! GPUs, build the positional `--device` list, and compute the per-device
+//! `--fit-target` margin (MiB to leave free) from each GPU's safety cap.
+//!
+//! The router no longer predicts `-ngl`/`--tensor-split`/expert offload. It
+//! hands llama.cpp the device list plus a per-device free-margin and lets `-fit`
+//! pack each GPU to ground-truth buffer sizes, spilling whatever doesn't fit to
+//! CPU. The only number the router still controls is the safety margin.
 
 use crate::config::Backend;
 use crate::vram::tracker::GpuInfo;
 
-/// A concrete placement on one backend: an explicit `--device` list and a
-/// `--tensor-split` whose values are positionally aligned to that list (verified
-/// against the ROCm binary: `--tensor-split` follows `--device` order, not the
-/// backend's global enumeration order). Emitting the device list explicitly is
-/// what makes placement correct on a box where Vulkan and ROCm enumerate GPUs
-/// in different orders.
+/// A `-fit`-delegated placement on one backend: an explicit `--device` list and
+/// the `--fit-target` margins (MiB to leave free per device) positionally
+/// aligned to it. `-fit` packs each device to `free - margin`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct BackendPlacement {
+pub struct FitPlacement {
     pub backend: Backend,
-    /// e.g. `ROCm2,ROCm3`.
+    /// e.g. `Vulkan0,Vulkan1`.
     pub device: String,
-    /// e.g. `0.514,0.486`, aligned to `device`.
-    pub tensor_split: String,
+    /// e.g. `652,6525`, MiB to leave free, aligned to `device`.
+    pub fit_target: String,
     pub gpus_used: usize,
 }
 
-/// Choose GPUs for `backend` from `candidates` (already filtered to GPUs the
-/// backend may drive, reserved-adjusted) to fit `needed_vram`, and emit the
-/// explicit `--device` + aligned `--tensor-split`.
+/// Plan a `-fit` placement on `backend`: take every eligible GPU (the backend's
+/// tagged, non-integrated cards that still have some free VRAM) and emit the
+/// device list plus the per-device `--fit-target` margin.
 ///
-/// Strategy: greedily take the most-free GPU until the cumulative free VRAM
-/// covers `needed_vram`, then order the chosen devices by the backend's own
-/// index so the emitted list is stable. Returns `None` if even all of the
-/// backend's GPUs don't fit it.
+/// The margin for a GPU is `(100 - cap%) × total_vram` (in MiB), so `-fit`
+/// leaves exactly that much free and the GPU lands at `cap%` of its total —
+/// regardless of how much a desktop/compositor is already using. A GPU driving
+/// a monitor uses `display_cap_pct` (lower) so the desktop keeps headroom.
 ///
-/// `needed_vram` is the model's `estimated_vram`, which already carries a 10%
-/// runtime-overhead margin (see [`crate::vram::estimator::VramEstimate`]), so we
-/// fit it directly — no extra multiplier. That keeps the admission gate exactly
-/// `free >= need`, matching the number reported to the operator.
-pub fn plan_backend_split(
+/// Returns `None` only when the backend has no eligible GPU with free VRAM.
+pub fn plan_fit_placement(
     backend: Backend,
     candidates: &[GpuInfo],
-    needed_vram: u64,
-) -> Option<BackendPlacement> {
-    if candidates.is_empty() || needed_vram == 0 {
-        return None;
-    }
-    let target = needed_vram;
-
-    // `allocatable_vram` (not raw free) so we never fill a GPU past its safety
-    // cap — 95% normally, 75% on a display GPU. The split fractions are
-    // proportional to allocatable too, so a display GPU receives a smaller
-    // slice of the model.
-    let mut by_free: Vec<&GpuInfo> = candidates
+    gpu_cap_pct: u8,
+    display_cap_pct: u8,
+) -> Option<FitPlacement> {
+    let mut gpus: Vec<&GpuInfo> = candidates
         .iter()
-        .filter(|g| g.allocatable_vram() > 0 && g.backend_index(backend).is_some())
+        .filter(|g| !g.integrated && g.backend_index(backend).is_some() && g.free_vram() > 0)
         .collect();
-    by_free.sort_by(|a, b| b.allocatable_vram().cmp(&a.allocatable_vram()));
-
-    let mut chosen: Vec<&GpuInfo> = Vec::new();
-    let mut acc: u64 = 0;
-    for g in by_free {
-        chosen.push(g);
-        acc = acc.saturating_add(g.allocatable_vram());
-        if acc >= target {
-            break;
-        }
-    }
-    if acc < target {
+    if gpus.is_empty() {
         return None;
     }
+    // Device order is cosmetic — the fit-target aligns to whatever order we list
+    // — but the backend's own index keeps the emitted list deterministic.
+    gpus.sort_by_key(|g| g.backend_index(backend).unwrap_or(usize::MAX));
 
-    // List devices in the backend's index order (cosmetic — the split aligns to
-    // whatever order we list — but keeps output deterministic and legible).
-    chosen.sort_by_key(|g| g.backend_index(backend).unwrap_or(usize::MAX));
-    let total: u64 = chosen.iter().map(|g| g.allocatable_vram()).sum();
-    let device = chosen
+    let device = gpus
         .iter()
         .filter_map(|g| g.backend_device_name(backend))
         .collect::<Vec<_>>()
         .join(",");
-    let tensor_split = chosen
+    let fit_target = gpus
         .iter()
-        .map(|g| format!("{:.3}", g.allocatable_vram() as f64 / total as f64))
+        .map(|g| fit_target_mib(g, gpu_cap_pct, display_cap_pct).to_string())
         .collect::<Vec<_>>()
         .join(",");
-    Some(BackendPlacement {
+
+    Some(FitPlacement {
         backend,
         device,
-        tensor_split,
-        gpus_used: chosen.len(),
+        fit_target,
+        gpus_used: gpus.len(),
     })
+}
+
+/// The `--fit-target` margin for one GPU, in MiB: the VRAM `-fit` must leave
+/// free so the GPU ends at its cap. `(100 - cap%) × total_vram`.
+fn fit_target_mib(gpu: &GpuInfo, gpu_cap_pct: u8, display_cap_pct: u8) -> u64 {
+    let cap = if gpu.display_attached {
+        display_cap_pct
+    } else {
+        gpu_cap_pct
+    }
+    .clamp(1, 100) as u64;
+    let margin_bytes = gpu.total_vram.saturating_mul(100 - cap) / 100;
+    margin_bytes >> 20
 }
 
 #[cfg(test)]
@@ -120,80 +114,56 @@ mod tests {
     }
 
     #[test]
-    fn backend_split_emits_explicit_device_in_index_order() {
-        // ROCm0 nearly full, ROCm2 + ROCm3 free. A 40 GB model must land on the
-        // two free cards, named explicitly, with the split aligned to the list.
+    fn fit_emits_explicit_device_in_index_order() {
+        // ROCm0 full, ROCm2 + ROCm3 free → device list names only the free cards,
+        // in backend-index order, with one fit-target per device.
         let gpus = vec![
-            rocm_gpu(0, 2_000_000_000),
+            rocm_gpu(0, 0),
             rocm_gpu(2, 32_000_000_000),
             rocm_gpu(3, 32_000_000_000),
         ];
-        let p = plan_backend_split(Backend::Rocm, &gpus, 40_000_000_000).unwrap();
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 98, 80).unwrap();
         assert_eq!(p.device, "ROCm2,ROCm3");
         assert_eq!(p.gpus_used, 2);
-        // Equal free → ~0.5/0.5, and the split has exactly one value per device.
-        assert_eq!(p.tensor_split.split(',').count(), 2);
-        assert!(!p.device.contains("ROCm0"), "must skip the busy card");
+        assert_eq!(p.fit_target.split(',').count(), 2);
+        assert!(!p.device.contains("ROCm0"), "must skip the full card");
     }
 
     #[test]
-    fn backend_split_none_when_backend_has_no_devices() {
+    fn fit_none_when_backend_has_no_devices() {
         // GPUs are Vulkan-only; a ROCm placement finds nothing.
         let gpus = vec![gpu("a", 40_000_000_000)];
-        assert!(plan_backend_split(Backend::Rocm, &gpus, 10_000_000_000).is_none());
+        assert!(plan_fit_placement(Backend::Rocm, &gpus, 98, 80).is_none());
     }
 
     #[test]
-    fn backend_split_single_gpu_when_it_fits_alone() {
-        // A 10 GB model fits on one 40 GB card → single device, full share.
-        let gpus = vec![rocm_gpu(0, 40_000_000_000), rocm_gpu(1, 40_000_000_000)];
-        let p = plan_backend_split(Backend::Rocm, &gpus, 10_000_000_000).unwrap();
-        assert_eq!(p.gpus_used, 1);
-        assert_eq!(p.tensor_split, "1.000");
+    fn fit_target_is_margin_to_leave_free() {
+        // A 32 GiB card at 98% leaves 2% free ≈ 640 MiB.
+        let gpus = vec![rocm_gpu(0, 30_000_000_000)];
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 98, 80).unwrap();
+        let total_mib = gpus[0].total_vram >> 20;
+        let expect = total_mib * 2 / 100;
+        assert_eq!(p.fit_target.parse::<u64>().unwrap(), expect);
     }
 
     #[test]
-    fn backend_split_fits_to_allocatable_and_honors_the_cap() {
-        // No hidden ×1.05 gate: a need at/just-under *allocatable* VRAM fits.
-        // But the per-GPU cap is enforced — a need above allocatable does not,
-        // even though it's below raw free.
-        let gpus = vec![rocm_gpu(0, 70_000_000_000), rocm_gpu(1, 71_300_000_000)];
-        let alloc: u64 = gpus.iter().map(|g| g.allocatable_vram()).sum();
-        let free: u64 = gpus.iter().map(|g| g.free_vram()).sum();
-        assert!(alloc < free, "cap must hold back some of free");
-        assert!(plan_backend_split(Backend::Rocm, &gpus, alloc - 2_000_000_000).is_some());
-        assert!(plan_backend_split(Backend::Rocm, &gpus, alloc + 2_000_000_000).is_none());
-    }
-
-    #[test]
-    fn display_gpu_gets_a_smaller_share_than_a_normal_gpu() {
-        // Two equal GPUs, one driving a monitor → it must receive a strictly
-        // smaller slice of the model (75% cap vs 95%).
-        let a = rocm_gpu(0, 60_000_000_000);
-        let mut b = rocm_gpu(1, 60_000_000_000);
+    fn display_gpu_gets_a_larger_margin_than_a_normal_gpu() {
+        // Two equal GPUs, one driving a monitor → it must be told to leave more
+        // free (20% vs 2%) so the desktop keeps headroom.
+        let a = rocm_gpu(0, 30_000_000_000);
+        let mut b = rocm_gpu(1, 30_000_000_000);
         b.display_attached = true;
-        let p = plan_backend_split(Backend::Rocm, &[a.clone(), b.clone()], 80_000_000_000).unwrap();
-        let parts: Vec<f32> = p.tensor_split.split(',').map(|s| s.parse().unwrap()).collect();
-        assert!(parts[0] > parts[1], "display GPU (ROCm1) should get less: {parts:?}");
-        // The cap reduces the display GPU's allocatable below the normal one's.
-        assert!(b.allocatable_vram() < a.allocatable_vram());
+        let p = plan_fit_placement(Backend::Rocm, &[a, b], 98, 80).unwrap();
+        let parts: Vec<u64> = p.fit_target.split(',').map(|s| s.parse().unwrap()).collect();
+        assert!(parts[1] > parts[0], "display GPU should leave more free: {parts:?}");
     }
 
     #[test]
-    fn backend_split_returns_none_when_total_free_too_small() {
-        let gpus = vec![rocm_gpu(0, 5_000_000_000), rocm_gpu(1, 5_000_000_000)];
-        assert!(plan_backend_split(Backend::Rocm, &gpus, 50_000_000_000).is_none());
-    }
-
-    #[test]
-    fn backend_split_shares_reflect_free_vram_proportions() {
-        // 40 GB + 60 GB free, 80 GB model → both picked, shares ~0.4 / 0.6 in
-        // device-index order (ROCm0 then ROCm1).
-        let gpus = vec![rocm_gpu(0, 40_000_000_000), rocm_gpu(1, 60_000_000_000)];
-        let p = plan_backend_split(Backend::Rocm, &gpus, 80_000_000_000).unwrap();
-        assert_eq!(p.device, "ROCm0,ROCm1");
-        let parts: Vec<f32> = p.tensor_split.split(',').map(|s| s.parse().unwrap()).collect();
-        assert!((parts[0] - 0.4).abs() < 0.01, "{parts:?}");
-        assert!((parts[1] - 0.6).abs() < 0.01, "{parts:?}");
+    fn fit_skips_full_gpus_but_keeps_those_with_any_free() {
+        // A card with even a sliver of free VRAM is still offered to -fit.
+        let gpus = vec![rocm_gpu(0, 0), rocm_gpu(1, 1_000_000_000)];
+        let p = plan_fit_placement(Backend::Rocm, &gpus, 98, 80).unwrap();
+        assert_eq!(p.device, "ROCm1");
+        assert_eq!(p.gpus_used, 1);
     }
 }

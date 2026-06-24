@@ -130,6 +130,10 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
     let runtimes = state.model_runtimes().await;
     let events = state.recent_events().await;
     let sys = state.system_stats();
+    let (gpu_cap, display_cap) = {
+        let s = state.settings().await;
+        (s.gpu_vram_cap_pct as u64, s.display_gpu_vram_cap_pct as u64)
+    };
 
     let response = StatusResponse {
         server_port: state.server_port,
@@ -143,7 +147,7 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
         gpus: gpus
             .into_iter()
             .map(|g| {
-                let vram_cap_pct = g.vram_cap_pct(); // borrow before moving fields
+                let vram_cap_pct = g.vram_cap_pct(gpu_cap, display_cap); // borrow before moving fields
                 GpuResponse {
                     id: g.id,
                     pci_bus_id: g.pci_bus_id,

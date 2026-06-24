@@ -13,6 +13,13 @@ pub struct AppSettings {
     pub loop_guards: LoopGuardSettings,
     /// Which set of model names is advertised on `/v1/models`.
     pub model_exposure: ModelExposure,
+    /// Percent of a GPU's VRAM the router lets llama.cpp fill (`--fit-target`
+    /// margin = the remainder). Keeps a safety margin so a packed model can't
+    /// OOM the GPU. 1..=100.
+    pub gpu_vram_cap_pct: u8,
+    /// Same, but for a GPU driving a monitor — lower, to leave headroom for the
+    /// desktop/compositor. 1..=100.
+    pub display_gpu_vram_cap_pct: u8,
 }
 
 impl Default for AppSettings {
@@ -21,6 +28,8 @@ impl Default for AppSettings {
             models_folder: default_models_folder(),
             loop_guards: LoopGuardSettings::default(),
             model_exposure: ModelExposure::default(),
+            gpu_vram_cap_pct: 98,
+            display_gpu_vram_cap_pct: 80,
         }
     }
 }
@@ -34,6 +43,9 @@ impl AppSettings {
                 .unwrap_or_else(default_models_folder),
             loop_guards: LoopGuardSettings::from_env(),
             model_exposure: ModelExposure::from_env(),
+            gpu_vram_cap_pct: env_pct("INFERENCE_ROUTER_GPU_VRAM_CAP_PCT").unwrap_or(98),
+            display_gpu_vram_cap_pct: env_pct("INFERENCE_ROUTER_DISPLAY_VRAM_CAP_PCT")
+                .unwrap_or(80),
         }
     }
 
@@ -41,9 +53,20 @@ impl AppSettings {
         if self.models_folder.trim().is_empty() {
             self.models_folder = default_models_folder();
         }
+        self.gpu_vram_cap_pct = self.gpu_vram_cap_pct.clamp(1, 100);
+        self.display_gpu_vram_cap_pct = self.display_gpu_vram_cap_pct.clamp(1, 100);
         self.loop_guards.sanitize();
         self
     }
+}
+
+fn env_pct(name: &str) -> Option<u8> {
+    std::env::var(name)
+        .ok()?
+        .trim()
+        .parse::<u8>()
+        .ok()
+        .filter(|p| (1..=100).contains(p))
 }
 
 fn default_models_folder() -> String {

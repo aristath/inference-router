@@ -218,6 +218,10 @@ async fn collect_live_data(state: &AppState, sort: &str, dir: &str, query: &str)
     let runtimes = state.model_runtimes().await;
     let events = state.recent_events().await;
     let sys = state.system_stats();
+    let (gpu_cap, display_cap) = {
+        let s = state.settings().await;
+        (s.gpu_vram_cap_pct as u64, s.display_gpu_vram_cap_pct as u64)
+    };
 
     let has_any_models = !models.is_empty();
     let displays: Vec<ModelDisplay> = models
@@ -234,7 +238,10 @@ async fn collect_live_data(state: &AppState, sort: &str, dir: &str, query: &str)
     LiveData {
         system: SystemDisplay::from_stats(sys),
         gpu_totals: GpuTotals::from_gpus(&gpus),
-        gpus: gpus.iter().map(GpuDisplay::from_gpu).collect(),
+        gpus: gpus
+            .iter()
+            .map(|g| GpuDisplay::from_gpu(g, gpu_cap, display_cap))
+            .collect(),
         events: events
             .into_iter()
             .map(|e| EventDisplay::new(e.ts, e.level, e.message))

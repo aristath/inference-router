@@ -62,42 +62,33 @@ pub struct GpuInfo {
     pub display_attached: bool,
 }
 
-/// Fraction of a GPU's VRAM the router is willing to fill on a normal GPU.
-/// Overridable via `INFERENCE_ROUTER_GPU_VRAM_CAP_PCT`.
-const DEFAULT_VRAM_CAP_PCT: u64 = 98;
-/// Lower fill fraction for a GPU driving a monitor — leaves headroom for the
-/// desktop/compositor. Overridable via `INFERENCE_ROUTER_DISPLAY_VRAM_CAP_PCT`.
-const DISPLAY_VRAM_CAP_PCT: u64 = 80;
-
 impl GpuInfo {
     pub fn free_vram(&self) -> u64 {
         self.total_vram.saturating_sub(self.used_vram)
     }
 
-    /// Percentage of total VRAM the router may fill on this GPU: lower for a
-    /// display-attached GPU. This is a placement guard, not a hard limit — it
-    /// keeps a safety margin so a fully-packed model can't OOM the GPU (or, on a
-    /// display GPU, starve the desktop).
-    pub fn vram_cap_pct(&self) -> u64 {
-        let (key, default) = if self.display_attached {
-            ("INFERENCE_ROUTER_DISPLAY_VRAM_CAP_PCT", DISPLAY_VRAM_CAP_PCT)
+    /// Percentage of total VRAM the router may fill on this GPU: `display_cap_pct`
+    /// for a display-attached GPU (leaves headroom for the desktop), else
+    /// `gpu_cap_pct`. Both come from `AppSettings` (the single source of truth).
+    /// A placement guard, not a hard limit — it keeps a safety margin so a
+    /// fully-packed model can't OOM the GPU.
+    pub fn vram_cap_pct(&self, gpu_cap_pct: u64, display_cap_pct: u64) -> u64 {
+        let pct = if self.display_attached {
+            display_cap_pct
         } else {
-            ("INFERENCE_ROUTER_GPU_VRAM_CAP_PCT", DEFAULT_VRAM_CAP_PCT)
+            gpu_cap_pct
         };
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|p| *p > 0 && *p <= 100)
-            .unwrap_or(default)
+        pct.clamp(1, 100)
     }
 
     /// VRAM (bytes) the router may still allocate on this GPU without crossing
-    /// its cap: `total * cap% - used`, clamped at 0. Placement and the MoE
-    /// auto-tune size against this, not raw `free_vram`, so a GPU is never
-    /// filled past its margin (and existing desktop usage on a display GPU is
-    /// already subtracted, since it's part of `used`).
-    pub fn allocatable_vram(&self) -> u64 {
-        let cap = self.total_vram.saturating_mul(self.vram_cap_pct()) / 100;
+    /// its cap: `total * cap% - used`, clamped at 0. The coarse eviction
+    /// heuristic sizes against this, not raw `free_vram`, so a GPU is never
+    /// treated as filled past its margin (existing desktop usage on a display
+    /// GPU is already part of `used`).
+    pub fn allocatable_vram(&self, gpu_cap_pct: u64, display_cap_pct: u64) -> u64 {
+        let cap =
+            self.total_vram.saturating_mul(self.vram_cap_pct(gpu_cap_pct, display_cap_pct)) / 100;
         cap.saturating_sub(self.used_vram)
     }
 
@@ -1015,15 +1006,15 @@ mod tests {
             temp_c: None,
             display_attached: false,
         };
-        // 95% cap on a normal GPU.
-        assert_eq!(g.allocatable_vram(), 32 * gib * 98 / 100);
+        // 98% cap on a normal GPU.
+        assert_eq!(g.allocatable_vram(98, 80), 32 * gib * 98 / 100);
         // Existing usage is subtracted.
         g.used_vram = 10 * gib;
-        assert_eq!(g.allocatable_vram(), 32 * gib * 98 / 100 - 10 * gib);
-        // Display GPU drops to the 75% cap.
+        assert_eq!(g.allocatable_vram(98, 80), 32 * gib * 98 / 100 - 10 * gib);
+        // Display GPU drops to the 80% cap.
         g.display_attached = true;
         g.used_vram = 0;
-        assert_eq!(g.allocatable_vram(), 32 * gib * 80 / 100);
+        assert_eq!(g.allocatable_vram(98, 80), 32 * gib * 80 / 100);
     }
 
     #[test]

@@ -590,6 +590,30 @@
 
             <div class="card" style="margin-bottom: 1rem;">
                 <div style="display:flex; justify-content:space-between; align-items:baseline; gap:1rem;">
+                    <h2 style="margin:0;">GPU VRAM caps</h2>
+                    <span id="vram-cap-settings-state" class="model-muted"></span>
+                </div>
+                <form id="vram-cap-settings-form" style="margin-top:1rem;">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="gpu-vram-cap">GPU cap (%)</label>
+                            <input type="number" id="gpu-vram-cap" min="1" max="100" step="1">
+                            <small class="field-help">How full llama.cpp's <code>-fit</code> packs each GPU. The remainder becomes the per-device <code>--fit-target</code> margin.</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="display-vram-cap">Display GPU cap (%)</label>
+                            <input type="number" id="display-vram-cap" min="1" max="100" step="1">
+                            <small class="field-help">Lower cap for a GPU driving a monitor, leaving headroom for the desktop.</small>
+                        </div>
+                    </div>
+                    <div style="margin-top:0.75rem;">
+                        <button type="submit" class="btn btn-primary btn-sm">Save</button>
+                    </div>
+                </form>
+            </div>
+
+            <div class="card" style="margin-bottom: 1rem;">
+                <div style="display:flex; justify-content:space-between; align-items:baseline; gap:1rem;">
                     <h2 style="margin:0;">Loop guards</h2>
                     <span id="loop-guard-settings-state" class="model-muted"></span>
                 </div>
@@ -1961,6 +1985,10 @@ function populateLoopGuardSettings(settings) {
     loopGuardEl('lg-tool-enabled').checked = !!tool.enabled;
     loopGuardEl('lg-tool-repeats').value = tool.repeats;
     loopGuardEl('lg-tool-window-messages').value = tool.window_messages;
+    const capEl = document.getElementById('gpu-vram-cap');
+    const dispCapEl = document.getElementById('display-vram-cap');
+    if (capEl) capEl.value = Number.isFinite(s.gpu_vram_cap_pct) ? s.gpu_vram_cap_pct : 98;
+    if (dispCapEl) dispCapEl.value = Number.isFinite(s.display_gpu_vram_cap_pct) ? s.display_gpu_vram_cap_pct : 80;
 }
 
 async function refreshLoopGuardSettings() {
@@ -2026,6 +2054,49 @@ function readLoopGuardSettings() {
             }, 1600);
         } catch (err) {
             setLoopGuardSettingsState(`Save failed: ${err.message || err}`, 'error');
+        }
+    });
+})();
+
+(function bindVramCapSettingsForm() {
+    const form = document.getElementById('vram-cap-settings-form');
+    if (!form) return;
+    const setState = (text, kind) => {
+        const el = document.getElementById('vram-cap-settings-state');
+        if (!el) return;
+        el.textContent = text || '';
+        el.style.color = kind === 'error' ? '#fca5a5' : (kind === 'ok' ? '#86efac' : '#94a3b8');
+    };
+    const clampPct = (id, fallback) => {
+        const n = parseInt((document.getElementById(id) || {}).value, 10);
+        if (!Number.isFinite(n)) return fallback;
+        return Math.min(100, Math.max(1, n));
+    };
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        // Preserve every other setting (normalize keeps `incoming` intact).
+        const body = normalizeLoopGuardSettings(_currentAppSettings);
+        body.gpu_vram_cap_pct = clampPct('gpu-vram-cap', 98);
+        body.display_gpu_vram_cap_pct = clampPct('display-vram-cap', 80);
+        setState('Saving…');
+        try {
+            const r = await fetch('/api/settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (!r.ok) {
+                const j = await r.json().catch(() => ({}));
+                throw new Error(j.error || r.statusText);
+            }
+            _currentAppSettings = body;
+            setState('Saved', 'ok');
+            setTimeout(() => {
+                const el = document.getElementById('vram-cap-settings-state');
+                if (el && el.textContent === 'Saved') setState('');
+            }, 1600);
+        } catch (err) {
+            setState(`Save failed: ${err.message || err}`, 'error');
         }
     });
 })();

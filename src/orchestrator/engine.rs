@@ -1,8 +1,8 @@
 use crate::config::{
     AppSettings, Backend, BinaryPreset, ConfigError, GpuTagOverride, JsonStore, ModelAlias,
-    ModelConfig, ModelState, SplitMode, WeightsFormat, tag_overrides_by_pci,
+    ModelConfig, ModelState, WeightsFormat, tag_overrides_by_pci,
 };
-use crate::orchestrator::allocation::plan_backend_split;
+use crate::orchestrator::allocation::plan_fit_placement;
 use crate::orchestrator::eviction::{EvictionAction, decide_eviction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
 use crate::system::stats::{SystemStats, SystemTracker};
@@ -731,9 +731,12 @@ impl Orchestrator {
         // inside the admission block during GGUF reads; used after the health
         // check to recompute estimated_vram from the measured KV bytes.
         let mut weight_file_size: u64 = 0;
-        // Set in the MoE estimate branch; used after placement to rebuild the
-        // expert-offload --override-tensor aligned to the chosen tensor-split.
-        let mut moe_n_layers: Option<u32> = None;
+        // Per-GPU VRAM safety caps drive the --fit-target margins handed to
+        // llama.cpp's -fit (see `plan_fit_placement`).
+        let (gpu_cap_pct, display_cap_pct) = {
+            let s = self.settings.lock().await;
+            (s.gpu_vram_cap_pct, s.display_gpu_vram_cap_pct)
+        };
         let (mut pending, pid, port, vram_reservation) = {
             let _admit = self.admission.lock().await;
 
@@ -791,7 +794,7 @@ impl Orchestrator {
                 // KV-cache portion of the estimate matches what the
                 // backend will actually allocate at run time.
                 use crate::config::CacheType;
-                use crate::vram::estimator::{auto_n_cpu_moe, GgufInfo, KvPerElement};
+                use crate::vram::estimator::{GgufInfo, KvPerElement};
                 let kv_bytes = KvPerElement::from_types(
                     model.cache_type_k.unwrap_or(CacheType::F16),
                     model.cache_type_v.unwrap_or(CacheType::F16),
@@ -800,71 +803,28 @@ impl Orchestrator {
                     Ok(info) => {
                         weight_file_size = info.file_size;
                         let kv = info.kv_cache_bytes(model.context, kv_bytes);
+                        // A single coarse estimate (full weights + KV) feeds only
+                        // the eviction heuristic and the dashboard — placement
+                        // itself is delegated to llama.cpp's -fit, which packs
+                        // each GPU to ground-truth sizes and spills the rest to
+                        // CPU. For a big MoE this over-states GPU use (experts
+                        // offload), which is the safe direction for eviction.
+                        let est = VramEstimate::compute(
+                            info.file_size,
+                            kv,
+                            info.n_layers,
+                            model.n_gpu_layers,
+                        );
+                        model.estimated_vram = est.total_vram;
                         if info.is_moe() {
-                            // MoE: dense + KV stay on GPU, experts split via
-                            // --n-cpu-moe. Auto-tune N to pack as many experts
-                            // into the preferred backend's free VRAM as fit,
-                            // unless the operator pinned n_cpu_moe.
-                            let reserved =
-                                self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-                            let backend =
-                                target_backends.first().copied().unwrap_or(Backend::Vulkan);
-                            let dense = info.dense_weight_bytes();
-                            let free: u64 = subtract_reserved_from_gpus(gpus.clone(), reserved)
-                                .iter()
-                                .filter(|g| !g.integrated && g.supports(backend))
-                                .map(|g| g.allocatable_vram())
-                                .sum();
-                            let n_cpu_moe = model.n_cpu_moe.unwrap_or_else(|| {
-                                auto_n_cpu_moe(
-                                    dense,
-                                    info.expert_weight_bytes,
-                                    kv,
-                                    info.n_layers,
-                                    free,
-                                )
-                                .unwrap_or(info.n_layers)
-                            });
-                            // Force all dense/attention onto the GPU; the CPU
-                            // experts are pinned via an *interleaved*
-                            // --override-tensor so VRAM fills evenly across GPUs
-                            // (not clustered like --n-cpu-moe). Applied to this
-                            // spawn only.
-                            model.n_gpu_layers = Some(99);
-                            model.n_cpu_moe = Some(n_cpu_moe);
-                            moe_n_layers = Some(info.n_layers);
-                            // Globally-spread override as a fallback; replaced
-                            // with a split-aligned one after placement below.
-                            model.override_tensor = crate::vram::estimator::moe_cpu_override_tensor(
-                                info.n_layers,
-                                n_cpu_moe,
-                            );
-                            let est = VramEstimate::compute_moe(
-                                dense,
-                                info.expert_weight_bytes,
-                                kv,
-                                info.n_layers,
-                                n_cpu_moe,
-                            );
-                            model.estimated_vram = est.total_vram;
                             info!(
                                 model = id,
-                                dense_gib = dense >> 30,
+                                dense_gib = info.dense_weight_bytes() >> 30,
                                 experts_gib = info.expert_weight_bytes >> 30,
                                 n_layers = info.n_layers,
-                                n_cpu_moe,
                                 est_gib = est.total_vram >> 30,
-                                override_tensor = ?model.override_tensor,
-                                "MoE offload plan (experts on CPU, interleaved across layers)"
+                                "MoE model; expert offload delegated to -fit"
                             );
-                        } else {
-                            let est = VramEstimate::compute(
-                                info.file_size,
-                                kv,
-                                info.n_layers,
-                                model.n_gpu_layers,
-                            );
-                            model.estimated_vram = est.total_vram;
                         }
                     }
                     Err(e) => {
@@ -908,28 +868,57 @@ impl Orchestrator {
                 }
             }
 
-            // Place the model on its backend's GPUs, evicting idle models and
-            // retrying once if it doesn't fit. `try_place` sets an explicit
-            // `--device` + aligned `--tensor-split` for auto-placed GGUF models.
-            // Reserved VRAM (concurrent in-flight loads whose weights haven't
-            // faulted in yet) is subtracted inside `try_place`.
+            // Delegate placement to llama.cpp's -fit: `try_place` hands the
+            // backend's eligible GPUs a `--device` list + per-device
+            // `--fit-target` margins. The coarse estimate only steers *eviction*
+            // — when it exceeds current GPU room we free idle models so -fit
+            // packs the new model into as much VRAM as possible, but the model
+            // loads either way (experts/overflow spill to CPU). We only error
+            // when no eligible GPU has any free VRAM at all. Reserved VRAM
+            // (concurrent in-flight loads) is subtracted inside `try_place`.
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-            match try_place(&mut model, &target_backends, &gpus, already_reserved) {
+            let caps = (gpu_cap_pct, display_cap_pct);
+            match try_place(&mut model, &target_backends, &gpus, already_reserved, caps) {
                 PlaceOutcome::Placed {
                     backend,
                     gpus_used,
+                    free,
                 } => {
+                    if free < model.estimated_vram {
+                        // Not enough free GPU to hold the whole model — evict
+                        // idle models to give -fit more room, then re-plan. The
+                        // load still proceeds if eviction frees nothing.
+                        let snapshot = self.data.lock().await.models.clone();
+                        let idle_models = self.process_manager.lock().await.idle_model_ids();
+                        for EvictionAction::Evict(victim) in
+                            decide_eviction(&snapshot, free, model.estimated_vram, &idle_models)
+                        {
+                            info!(victim = victim, "evicting to free GPU for -fit");
+                            self.record_event("info", format!("evicting {victim} to load {id}"))
+                                .await;
+                            if let Err(e) = self.stop_model_inner(&victim).await {
+                                warn!(model = victim, error = %e, "eviction stop failed");
+                            }
+                        }
+                        let gpus_after = self.vram_tracker.refresh();
+                        self.data.lock().await.gpus = gpus_after.clone();
+                        // Re-plan against the freed GPUs (fit-target margins now
+                        // reflect the extra room).
+                        try_place(&mut model, &target_backends, &gpus_after, already_reserved, caps);
+                    }
                     info!(
                         model = id,
                         ?backend,
                         gpus_used,
                         device = ?model.device,
-                        tensor_split = ?model.tensor_split,
-                        "auto-placed on backend devices"
+                        fit_target = ?model.fit_target,
+                        "auto-placed via -fit"
                     );
                 }
                 PlaceOutcome::Fits => {}
                 PlaceOutcome::DoesNotFit { free } => {
+                    // No eligible GPU has any free VRAM (or a pinned model is too
+                    // big). Evict idle models and retry once before giving up.
                     let snapshot = self.data.lock().await.models.clone();
                     let idle_models = self.process_manager.lock().await.idle_model_ids();
                     for EvictionAction::Evict(victim) in
@@ -945,7 +934,8 @@ impl Orchestrator {
                     // Re-read VRAM after eviction so placement sees freed space.
                     let gpus_after = self.vram_tracker.refresh();
                     self.data.lock().await.gpus = gpus_after.clone();
-                    match try_place(&mut model, &target_backends, &gpus_after, already_reserved) {
+                    match try_place(&mut model, &target_backends, &gpus_after, already_reserved, caps)
+                    {
                         PlaceOutcome::Placed { .. } | PlaceOutcome::Fits => {}
                         PlaceOutcome::DoesNotFit { free } => {
                             return Err(LoadError::InsufficientVram {
@@ -955,22 +945,6 @@ impl Orchestrator {
                             });
                         }
                     }
-                }
-            }
-
-            // Placement set the tensor-split; rebuild the MoE expert offload so
-            // each GPU's layer range gets its proportional share offloaded and
-            // VRAM fills to every GPU's cap evenly (not one capping out first).
-            if let (Some(nl), Some(ncpu), Some(ts)) = (
-                moe_n_layers,
-                model.n_cpu_moe,
-                model.tensor_split.as_deref(),
-            ) {
-                let fracs: Vec<f64> = ts.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-                let layers =
-                    crate::vram::estimator::boundary_aware_cpu_moe_layers(nl, ncpu, &fracs);
-                if let Some(ot) = crate::vram::estimator::cpu_moe_override_from_layers(&layers) {
-                    model.override_tensor = Some(ot);
                 }
             }
 
@@ -1121,16 +1095,22 @@ impl Orchestrator {
             // GPUs that have room *right now* (e.g. the GPUs the first instance
             // left free). No eviction — if nothing fits, reuse the busy instance.
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-            match try_place(&mut model, &target_backends, &gpus, already_reserved) {
+            let caps = {
+                let s = self.settings.lock().await;
+                (s.gpu_vram_cap_pct, s.display_gpu_vram_cap_pct)
+            };
+            match try_place(&mut model, &target_backends, &gpus, already_reserved, caps) {
                 PlaceOutcome::Placed {
                     backend,
                     gpus_used,
+                    ..
                 } => {
                     info!(
                         model = id,
                         ?backend,
                         gpus_used,
                         device = ?model.device,
+                        fit_target = ?model.fit_target,
                         "scaling out onto free backend devices"
                     );
                 }
@@ -1634,46 +1614,55 @@ fn resolve_targets(model: &ModelConfig, presets: &HashMap<String, BinaryPreset>)
 
 /// Result of attempting to place a model on the current GPUs.
 enum PlaceOutcome {
-    /// GGUF auto-placement succeeded; `model.device`/`tensor_split` were set.
-    Placed { backend: Backend, gpus_used: usize },
+    /// Auto-placed GGUF: `model.device` + `model.fit_target` were set for -fit.
+    /// `free` is the chosen backend's allocatable VRAM, so the caller can decide
+    /// whether to evict idle models for more room (placement succeeds either way
+    /// — -fit spills overflow to CPU).
+    Placed {
+        backend: Backend,
+        gpus_used: usize,
+        free: u64,
+    },
     /// Explicit-device or non-GGUF model that fits by total free VRAM.
     Fits,
-    /// Doesn't fit anywhere; `free` is the best-case free VRAM seen across the
-    /// model's target backends (for the error message).
+    /// No eligible GPU has any free VRAM (auto GGUF), or a pinned/non-GGUF model
+    /// exceeds free VRAM. `free` is the best-case free seen (for the message).
     DoesNotFit { free: u64 },
 }
 
 /// Decide where `model` runs on `gpus` (reserved VRAM subtracted inside).
 ///
 /// For an auto-placed GGUF model, walks `targets` in priority order and, on the
-/// first backend whose tagged GPUs hold the model, sets an explicit `--device`
-/// list + a `--tensor-split` aligned to it. Because the device list is explicit,
-/// placement is correct even when backends enumerate GPUs in different orders.
-/// Explicit-device and non-GGUF models keep their config and are only VRAM-checked.
+/// first backend with an eligible free-VRAM GPU, sets an explicit `--device`
+/// list + the `--fit-target` margins and clears any manual placement knobs —
+/// llama.cpp's `-fit` then packs the GPUs and offloads the remainder to CPU.
+/// Because the device list is explicit, placement is correct even when backends
+/// enumerate GPUs in different orders. Explicit-device and non-GGUF models keep
+/// their config and are only VRAM-checked.
 fn try_place(
     model: &mut ModelConfig,
     targets: &[Backend],
     gpus: &[GpuInfo],
     reserved: u64,
+    caps: (u8, u8),
 ) -> PlaceOutcome {
     let adjusted = subtract_reserved_from_gpus(gpus.to_vec(), reserved);
+    let (gpu_cap_pct, display_cap_pct) = caps;
 
     // Explicit pin or non-GGUF: trust the config, just check it fits.
     if model.weights_format != WeightsFormat::Gguf
         || configured_llama_device_value(model).is_some()
     {
         let eligible = model_visible_gpus(model, adjusted);
-        let free: u64 = eligible.iter().map(|g| g.allocatable_vram()).sum();
+        let free: u64 = eligible
+            .iter()
+            .map(|g| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
+            .sum();
         return if model.estimated_vram == 0 || free >= model.estimated_vram {
             PlaceOutcome::Fits
         } else {
             PlaceOutcome::DoesNotFit { free }
         };
-    }
-
-    // No estimate (gguf parse failed): can't plan; let the backend default place it.
-    if model.estimated_vram == 0 {
-        return PlaceOutcome::Fits;
     }
 
     let mut best_free = 0u64;
@@ -1683,16 +1672,26 @@ fn try_place(
             .filter(|g| !g.integrated && g.supports(backend))
             .cloned()
             .collect();
-        best_free = best_free.max(candidates.iter().map(|g| g.allocatable_vram()).sum());
-        if let Some(p) = plan_backend_split(backend, &candidates, model.estimated_vram) {
+        let free: u64 = candidates
+            .iter()
+            .map(|g| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
+            .sum();
+        best_free = best_free.max(free);
+        if let Some(p) =
+            plan_fit_placement(backend, &candidates, gpu_cap_pct, display_cap_pct)
+        {
             model.device = Some(p.device);
-            model.tensor_split = Some(p.tensor_split);
-            if p.gpus_used > 1 && model.split_mode.is_none() {
-                model.split_mode = Some(SplitMode::Layer);
-            }
+            model.fit_target = Some(p.fit_target);
+            // -fit owns -ngl / tensor-split / expert offload; clear any stale
+            // micromanagement so build_command_args doesn't fight it.
+            model.tensor_split = None;
+            model.n_gpu_layers = None;
+            model.n_cpu_moe = None;
+            model.override_tensor = None;
             return PlaceOutcome::Placed {
                 backend,
                 gpus_used: p.gpus_used,
+                free,
             };
         }
     }

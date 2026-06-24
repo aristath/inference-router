@@ -197,6 +197,14 @@ pub struct ModelConfig {
     /// persisted; set per-spawn by the placement logic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub override_tensor: Option<String>,
+    /// Computed at load time for auto-placed GGUF models: the `--fit-target`
+    /// margins (MiB to leave free per device, aligned to `device`) handed to
+    /// llama.cpp's `-fit`, which packs each GPU to ground-truth buffer sizes and
+    /// spills the rest to CPU. When set, the router emits `-fit on --fit-target`
+    /// and suppresses the manual `-ngl`/`--tensor-split`/`--n-cpu-moe` knobs.
+    /// Not persisted; set per-spawn by the placement logic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_target: Option<String>,
     #[serde(default)]
     pub mlock: bool,
     #[serde(default)]
@@ -326,6 +334,7 @@ impl Default for ModelConfig {
             n_gpu_layers: None,
             n_cpu_moe: None,
             override_tensor: None,
+            fit_target: None,
             mlock: false,
             no_mmap: false,
             parallel_slots: None,

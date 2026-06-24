@@ -417,6 +417,17 @@ pub fn build_command_args(
             } else {
                 "off".into()
             });
+            // Auto-placed GGUF: delegate placement to llama.cpp's `-fit`. It
+            // packs each device in `--device` to `free - fit_target[i]` (MiB)
+            // using ground-truth buffer sizes and spills the overflow to CPU, so
+            // the router passes no manual `-ngl`/`--tensor-split`/expert knobs
+            // (the placement logic clears them when it sets `fit_target`).
+            if let Some(ref ft) = model.fit_target {
+                args.push("-fit".into());
+                args.push("on".into());
+                args.push("--fit-target".into());
+                args.push(ft.clone());
+            }
             if let Some(n) = model.n_gpu_layers {
                 args.push("-ngl".into());
                 args.push(n.to_string());
@@ -452,7 +463,9 @@ pub fn build_command_args(
                 args.push("--cache-type-v".into());
                 args.push(v.as_arg().into());
             }
-            if let Some(mode) = model.split_mode {
+            // -fit owns layer/expert split; only honour an explicit split-mode
+            // when not delegating to it.
+            if let (Some(mode), None) = (model.split_mode, model.fit_target.as_ref()) {
                 args.push("--split-mode".into());
                 args.push(match mode {
                     SplitMode::None => "none".into(),
