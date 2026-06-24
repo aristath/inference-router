@@ -143,6 +143,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         parts.uri.path(),
         &outbound_body,
         &settings.loop_guards.streaming,
+        state.clone(),
+        model_id.clone(),
     ) {
         return session.into_response(guard).await;
     }
@@ -174,6 +176,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
+    // A non-streaming response is a single JSON document carrying the `timings`
+    // block — buffer it, fold the throughput into the model's average, then
+    // hand the buffered body back. Streaming (SSE) responses can't be buffered
+    // here; their stats are captured in the StreamSession tap instead.
+    let is_sse = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
+
     let mut resp_builder = Response::builder().status(status);
     for (name, value) in upstream.headers().iter() {
         let lower = name.as_str().to_ascii_lowercase();
@@ -186,6 +199,41 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         ) {
             resp_builder = resp_builder.header(hn, hv);
         }
+    }
+
+    if !is_sse {
+        let body_bytes = match upstream.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                error!(upstream = upstream_url, error = %e, "reading upstream body failed");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("upstream body error: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        if status == StatusCode::OK {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                if let Some((decode, prefill)) = crate::config::timings_from_json(&v) {
+                    state.record_perf(&model_id, decode, prefill);
+                }
+            }
+        }
+        // The whole response is materialized, so the request is complete here —
+        // the guard can drop.
+        drop(guard);
+        return match resp_builder.body(Body::from(body_bytes)) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "failed to build proxy response");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "proxy response build failed",
+                )
+                    .into_response()
+            }
+        };
     }
 
     // Wrap the byte stream so the guard stays alive until the body is fully

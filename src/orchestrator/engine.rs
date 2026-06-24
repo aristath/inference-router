@@ -1,6 +1,6 @@
 use crate::config::{
     AppSettings, Backend, BinaryPreset, ConfigError, GpuTagOverride, JsonStore, ModelAlias,
-    ModelConfig, ModelState, WeightsFormat, tag_overrides_by_pci,
+    ModelConfig, ModelPerf, ModelState, WeightsFormat, tag_overrides_by_pci,
 };
 use crate::orchestrator::allocation::plan_fit_placement;
 use crate::orchestrator::eviction::{EvictionAction, decide_eviction};
@@ -65,6 +65,10 @@ pub struct Orchestrator {
     /// every edit.
     pub gpu_tags_store: Option<Arc<JsonStore<Vec<GpuTagOverride>>>>,
     pub settings_store: Option<Arc<JsonStore<AppSettings>>>,
+    /// Per-model throughput averages (`model_perf.json`). `None` in
+    /// minimal/test constructors. Updated per request from the upstream
+    /// response `timings`; persisted by reconcile when `perf_dirty`.
+    pub perf_store: Option<Arc<JsonStore<HashMap<String, ModelPerf>>>>,
     pub dirty: Arc<AtomicBool>,
     /// Set when presets change so reconcile persists presets.json.
     pub presets_dirty: Arc<AtomicBool>,
@@ -72,6 +76,9 @@ pub struct Orchestrator {
     pub aliases_dirty: Arc<AtomicBool>,
     /// Set when app settings change so reconcile persists settings.json.
     pub settings_dirty: Arc<AtomicBool>,
+    /// Set when per-model perf averages change so reconcile persists
+    /// model_perf.json.
+    pub perf_dirty: Arc<AtomicBool>,
     pub server_port: u16,
     pub settings: Arc<Mutex<AppSettings>>,
     pub max_body_bytes: usize,
@@ -94,6 +101,7 @@ impl Orchestrator {
             aliases_store,
             None,
             None,
+            None,
             AppSettings::from_env(),
             server_port,
         )
@@ -105,6 +113,7 @@ impl Orchestrator {
         aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
         settings_store: Arc<JsonStore<AppSettings>>,
         gpu_tags_store: Arc<JsonStore<Vec<GpuTagOverride>>>,
+        perf_store: Arc<JsonStore<HashMap<String, ModelPerf>>>,
         server_port: u16,
     ) -> Self {
         let settings = settings_store.snapshot();
@@ -114,17 +123,20 @@ impl Orchestrator {
             aliases_store,
             Some(settings_store),
             Some(gpu_tags_store),
+            Some(perf_store),
             settings.sanitized(),
             server_port,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_inner(
         store: Arc<JsonStore<Vec<ModelConfig>>>,
         presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
         aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
         settings_store: Option<Arc<JsonStore<AppSettings>>>,
         gpu_tags_store: Option<Arc<JsonStore<Vec<GpuTagOverride>>>>,
+        perf_store: Option<Arc<JsonStore<HashMap<String, ModelPerf>>>>,
         settings: AppSettings,
         server_port: u16,
     ) -> Self {
@@ -198,10 +210,12 @@ impl Orchestrator {
             aliases_store,
             gpu_tags_store,
             settings_store,
+            perf_store,
             dirty: Arc::new(AtomicBool::new(migrated_any)),
             presets_dirty: Arc::new(AtomicBool::new(false)),
             aliases_dirty: Arc::new(AtomicBool::new(false)),
             settings_dirty: Arc::new(AtomicBool::new(false)),
+            perf_dirty: Arc::new(AtomicBool::new(false)),
             server_port,
             settings: Arc::new(Mutex::new(settings)),
             max_body_bytes,
@@ -248,6 +262,37 @@ impl Orchestrator {
 
     pub async fn model_runtimes(&self) -> HashMap<String, ModelRuntime> {
         self.process_manager.lock().await.model_runtimes()
+    }
+
+    /// Fold one request's decode/prefill tokens-per-second (from the upstream
+    /// `timings`) into the model's running average. Sync + cheap (a HashMap
+    /// update under a sync mutex); the disk write happens in reconcile.
+    pub fn record_perf(&self, model_id: &str, decode: f64, prefill: f64) {
+        let Some(store) = &self.perf_store else { return };
+        store.with_mut(|map| {
+            map.entry(model_id.to_string())
+                .or_default()
+                .record(decode, prefill);
+        });
+        self.perf_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Drop a model's accumulated averages — called when its config changes, so
+    /// stale timings don't blend with the new setup.
+    pub fn reset_perf(&self, model_id: &str) {
+        let Some(store) = &self.perf_store else { return };
+        let removed = store.with_mut(|map| map.remove(model_id).is_some());
+        if removed {
+            self.perf_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot of every model's persisted throughput averages.
+    pub fn perf_snapshot(&self) -> HashMap<String, ModelPerf> {
+        self.perf_store
+            .as_ref()
+            .map(|s| s.snapshot())
+            .unwrap_or_default()
     }
 
     pub async fn recent_events(&self) -> Vec<AppEvent> {
@@ -450,6 +495,7 @@ impl Orchestrator {
 
     pub async fn update_model(&self, new: ModelConfig) -> Result<(), MutationError> {
         let stop_after_update;
+        let config_changed;
         let id = new.id.clone();
         {
             let mut data = self.data.lock().await;
@@ -463,7 +509,11 @@ impl Orchestrator {
 
             let process_live =
                 existing.state == ModelState::Running || existing.state == ModelState::Loading;
-            stop_after_update = process_live && spawn_config_changed(existing, &new);
+            // Any change to how the model is spawned invalidates its recorded
+            // throughput — reset the perf average for it (whether or not it's
+            // currently running).
+            config_changed = spawn_config_changed(existing, &new);
+            stop_after_update = process_live && config_changed;
 
             // Preserve runtime fields if the model is currently running/loading —
             // we don't want the form to wipe state by accident.
@@ -491,6 +541,9 @@ impl Orchestrator {
             *existing = updated;
         }
         self.dirty.store(true, Ordering::Relaxed);
+        if config_changed {
+            self.reset_perf(&id);
+        }
         if stop_after_update {
             info!(
                 model = id,
@@ -1342,6 +1395,24 @@ impl Orchestrator {
                 }
             } else {
                 self.settings_dirty.store(false, Ordering::Relaxed);
+            }
+        }
+
+        if self.perf_dirty.swap(false, Ordering::Relaxed) {
+            if let Some(store) = self.perf_store.clone() {
+                // The store already holds the live in-memory averages (updated
+                // in-place by record_perf/reset_perf), so just flush to disk.
+                match tokio::task::spawn_blocking(move || store.save()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        error!(error = %e, "failed to persist model_perf.json");
+                        self.perf_dirty.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        error!(error = %e, "model_perf.json persistence task failed");
+                        self.perf_dirty.store(true, Ordering::Relaxed);
+                    }
+                }
             }
         }
     }
@@ -2542,8 +2613,11 @@ mod tests {
         let gpu_tags = Arc::new(JsonStore::<Vec<GpuTagOverride>>::new(
             tmp.path().join("gpus.json"),
         ));
+        let perf = Arc::new(JsonStore::<HashMap<String, ModelPerf>>::new(
+            tmp.path().join("model_perf.json"),
+        ));
         let o = Arc::new(Orchestrator::new_with_settings_store(
-            store, presets, aliases, settings, gpu_tags, 8080,
+            store, presets, aliases, settings, gpu_tags, perf, 8080,
         ));
 
         let mut next = o.settings().await;

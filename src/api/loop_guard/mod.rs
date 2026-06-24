@@ -44,6 +44,7 @@ use tokio::time::{interval_at, Instant};
 use tracing::{error, warn};
 
 use crate::config::{StreamingLoopAction, StreamingLoopSettings, ToolLoopSettings};
+use crate::orchestrator::engine::AppState;
 use crate::process::manager::RequestGuard;
 
 use self::detector::Detector;
@@ -113,9 +114,15 @@ pub(super) struct StreamSession {
     req_doc: Value,
     spec: EndpointKind,
     choices: HashMap<i64, ChoiceState>,
+    /// For folding the response `timings` into the model's throughput average.
+    state: AppState,
+    model_id: String,
+    /// One perf record per request — the timings ride in the final SSE event.
+    perf_recorded: bool,
 }
 
 impl StreamSession {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         client: reqwest::Client,
         method: reqwest::Method,
@@ -124,6 +131,8 @@ impl StreamSession {
         path: &str,
         body: &[u8],
         cfg: &StreamingLoopSettings,
+        state: AppState,
+        model_id: String,
     ) -> Option<Self> {
         let cfg = Config::from_settings(cfg);
         if !cfg.enabled {
@@ -147,7 +156,25 @@ impl StreamSession {
             req_doc,
             spec,
             choices: HashMap::new(),
+            state,
+            model_id,
+            perf_recorded: false,
         })
+    }
+
+    /// Fold this SSE event's `timings` (if any) into the model's running
+    /// throughput average. Only the final event carries timings, so this records
+    /// at most once per request.
+    fn note_timings(&mut self, payload: &[u8]) {
+        if self.perf_recorded {
+            return;
+        }
+        if let Ok(v) = serde_json::from_slice::<Value>(payload) {
+            if let Some((decode, prefill)) = crate::config::timings_from_json(&v) {
+                self.state.record_perf(&self.model_id, decode, prefill);
+                self.perf_recorded = true;
+            }
+        }
     }
 
     pub(super) async fn into_response(mut self, guard: RequestGuard) -> Response {
@@ -309,6 +336,7 @@ impl StreamSession {
                             for payload in parser.push(&chunk) {
                                 if !self.spec.is_done(&payload) {
                                     self.feed_detectors(&payload);
+                                    self.note_timings(&payload);
                                 }
                             }
                         }
@@ -319,6 +347,7 @@ impl StreamSession {
                             for payload in parser.finish() {
                                 if !self.spec.is_done(&payload) {
                                     self.feed_detectors(&payload);
+                                    self.note_timings(&payload);
                                 }
                             }
                             return Outcome::FinishedNaturally;

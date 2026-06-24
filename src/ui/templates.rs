@@ -211,6 +211,14 @@ pub struct ModelDisplay {
     pub active_requests: usize,
     /// Instances currently spawning, from the live runtime.
     pub pending_instances: usize,
+    /// Average decode (generation) tok/s over all requests since the model's
+    /// config last changed; "—" when none recorded. From `model_perf.json`.
+    pub decode_tps_str: String,
+    /// Average prefill (prompt) tok/s; "—" when none recorded.
+    pub prefill_tps_str: String,
+    /// True when at least one request has been recorded (drives whether the
+    /// dashboard shows the tok/s cell at all).
+    pub has_perf: bool,
 }
 
 impl ModelDisplay {
@@ -253,7 +261,23 @@ impl ModelDisplay {
             running_instances: 0,
             active_requests: 0,
             pending_instances: 0,
+            decode_tps_str: "—".into(),
+            prefill_tps_str: "—".into(),
+            has_perf: false,
         }
+    }
+
+    /// Overlays the persisted throughput averages onto a display built from
+    /// static config. `None` (or zero samples) leaves the "—" placeholders.
+    pub fn with_perf(mut self, perf: Option<&crate::config::ModelPerf>) -> Self {
+        if let Some(p) = perf {
+            if p.samples > 0 {
+                self.decode_tps_str = format!("{:.1}", p.decode);
+                self.prefill_tps_str = format!("{:.0}", p.prefill);
+                self.has_perf = true;
+            }
+        }
+        self
     }
 
     /// Overlays live runtime counters (running instances / active requests /

@@ -23,6 +23,7 @@
                 <th class="sortable{% if sort_key == "name" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="name" data-sort-type="text" aria-sort="{% if sort_key == "name" %}{{ sort_aria }}{% else %}none{% endif %}">Name</th>
                 <th class="sortable{% if sort_key == "context" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="context" data-sort-type="number" aria-sort="{% if sort_key == "context" %}{{ sort_aria }}{% else %}none{% endif %}">Context</th>
                 <th class="sortable{% if sort_key == "file-size" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="file-size" data-sort-type="number" aria-sort="{% if sort_key == "file-size" %}{{ sort_aria }}{% else %}none{% endif %}">File</th>
+                <th scope="col" title="Average decode / prefill tokens per second, since the model's settings last changed">tok/s</th>
                 <th class="sortable{% if sort_key == "actions" %} {{ sort_dir_class }}{% endif %}" scope="col" data-sort-key="actions" data-sort-type="text" aria-sort="{% if sort_key == "actions" %}{{ sort_aria }}{% else %}none{% endif %}">Actions</th>
             </tr>
         </thead>
@@ -49,6 +50,13 @@
                     <span class="model-muted">—</span>
                     {% else %}
                     {{ model.file_size_gib_str }} GiB
+                    {% endif %}
+                </td>
+                <td class="model-perf-cell">
+                    {% if model.has_perf %}
+                    <span title="decode {{ model.decode_tps_str }} tok/s · prefill {{ model.prefill_tps_str }} tok/s">{{ model.decode_tps_str }}<span class="model-muted"> · {{ model.prefill_tps_str }}</span></span>
+                    {% else %}
+                    <span class="model-muted">—</span>
                     {% endif %}
                 </td>
                 <td>

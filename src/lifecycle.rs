@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +14,9 @@ use crate::api::model_scan::{reconcile_models_folder, scan_models_folder};
 use crate::api::proxy;
 use crate::api::routes::*;
 use crate::api::state::get_app_state;
-use crate::config::{AppSettings, BinaryPreset, GpuTagOverride, JsonStore, ModelAlias, ModelConfig};
+use crate::config::{
+    AppSettings, BinaryPreset, GpuTagOverride, JsonStore, ModelAlias, ModelConfig, ModelPerf,
+};
 use crate::orchestrator::{AppState, Orchestrator};
 use crate::ui::templates::{
     sort_and_filter, DashboardFragmentTemplate, DashboardTemplate, EventDisplay, GpuDisplay,
@@ -68,6 +71,8 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     }
     let gpu_tags_store: Arc<JsonStore<Vec<GpuTagOverride>>> =
         Arc::new(JsonStore::new(config_dir.join("gpus.json")));
+    let perf_store: Arc<JsonStore<HashMap<String, ModelPerf>>> =
+        Arc::new(JsonStore::new(config_dir.join("model_perf.json")));
 
     let orchestrator = Arc::new(Orchestrator::new_with_settings_store(
         models_store.clone(),
@@ -75,6 +80,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         aliases_store.clone(),
         settings_store.clone(),
         gpu_tags_store.clone(),
+        perf_store.clone(),
         config.port,
     ));
 
@@ -223,12 +229,15 @@ async fn collect_live_data(state: &AppState, sort: &str, dir: &str, query: &str)
         (s.gpu_vram_cap_pct as u64, s.display_gpu_vram_cap_pct as u64)
     };
 
+    let perf = state.perf_snapshot();
     let has_any_models = !models.is_empty();
     let displays: Vec<ModelDisplay> = models
         .iter()
         .map(|m| {
             let rt = runtimes.get(&m.id).copied().unwrap_or_default();
-            ModelDisplay::from_model(m).with_runtime(rt.instances, rt.active, rt.pending)
+            ModelDisplay::from_model(m)
+                .with_runtime(rt.instances, rt.active, rt.pending)
+                .with_perf(perf.get(&m.id))
         })
         .collect();
 
