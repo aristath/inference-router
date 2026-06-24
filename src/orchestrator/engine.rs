@@ -731,6 +731,9 @@ impl Orchestrator {
         // inside the admission block during GGUF reads; used after the health
         // check to recompute estimated_vram from the measured KV bytes.
         let mut weight_file_size: u64 = 0;
+        // Set in the MoE estimate branch; used after placement to rebuild the
+        // expert-offload --override-tensor aligned to the chosen tensor-split.
+        let mut moe_n_layers: Option<u32> = None;
         let (mut pending, pid, port, vram_reservation) = {
             let _admit = self.admission.lock().await;
 
@@ -829,6 +832,9 @@ impl Orchestrator {
                             // spawn only.
                             model.n_gpu_layers = Some(99);
                             model.n_cpu_moe = Some(n_cpu_moe);
+                            moe_n_layers = Some(info.n_layers);
+                            // Globally-spread override as a fallback; replaced
+                            // with a split-aligned one after placement below.
                             model.override_tensor = crate::vram::estimator::moe_cpu_override_tensor(
                                 info.n_layers,
                                 n_cpu_moe,
@@ -949,6 +955,22 @@ impl Orchestrator {
                             });
                         }
                     }
+                }
+            }
+
+            // Placement set the tensor-split; rebuild the MoE expert offload so
+            // each GPU's layer range gets its proportional share offloaded and
+            // VRAM fills to every GPU's cap evenly (not one capping out first).
+            if let (Some(nl), Some(ncpu), Some(ts)) = (
+                moe_n_layers,
+                model.n_cpu_moe,
+                model.tensor_split.as_deref(),
+            ) {
+                let fracs: Vec<f64> = ts.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                let layers =
+                    crate::vram::estimator::boundary_aware_cpu_moe_layers(nl, ncpu, &fracs);
+                if let Some(ot) = crate::vram::estimator::cpu_moe_override_from_layers(&layers) {
+                    model.override_tensor = Some(ot);
                 }
             }
 

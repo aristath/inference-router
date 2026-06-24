@@ -64,10 +64,10 @@ pub struct GpuInfo {
 
 /// Fraction of a GPU's VRAM the router is willing to fill on a normal GPU.
 /// Overridable via `INFERENCE_ROUTER_GPU_VRAM_CAP_PCT`.
-const DEFAULT_VRAM_CAP_PCT: u64 = 95;
+const DEFAULT_VRAM_CAP_PCT: u64 = 98;
 /// Lower fill fraction for a GPU driving a monitor — leaves headroom for the
 /// desktop/compositor. Overridable via `INFERENCE_ROUTER_DISPLAY_VRAM_CAP_PCT`.
-const DISPLAY_VRAM_CAP_PCT: u64 = 75;
+const DISPLAY_VRAM_CAP_PCT: u64 = 80;
 
 impl GpuInfo {
     pub fn free_vram(&self) -> u64 {
@@ -1016,14 +1016,14 @@ mod tests {
             display_attached: false,
         };
         // 95% cap on a normal GPU.
-        assert_eq!(g.allocatable_vram(), 32 * gib * 95 / 100);
+        assert_eq!(g.allocatable_vram(), 32 * gib * 98 / 100);
         // Existing usage is subtracted.
         g.used_vram = 10 * gib;
-        assert_eq!(g.allocatable_vram(), 32 * gib * 95 / 100 - 10 * gib);
+        assert_eq!(g.allocatable_vram(), 32 * gib * 98 / 100 - 10 * gib);
         // Display GPU drops to the 75% cap.
         g.display_attached = true;
         g.used_vram = 0;
-        assert_eq!(g.allocatable_vram(), 32 * gib * 75 / 100);
+        assert_eq!(g.allocatable_vram(), 32 * gib * 80 / 100);
     }
 
     #[test]

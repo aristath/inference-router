@@ -86,10 +86,11 @@ impl VramEstimate {
         let frac = gpu_layer_fraction(n_layers, n_gpu_layers);
         let weight_vram = scale_bytes(file_size, frac);
         let kv_vram = scale_bytes(kv_cache_bytes, frac);
+        let total = (weight_vram + kv_vram).saturating_mul(11) / 10;
         Self {
             weight_vram,
             kv_cache_vram: kv_vram,
-            total_vram: with_overhead(weight_vram + kv_vram),
+            total_vram: total,
             cpu_kv_ram: kv_cache_bytes.saturating_sub(kv_vram),
         }
     }
@@ -113,10 +114,11 @@ impl VramEstimate {
         };
         let experts_on_gpu = scale_bytes(expert_bytes, gpu_expert_frac);
         let weight_vram = dense_bytes.saturating_add(experts_on_gpu);
+        let total = (weight_vram + kv_cache_bytes).saturating_mul(11) / 10;
         Self {
             weight_vram,
             kv_cache_vram: kv_cache_bytes,
-            total_vram: with_overhead(weight_vram + kv_cache_bytes),
+            total_vram: total,
             // CPU-resident experts are mmap'd weights (file-backed, reclaimable),
             // not anonymous RAM, so they don't count against the admission RAM.
             cpu_kv_ram: 0,
@@ -159,10 +161,56 @@ pub fn cpu_moe_layers(n_layers: u32, n_cpu: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Build the `--override-tensor` value pinning those layers' expert tensors to
-/// CPU: `blk\.(L1|L2|…)\.ffn_.*_exps=CPU`. `None` when nothing is offloaded.
-pub fn moe_cpu_override_tensor(n_layers: u32, n_cpu: u32) -> Option<String> {
-    let layers = cpu_moe_layers(n_layers, n_cpu);
+/// Boundary-aware version of [`cpu_moe_layers`]: given the per-GPU
+/// `--tensor-split` fractions (which determine each GPU's *contiguous* layer
+/// range under `--split-mode layer`), offload each GPU's *proportional share*
+/// of layers, spread within that GPU's range. Every GPU then keeps the same
+/// fraction of GPU-resident experts, so VRAM fills to each GPU's cap together
+/// instead of one capping out while others sit half-empty.
+pub fn boundary_aware_cpu_moe_layers(n_layers: u32, n_cpu: u32, split_fracs: &[f64]) -> Vec<u32> {
+    let n_cpu = n_cpu.min(n_layers);
+    if n_cpu == 0 || n_layers == 0 {
+        return Vec::new();
+    }
+    let total: f64 = split_fracs
+        .iter()
+        .filter(|f| f.is_finite())
+        .map(|f| f.max(0.0))
+        .sum();
+    if split_fracs.is_empty() || total <= 0.0 {
+        return cpu_moe_layers(n_layers, n_cpu); // no split info → global spread
+    }
+    let offload_frac = n_cpu as f64 / n_layers as f64;
+    let mut result = Vec::new();
+    let mut cum = 0.0f64;
+    let mut start = 0u32;
+    let last = split_fracs.len() - 1;
+    for (i, f) in split_fracs.iter().enumerate() {
+        cum += f.max(0.0);
+        let end = if i == last {
+            n_layers
+        } else {
+            (((cum / total) * n_layers as f64).round() as u32).clamp(start, n_layers)
+        };
+        let range = end.saturating_sub(start);
+        if range > 0 {
+            // Offload this GPU's proportional share, spread within [start, end).
+            let n_off = (offload_frac * range as f64).round() as u32;
+            for j in 0..n_off {
+                let layer = start + ((j as u64 * range as u64) / n_off.max(1) as u64) as u32;
+                result.push(layer.min(end - 1));
+            }
+        }
+        start = end;
+    }
+    result.sort_unstable();
+    result.dedup();
+    result
+}
+
+/// Build the `--override-tensor` value pinning these layers' expert tensors to
+/// CPU: `blk\.(L1|L2|…)\.ffn_.*_exps=CPU`. `None` for an empty layer set.
+pub fn cpu_moe_override_from_layers(layers: &[u32]) -> Option<String> {
     if layers.is_empty() {
         return None;
     }
@@ -175,16 +223,14 @@ pub fn moe_cpu_override_tensor(n_layers: u32, n_cpu: u32) -> Option<String> {
     Some(format!(r"blk\.({alt})\.ffn_.*_exps=CPU"))
 }
 
-fn scale_bytes(bytes: u64, fraction: f64) -> u64 {
-    (bytes as f64 * fraction.clamp(0.0, 1.0)).round() as u64
+/// Globally-spread `--override-tensor` (used as a fallback before the split is
+/// known). [`boundary_aware_cpu_moe_layers`] is preferred once it is.
+pub fn moe_cpu_override_tensor(n_layers: u32, n_cpu: u32) -> Option<String> {
+    cpu_moe_override_from_layers(&cpu_moe_layers(n_layers, n_cpu))
 }
 
-/// Runtime-overhead margin on the weight+KV total (compute buffers, allocator
-/// slack). Kept small (5%) because the per-GPU VRAM cap (95% / 75% on display
-/// GPUs) is now the real safety margin — a blanket 10% here on top of the cap
-/// left ~10 GiB of VRAM unused on a packed MoE model.
-fn with_overhead(bytes: u64) -> u64 {
-    bytes.saturating_mul(21) / 20
+fn scale_bytes(bytes: u64, fraction: f64) -> u64 {
+    (bytes as f64 * fraction.clamp(0.0, 1.0)).round() as u64
 }
 
 /// All the GGUF metadata fields the orchestrator + form UI care about.
@@ -1154,15 +1200,15 @@ mod tests {
         let kv = info.kv_cache_bytes(0, KvPerElement::FP16_BOTH);
         assert_eq!(kv, 0);
         let e = VramEstimate::compute(FILE_SIZE, kv, 32, None);
-        assert_eq!(e.total_vram, (FILE_SIZE * 21) / 20);
+        assert_eq!(e.total_vram, (FILE_SIZE * 11) / 10);
     }
 
     #[test]
-    fn overhead_is_five_percent() {
+    fn overhead_is_ten_percent() {
         let info = uniform_info(32, 32, 128, FILE_SIZE);
         let kv = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
         let e = VramEstimate::compute(FILE_SIZE, kv, 32, None);
-        assert_eq!(e.total_vram, (FILE_SIZE + kv) * 21 / 20);
+        assert_eq!(e.total_vram, (FILE_SIZE + kv) * 11 / 10);
     }
 
     #[test]
@@ -1174,10 +1220,10 @@ mod tests {
 
         // All experts on GPU → dense + experts + KV, ×1.1.
         let all_gpu = VramEstimate::compute_moe(dense, experts, kv, layers, 0);
-        assert_eq!(all_gpu.total_vram, (dense + experts + kv) * 21 / 20);
+        assert_eq!(all_gpu.total_vram, (dense + experts + kv) * 11 / 10);
         // All experts on CPU → only dense + KV count as VRAM (experts mmap'd).
         let all_cpu = VramEstimate::compute_moe(dense, experts, kv, layers, layers);
-        assert_eq!(all_cpu.total_vram, (dense + kv) * 21 / 20);
+        assert_eq!(all_cpu.total_vram, (dense + kv) * 11 / 10);
         assert_eq!(all_cpu.cpu_kv_ram, 0); // experts are file-backed, not anon RAM
         // More CPU-expert layers → less VRAM.
         let half = VramEstimate::compute_moe(dense, experts, kv, layers, 25);
@@ -1260,6 +1306,23 @@ mod tests {
     }
 
     #[test]
+    fn boundary_aware_offload_gives_each_gpu_its_proportional_share() {
+        // 4 GPUs, last one (index 3) gets a 2x bigger split → its layer range is
+        // bigger, so it must receive proportionally MORE offloaded layers.
+        let fracs = vec![0.2, 0.2, 0.2, 0.4];
+        let layers = boundary_aware_cpu_moe_layers(50, 25, &fracs); // offload ~half
+        assert!(!layers.is_empty());
+        assert!(layers.iter().all(|&l| l < 50));
+        // Count offloaded layers in the big GPU's range (last 40% ≈ layers 30..50).
+        let in_big = layers.iter().filter(|&&l| l >= 30).count();
+        let in_first = layers.iter().filter(|&&l| l < 10).count();
+        assert!(in_big > in_first, "big-split GPU should offload more: big={in_big} first={in_first}");
+        // Empty split → falls back to the global spread (non-empty).
+        assert!(!boundary_aware_cpu_moe_layers(50, 25, &[]).is_empty());
+        assert!(boundary_aware_cpu_moe_layers(50, 0, &fracs).is_empty());
+    }
+
+    #[test]
     fn moe_override_tensor_builds_anchored_regex() {
         let ot = moe_cpu_override_tensor(4, 2).unwrap();
         assert!(ot.ends_with("=CPU"));
@@ -1287,7 +1350,7 @@ mod tests {
         let partial = VramEstimate::compute(FILE_SIZE, kv, 51, Some(14));
 
         // Full offload is unchanged from the old behaviour.
-        assert_eq!(full.total_vram, (FILE_SIZE + kv) * 21 / 20);
+        assert_eq!(full.total_vram, (FILE_SIZE + kv) * 11 / 10);
         assert_eq!(full.cpu_kv_ram, 0);
 
         // Partial offload is far smaller and frees most of the KV to CPU RAM.
