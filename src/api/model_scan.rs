@@ -333,20 +333,16 @@ fn canonical_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Whether `path` lives inside the scan `root`. Purely lexical: it must keep
+/// working when the file — and its parent directory — have been deleted, which
+/// is exactly the "missing model" case. We compare against both the literal root
+/// and its canonical form, because the configured folder is commonly a symlink
+/// (`~/models -> /mnt/models/models`) while model paths are stored as the real
+/// target — so neither representation alone catches every model.
 fn path_appears_under_root(path: &Path, root: &Path) -> bool {
     let expanded_path = PathBuf::from(expand_tilde(&path.to_string_lossy()));
-    if expanded_path.starts_with(root) {
-        return true;
-    }
     let root_key = canonical_key(root);
-    if let Ok(parent) = expanded_path
-        .parent()
-        .unwrap_or(&expanded_path)
-        .canonicalize()
-    {
-        return parent.starts_with(root_key);
-    }
-    false
+    expanded_path.starts_with(root) || expanded_path.starts_with(&root_key)
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -428,6 +424,33 @@ mod tests {
         )];
         let newcomer = Path::new("/models/qwen3.5/9b/QWOPUS-Q8_K_XL/Qwopus3.5-9B.gguf");
         assert!(nearest_template(newcomer, &existing).is_none());
+    }
+
+    #[test]
+    fn missing_file_under_symlinked_root_still_appears_under_root() {
+        // Reproduces the real bug: the scan folder is a symlink (~/models ->
+        // /mnt/models/models) and a model's file (and its whole quant directory)
+        // has been deleted. The under-root check must still say "yes, this was in
+        // the folder" so it lands in the `missing` list.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real_models");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link_models");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Path stored as the real target, with its directory gone (never created).
+        let gone_real = real.join("Q8_0/model.gguf");
+        assert!(!gone_real.exists());
+        assert!(path_appears_under_root(&gone_real, &link));
+
+        // Path stored via the symlink form (how a scan-added model looks).
+        let gone_link = link.join("Q8_0/model.gguf");
+        assert!(path_appears_under_root(&gone_link, &link));
+
+        // A path in an unrelated tree is still correctly rejected.
+        let outside = tmp.path().join("elsewhere/model.gguf");
+        assert!(!path_appears_under_root(&outside, &link));
     }
 
     #[test]
