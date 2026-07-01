@@ -49,7 +49,7 @@ pub fn fit_binary_for_server(server: &Path) -> PathBuf {
 pub fn run_llama_fit_sizing(
     fit_binary: &Path,
     model: &ModelConfig,
-    draft: Option<&ModelConfig>,
+    _draft: Option<&ModelConfig>,
     device: &str,
     fit_target: &str,
 ) -> Result<LlamaFitSizing, LlamaFitError> {
@@ -57,14 +57,14 @@ pub fn run_llama_fit_sizing(
         return Err(LlamaFitError::MissingTool(fit_binary.to_path_buf()));
     }
 
-    let mut fit_args = base_args(model, draft, device);
+    let mut fit_args = base_args(model, device);
     fit_args.push("--fit-target".into());
     fit_args.push(fit_target.into());
 
     let fitted_stdout = run_fit_tool(fit_binary, &fit_args)?;
     let fitted = parse_fitted_args(&fitted_stdout)?;
 
-    let mut print_args = base_args(model, draft, device);
+    let mut print_args = base_args(model, device);
     apply_fitted_args(&mut print_args, &fitted);
     print_args.push("--fit-print".into());
     print_args.push("on".into());
@@ -78,7 +78,15 @@ pub fn run_llama_fit_sizing(
     })
 }
 
-fn base_args(model: &ModelConfig, draft: Option<&ModelConfig>, device: &str) -> Vec<String> {
+pub fn needs_server_owned_fit(model: &ModelConfig, draft: Option<&ModelConfig>) -> bool {
+    model.mmproj_path.is_some()
+        || draft.is_some()
+        || (draft.is_none()
+            && model.draft_model_id.is_none()
+            && model.mtp_tokens.filter(|n| *n > 0).is_some())
+}
+
+fn base_args(model: &ModelConfig, device: &str) -> Vec<String> {
     let mut args = vec![
         "-m".into(),
         model.model_path.to_string_lossy().into_owned(),
@@ -101,58 +109,6 @@ fn base_args(model: &ModelConfig, draft: Option<&ModelConfig>, device: &str) -> 
     if let Some(n) = model.parallel_slots {
         args.push("--parallel".into());
         args.push(n.to_string());
-    }
-    if let Some(ref path) = model.mmproj_path {
-        args.push("--mmproj".into());
-        args.push(path.to_string_lossy().into_owned());
-    }
-    if draft.is_none() && model.draft_model_id.is_none() {
-        if let Some(n) = model.mtp_tokens.filter(|n| *n > 0) {
-            args.push("--spec-type".into());
-            args.push("draft-mtp".into());
-            args.push("--spec-draft-n-max".into());
-            args.push(n.to_string());
-        }
-    }
-    if let Some(d) = draft {
-        args.push("-md".into());
-        args.push(d.model_path.to_string_lossy().into_owned());
-        if let Some(n) = d.n_gpu_layers {
-            args.push("-ngld".into());
-            args.push(n.to_string());
-        }
-        if let Some(ref dev) = d.device {
-            args.push("-devd".into());
-            args.push(dev.clone());
-        }
-        if let Some(k) = d.cache_type_k {
-            args.push("-ctkd".into());
-            args.push(k.as_arg().into());
-        }
-        if let Some(v) = d.cache_type_v {
-            args.push("-ctvd".into());
-            args.push(v.as_arg().into());
-        }
-        if let Some(n) = model.draft_max {
-            args.push("--spec-draft-n-max".into());
-            args.push(n.to_string());
-        }
-        if let Some(n) = model.draft_min {
-            args.push("--spec-draft-n-min".into());
-            args.push(n.to_string());
-        }
-        if let Some(p) = model.draft_p_min {
-            args.push("--spec-draft-p-min".into());
-            args.push(p.to_string());
-        }
-        if let Some(n) = model.ctx_checkpoints {
-            args.push("--ctx-checkpoints".into());
-            args.push(n.to_string());
-        }
-        if let Some(n) = model.checkpoint_every_n_tokens {
-            args.push("--checkpoint-every-n-tokens".into());
-            args.push(n.to_string());
-        }
     }
 
     args

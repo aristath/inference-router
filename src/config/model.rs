@@ -225,9 +225,9 @@ pub struct ModelConfig {
     // builder pulls the draft's `model_path` and `cache_type_{k,v}` to emit
     // `-md / -ctkd / -ctvd`. Placement stays router-owned. Spec-decode policy
     // (how hard this model drives the draft) lives here: `draft_max`,
-    // `draft_min`, `draft_p_min`, `ctx_checkpoints`,
-    // `checkpoint_every_n_tokens`. MTP speculative decoding uses the target
-    // model's own draft heads and is controlled by `mtp_tokens`.
+    // `draft_min`, `draft_p_min`, `ctx_checkpoints`, and
+    // `checkpoint_min_step`. MTP speculative decoding uses the target model's
+    // own draft heads and is controlled by `mtp_tokens`.
     /// Fitted at load time from the router's chosen GPU subset. Manual target
     /// device selection is ignored at the config/API boundary.
     #[serde(skip)]
@@ -257,7 +257,11 @@ pub struct ModelConfig {
     /// rollback works via snapshot/restore instead of seq_rm.
     #[serde(default)]
     pub ctx_checkpoints: Option<u32>,
-    /// `--checkpoint-every-n-tokens N`. Prefill-time checkpoint cadence.
+    /// `--checkpoint-min-step N`. Minimum spacing between checkpoints.
+    #[serde(default)]
+    pub checkpoint_min_step: Option<u32>,
+    /// Deprecated persisted field for the old checkpoint cadence flag. Kept
+    /// only so older configs deserialize; it is not emitted as structured argv.
     #[serde(default)]
     pub checkpoint_every_n_tokens: Option<i32>,
 
@@ -320,6 +324,7 @@ impl Default for ModelConfig {
             draft_min: None,
             draft_p_min: None,
             ctx_checkpoints: None,
+            checkpoint_min_step: None,
             checkpoint_every_n_tokens: None,
             state: ModelState::default(),
             pid: None,
@@ -488,6 +493,15 @@ impl ModelConfig {
                     if let Ok(n) = v.parse::<u32>() {
                         if self.ctx_checkpoints.is_none() {
                             self.ctx_checkpoints = Some(n);
+                            changed = true;
+                        }
+                        consumed = 2;
+                    }
+                }
+                ("--checkpoint-min-step" | "-cms", Some(v)) => {
+                    if let Ok(n) = v.parse::<u32>() {
+                        if self.checkpoint_min_step.is_none() {
+                            self.checkpoint_min_step = Some(n);
                             changed = true;
                         }
                         consumed = 2;

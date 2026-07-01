@@ -443,6 +443,10 @@ pub fn build_command_args(
                 args.push("--device".into());
                 args.push(dev.clone());
             }
+            if let Some(ref target) = model.fit_target {
+                args.push("--fit-target".into());
+                args.push(target.clone());
+            }
             if gguf_has_fitted_placement(model) {
                 args.push("--fit".into());
                 args.push("off".into());
@@ -516,8 +520,8 @@ pub fn build_command_args(
                     args.push("--ctx-checkpoints".into());
                     args.push(n.to_string());
                 }
-                if let Some(n) = model.checkpoint_every_n_tokens {
-                    args.push("--checkpoint-every-n-tokens".into());
+                if let Some(n) = model.checkpoint_min_step {
+                    args.push("--checkpoint-min-step".into());
                     args.push(n.to_string());
                 }
             }

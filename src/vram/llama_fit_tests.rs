@@ -14,7 +14,7 @@ fn parses_fitted_args_with_quoted_override_tensor() {
 }
 
 #[test]
-fn base_args_include_runtime_memory_affecting_options() {
+fn base_args_include_only_fit_tool_supported_memory_options() {
     let model = ModelConfig {
         model_path: "/models/target.gguf".into(),
         context: 8192,
@@ -35,15 +35,21 @@ fn base_args_include_runtime_memory_affecting_options() {
         cache_type_v: Some(CacheType::Q8_0),
         ..ModelConfig::default()
     };
-    let args = base_args(&model, Some(&draft), "Vulkan0,Vulkan1").join(" ");
-    assert!(args.contains("--mmproj /models/mmproj.gguf"), "{args}");
-    assert!(args.contains("-md /models/draft.gguf"), "{args}");
-    assert!(args.contains("-ngld 12"), "{args}");
-    assert!(args.contains("-devd Vulkan2"), "{args}");
-    assert!(args.contains("-ctkd q8_0"), "{args}");
-    assert!(args.contains("-ctvd q8_0"), "{args}");
-    assert!(args.contains("--spec-draft-n-max 16"), "{args}");
-    assert!(args.contains("--ctx-checkpoints 3"), "{args}");
+    let args = base_args(&model, "Vulkan0,Vulkan1").join(" ");
+    assert!(args.contains("-m /models/target.gguf"), "{args}");
+    assert!(args.contains("-c 8192"), "{args}");
+    assert!(args.contains("--device Vulkan0,Vulkan1"), "{args}");
+    assert!(!args.contains("--mmproj"), "{args}");
+    assert!(!args.contains("-md"), "{args}");
+    assert!(!args.contains("-ngld"), "{args}");
+    assert!(!args.contains("-devd"), "{args}");
+    assert!(!args.contains("-ctkd"), "{args}");
+    assert!(!args.contains("-ctvd"), "{args}");
+    assert!(!args.contains("--spec-draft-n-max"), "{args}");
+    assert!(!args.contains("--ctx-checkpoints"), "{args}");
+    assert!(!args.contains("--checkpoint-every-n-tokens"), "{args}");
+
+    assert!(needs_server_owned_fit(&model, Some(&draft)));
 }
 
 #[test]

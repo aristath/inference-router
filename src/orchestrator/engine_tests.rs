@@ -112,6 +112,7 @@ fn spill_candidate(gpus_used: usize, device_vram: u64) -> FitCandidate {
     FitCandidate {
         backend: Backend::Vulkan,
         device: format!("Vulkan{}", gpus_used - 1),
+        fit_target: "1024".into(),
         free: device_vram,
         gpus_used,
         sizing: fit_sizing(
@@ -149,6 +150,20 @@ fn spill_candidate_prefers_more_gpus_before_more_vram() {
 fn scale_out_rejects_cpu_spill_placement() {
     assert!(scale_out_accepts_placement(true));
     assert!(!scale_out_accepts_placement(false));
+}
+
+#[test]
+fn server_owned_fit_keeps_device_and_target_without_fixed_placement() {
+    let sizing = fit_sizing(Some(-1), Some(r"blk\.(12|13)\.ffn_.*_exps=CPU"), 123);
+    let mut m = model("a");
+    apply_fit_selection(&mut m, "Vulkan0,Vulkan1", "1024,2048", &sizing, true);
+
+    assert_eq!(m.device.as_deref(), Some("Vulkan0,Vulkan1"));
+    assert_eq!(m.fit_target.as_deref(), Some("1024,2048"));
+    assert_eq!(m.estimated_vram, 123);
+    assert_eq!(m.n_gpu_layers, None);
+    assert_eq!(m.tensor_split, None);
+    assert_eq!(m.override_tensor, None);
 }
 
 #[test]

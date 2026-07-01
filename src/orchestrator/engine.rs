@@ -7,7 +7,9 @@ use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
 use crate::system::stats::{SystemStats, SystemTracker};
 use crate::vram::estimator::GgufMeta;
-use crate::vram::llama_fit::{apply_sizing_to_model, fit_binary_for_server, run_llama_fit_sizing};
+use crate::vram::llama_fit::{
+    apply_sizing_to_model, fit_binary_for_server, needs_server_owned_fit, run_llama_fit_sizing,
+};
 use crate::vram::tracker::{GpuInfo, VRAMTracker};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1602,6 +1604,7 @@ fn spawn_config_changed(old: &ModelConfig, new: &ModelConfig) -> bool {
         || old.draft_min != new.draft_min
         || old.draft_p_min != new.draft_p_min
         || old.ctx_checkpoints != new.ctx_checkpoints
+        || old.checkpoint_min_step != new.checkpoint_min_step
         || old.checkpoint_every_n_tokens != new.checkpoint_every_n_tokens
 }
 
@@ -1674,6 +1677,7 @@ fn place_model(
 struct FitCandidate {
     backend: Backend,
     device: String,
+    fit_target: String,
     free: u64,
     gpus_used: usize,
     sizing: crate::vram::llama_fit::LlamaFitSizing,
@@ -1708,13 +1712,18 @@ fn place_gguf_with_llama_fit(
             .join(",");
         let sizing = run_llama_fit_sizing(&fit_binary, model, draft, &device, &fit_target)?;
         let fully_on_gpu = fitted_fully_on_gpu(&sizing, n_layers);
-        apply_sizing_to_model(model, &sizing);
-        model.device = Some(device);
+        apply_fit_selection(
+            model,
+            &device,
+            &fit_target,
+            &sizing,
+            needs_server_owned_fit(model, draft),
+        );
         return Ok(PlaceOutcome::Placed {
             backend: targets.first().copied().unwrap_or(Backend::Vulkan),
             gpus_used: eligible.len(),
             free,
-            fully_on_gpu,
+            fully_on_gpu: fully_on_gpu && !needs_server_owned_fit(model, draft),
         });
     }
 
@@ -1765,17 +1774,23 @@ fn place_gguf_with_llama_fit(
                     let candidate = FitCandidate {
                         backend,
                         device,
+                        fit_target,
                         free,
                         gpus_used: chosen.len(),
                         sizing,
                     };
                     if fitted_fully_on_gpu(&candidate.sizing, n_layers) {
-                        apply_fit_candidate(model, &candidate);
+                        apply_fit_candidate(
+                            model,
+                            &candidate,
+                            &candidate.fit_target,
+                            needs_server_owned_fit(model, draft),
+                        );
                         return Ok(PlaceOutcome::Placed {
                             backend: candidate.backend,
                             gpus_used: candidate.gpus_used,
                             free: candidate.free,
-                            fully_on_gpu: true,
+                            fully_on_gpu: !needs_server_owned_fit(model, draft),
                         });
                     }
                     keep_best_spill_candidate(&mut spill, candidate);
@@ -1785,7 +1800,12 @@ fn place_gguf_with_llama_fit(
         }
 
         if let Some(candidate) = spill {
-            apply_fit_candidate(model, &candidate);
+            apply_fit_candidate(
+                model,
+                &candidate,
+                &candidate.fit_target,
+                needs_server_owned_fit(model, draft),
+            );
             return Ok(PlaceOutcome::Placed {
                 backend: candidate.backend,
                 gpus_used: candidate.gpus_used,
@@ -1802,9 +1822,39 @@ fn place_gguf_with_llama_fit(
     }
 }
 
-fn apply_fit_candidate(model: &mut ModelConfig, candidate: &FitCandidate) {
-    apply_sizing_to_model(model, &candidate.sizing);
-    model.device = Some(candidate.device.clone());
+fn apply_fit_candidate(
+    model: &mut ModelConfig,
+    candidate: &FitCandidate,
+    fit_target: &str,
+    server_owned_fit: bool,
+) {
+    apply_fit_selection(
+        model,
+        &candidate.device,
+        fit_target,
+        &candidate.sizing,
+        server_owned_fit,
+    );
+}
+
+fn apply_fit_selection(
+    model: &mut ModelConfig,
+    device: &str,
+    fit_target: &str,
+    sizing: &crate::vram::llama_fit::LlamaFitSizing,
+    server_owned_fit: bool,
+) {
+    model.device = Some(device.to_string());
+    if server_owned_fit {
+        model.context = sizing.fitted.context.unwrap_or(model.context);
+        model.estimated_vram = sizing.device_vram;
+        model.n_gpu_layers = None;
+        model.tensor_split = None;
+        model.override_tensor = None;
+        model.fit_target = Some(fit_target.to_string());
+    } else {
+        apply_sizing_to_model(model, sizing);
+    }
 }
 
 fn scale_out_accepts_placement(fully_on_gpu: bool) -> bool {

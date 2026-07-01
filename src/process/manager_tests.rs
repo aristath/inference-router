@@ -370,7 +370,7 @@ fn spec_decode_argv_emits_full_draft_and_policy_flags() {
     t.draft_min = Some(1);
     t.draft_p_min = Some(0.75);
     t.ctx_checkpoints = Some(4);
-    t.checkpoint_every_n_tokens = Some(-1);
+    t.checkpoint_min_step = Some(0);
     let d = draft_model();
     let args = build_command_args(&t, Some(&d), 9001);
     assert_eq!(find_flag(&args, "-md"), Some("/models/draft.gguf"));
@@ -382,7 +382,8 @@ fn spec_decode_argv_emits_full_draft_and_policy_flags() {
     assert_eq!(find_flag(&args, "--spec-draft-n-min"), Some("1"));
     assert_eq!(find_flag(&args, "--spec-draft-p-min"), Some("0.75"));
     assert_eq!(find_flag(&args, "--ctx-checkpoints"), Some("4"));
-    assert_eq!(find_flag(&args, "--checkpoint-every-n-tokens"), Some("-1"));
+    assert_eq!(find_flag(&args, "--checkpoint-min-step"), Some("0"));
+    assert_eq!(find_flag(&args, "--checkpoint-every-n-tokens"), None);
 }
 
 #[test]
@@ -410,6 +411,26 @@ fn spec_decode_argv_omits_unset_policy_flags() {
     assert!(!joined.contains("--spec-draft-p-min"), "{joined}");
     assert!(!joined.contains("--ctx-checkpoints"), "{joined}");
     assert!(!joined.contains("--checkpoint-every-n-tokens"), "{joined}");
+}
+
+#[test]
+fn gguf_argv_emits_fit_target_without_disabling_server_fit() {
+    let mut m = gguf_model();
+    m.device = Some("Vulkan0,Vulkan1".into());
+    m.fit_target = Some("1024,2048".into());
+    let args = build_command_args(&m, None, 9001);
+    assert_eq!(find_flag(&args, "--device"), Some("Vulkan0,Vulkan1"));
+    assert_eq!(find_flag(&args, "--fit-target"), Some("1024,2048"));
+    assert_eq!(find_flag(&args, "--fit"), None);
+}
+
+#[test]
+fn legacy_checkpoint_every_n_tokens_is_not_emitted_as_structured_arg() {
+    let mut t = gguf_model();
+    t.draft_model_id = Some("draft".into());
+    t.checkpoint_every_n_tokens = Some(-1);
+    let args = build_command_args(&t, Some(&draft_model()), 9001);
+    assert_eq!(find_flag(&args, "--checkpoint-every-n-tokens"), None);
 }
 
 #[test]

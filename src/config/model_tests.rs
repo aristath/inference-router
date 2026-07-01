@@ -101,6 +101,7 @@ fn runtime_fields_default_when_absent() {
     assert_eq!(parsed.draft_min, None);
     assert_eq!(parsed.draft_p_min, None);
     assert_eq!(parsed.ctx_checkpoints, None);
+    assert_eq!(parsed.checkpoint_min_step, None);
     assert_eq!(parsed.checkpoint_every_n_tokens, None);
 }
 
@@ -394,8 +395,8 @@ fn migrate_extracts_spec_decode_policy_flags() {
         "0.75".into(),
         "--ctx-checkpoints".into(),
         "4".into(),
-        "--checkpoint-every-n-tokens".into(),
-        "-1".into(),
+        "--checkpoint-min-step".into(),
+        "0".into(),
     ];
     let original_extra_args = m.extra_args.clone();
     assert!(m.migrate_extra_args());
@@ -403,6 +404,17 @@ fn migrate_extracts_spec_decode_policy_flags() {
     assert_eq!(m.draft_min, Some(1));
     assert_eq!(m.draft_p_min, Some(0.75));
     assert_eq!(m.ctx_checkpoints, Some(4));
+    assert_eq!(m.checkpoint_min_step, Some(0));
+    assert_eq!(m.checkpoint_every_n_tokens, None);
+    assert_eq!(m.extra_args, original_extra_args);
+}
+
+#[test]
+fn migrate_preserves_legacy_checkpoint_every_n_tokens_without_current_emission() {
+    let mut m = bare();
+    m.extra_args = vec!["--checkpoint-every-n-tokens".into(), "-1".into()];
+    let original_extra_args = m.extra_args.clone();
+    assert!(m.migrate_extra_args());
     assert_eq!(m.checkpoint_every_n_tokens, Some(-1));
     assert_eq!(m.extra_args, original_extra_args);
 }
