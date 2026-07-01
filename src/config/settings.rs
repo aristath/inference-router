@@ -20,6 +20,8 @@ pub struct AppSettings {
     /// Same, but for a GPU driving a monitor — lower, to leave headroom for the
     /// desktop/compositor. 1..=100.
     pub display_gpu_vram_cap_pct: u8,
+    /// Watchdog / self-heal configuration for wedged inference instances.
+    pub watchdog: WatchdogSettings,
 }
 
 impl Default for AppSettings {
@@ -30,6 +32,7 @@ impl Default for AppSettings {
             model_exposure: ModelExposure::default(),
             gpu_vram_cap_pct: 98,
             display_gpu_vram_cap_pct: 80,
+            watchdog: WatchdogSettings::default(),
         }
     }
 }
@@ -46,6 +49,7 @@ impl AppSettings {
             gpu_vram_cap_pct: env_pct("INFERENCE_ROUTER_GPU_VRAM_CAP_PCT").unwrap_or(98),
             display_gpu_vram_cap_pct: env_pct("INFERENCE_ROUTER_DISPLAY_VRAM_CAP_PCT")
                 .unwrap_or(80),
+            watchdog: WatchdogSettings::from_env(),
         }
     }
 
@@ -56,7 +60,144 @@ impl AppSettings {
         self.gpu_vram_cap_pct = self.gpu_vram_cap_pct.clamp(1, 100);
         self.display_gpu_vram_cap_pct = self.display_gpu_vram_cap_pct.clamp(1, 100);
         self.loop_guards.sanitize();
+        self.watchdog.sanitize();
         self
+    }
+}
+
+/// Self-heal configuration for wedged inference-server instances.
+///
+/// A GPU compute-engine hang (e.g. Intel `xe` CCS engine reset on Battlemage)
+/// leaves a llama.cpp process *alive* — its `/health` still returns `ok` — but
+/// unable to decode: one thread busy-spins, the GPU is idle, and every request
+/// is accepted and then silently stalls until the client gives up. None of the
+/// pre-existing liveness checks (`kill -0`, spawn-time `/health`) catch this.
+///
+/// Three independent, layered mechanisms recover from it:
+/// 1. **Engine-reset watchdog** — watches the kernel's DRM `devcoredump` node
+///    (created on every engine reset) and recycles GPU-backed instances within
+///    seconds. Fast path.
+/// 2. **Liveness probe** — periodically probes each instance on a path a wedged
+///    server fails to answer (`/slots`) and recycles after repeated timeouts.
+/// 3. **Idle timeout** — a long backstop (`read_timeout` on the proxy client):
+///    if a forwarded request produces no bytes for this long, it is aborted and
+///    the instance recycled. Only fires for wedges the first two miss.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WatchdogSettings {
+    /// Master switch for all self-heal behaviour.
+    pub enabled: bool,
+    /// Backstop: seconds a proxied request may produce no bytes before it is
+    /// aborted and its instance recycled. Long by design — the watchdog and
+    /// liveness probe handle the common cases far sooner. 0 disables the
+    /// idle backstop.
+    pub idle_timeout_secs: u64,
+    /// Enable the DRM `devcoredump` engine-reset watchdog.
+    pub engine_reset_watch: bool,
+    /// How often (seconds) to scan for a new `devcoredump`.
+    pub engine_reset_poll_secs: u64,
+    /// Directory `/sys/class/drm` is scanned under for `card*/device/devcoredump`.
+    /// Overridable so tests / non-standard mounts can point elsewhere.
+    pub drm_root: String,
+    /// Where to copy each captured `devcoredump` for later analysis. Reading the
+    /// node also releases it, clearing the kernel's pending report. Empty = don't
+    /// capture (the report is left in place for manual inspection).
+    pub devcoredump_capture_dir: String,
+    /// Enable the periodic per-instance liveness probe.
+    pub liveness_enabled: bool,
+    /// HTTP path probed on each instance. Must be a path a healthy server answers
+    /// quickly but a wedged one stalls on. `/slots` fits (a wedged llama.cpp
+    /// still answers `/health` but hangs `/slots`).
+    pub liveness_probe_path: String,
+    /// Seconds between liveness probe sweeps.
+    pub liveness_interval_secs: u64,
+    /// Per-probe timeout (seconds). A probe that doesn't answer in this long
+    /// counts as one failure.
+    pub liveness_timeout_secs: u64,
+    /// Consecutive probe failures before an instance is recycled.
+    pub liveness_failures_to_recycle: u32,
+    /// Optional webhook POSTed a small JSON `{"text": "..."}` whenever an
+    /// instance is auto-recycled, so a recovery is never silent. Empty = off.
+    pub notify_webhook_url: String,
+}
+
+impl Default for WatchdogSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_timeout_secs: 900,
+            engine_reset_watch: true,
+            engine_reset_poll_secs: 3,
+            drm_root: "/sys/class/drm".into(),
+            devcoredump_capture_dir: "~/gpu-hangs".into(),
+            liveness_enabled: true,
+            liveness_probe_path: "/slots".into(),
+            liveness_interval_secs: 30,
+            liveness_timeout_secs: 10,
+            liveness_failures_to_recycle: 3,
+            notify_webhook_url: String::new(),
+        }
+    }
+}
+
+impl WatchdogSettings {
+    pub fn sanitize(&mut self) {
+        if self.drm_root.trim().is_empty() {
+            self.drm_root = "/sys/class/drm".into();
+        }
+        if self.liveness_probe_path.trim().is_empty() {
+            self.liveness_probe_path = "/slots".into();
+        }
+        self.engine_reset_poll_secs = self.engine_reset_poll_secs.max(1);
+        self.liveness_interval_secs = self.liveness_interval_secs.max(1);
+        self.liveness_timeout_secs = self.liveness_timeout_secs.max(1);
+        self.liveness_failures_to_recycle = self.liveness_failures_to_recycle.max(1);
+    }
+
+    fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Some(v) = env_bool("INFERENCE_ROUTER_WATCHDOG_ENABLED") {
+            cfg.enabled = v;
+        }
+        if let Some(v) = env_u64("INFERENCE_ROUTER_IDLE_TIMEOUT_SECS") {
+            cfg.idle_timeout_secs = v;
+        }
+        if let Some(v) = env_bool("INFERENCE_ROUTER_ENGINE_RESET_WATCH") {
+            cfg.engine_reset_watch = v;
+        }
+        if let Some(v) = env_u64("INFERENCE_ROUTER_ENGINE_RESET_POLL_SECS") {
+            cfg.engine_reset_poll_secs = v;
+        }
+        if let Ok(v) = std::env::var("INFERENCE_ROUTER_DRM_ROOT") {
+            if !v.trim().is_empty() {
+                cfg.drm_root = v;
+            }
+        }
+        if let Ok(v) = std::env::var("INFERENCE_ROUTER_DEVCOREDUMP_CAPTURE_DIR") {
+            cfg.devcoredump_capture_dir = v;
+        }
+        if let Some(v) = env_bool("INFERENCE_ROUTER_LIVENESS_ENABLED") {
+            cfg.liveness_enabled = v;
+        }
+        if let Ok(v) = std::env::var("INFERENCE_ROUTER_LIVENESS_PROBE_PATH") {
+            if !v.trim().is_empty() {
+                cfg.liveness_probe_path = v;
+            }
+        }
+        if let Some(v) = env_u64("INFERENCE_ROUTER_LIVENESS_INTERVAL_SECS") {
+            cfg.liveness_interval_secs = v;
+        }
+        if let Some(v) = env_u64("INFERENCE_ROUTER_LIVENESS_TIMEOUT_SECS") {
+            cfg.liveness_timeout_secs = v;
+        }
+        if let Some(v) = env_usize("INFERENCE_ROUTER_LIVENESS_FAILURES") {
+            cfg.liveness_failures_to_recycle = v as u32;
+        }
+        if let Ok(v) = std::env::var("INFERENCE_ROUTER_NOTIFY_WEBHOOK_URL") {
+            cfg.notify_webhook_url = v;
+        }
+        cfg.sanitize();
+        cfg
     }
 }
 

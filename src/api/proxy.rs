@@ -44,6 +44,21 @@ impl<S: Stream + Unpin> Stream for GuardedStream<S> {
     }
 }
 
+/// Loud, actionable error returned when an instance was found unresponsive and
+/// recycled, so the client shows "restarting, retry" instead of hanging or a
+/// generic gateway error.
+fn unresponsive_response(model_id: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": format!("model '{model_id}' was unresponsive and is being restarted; please retry"),
+            "model": model_id,
+            "retry": true,
+        })),
+    )
+        .into_response()
+}
+
 /// Byte-level passthrough handler for `/v1/*`. Peeks `model` from the JSON
 /// body, calls `ensure_loaded`, then proxies request/response unchanged.
 pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
@@ -126,11 +141,30 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         .unwrap_or("/");
     let upstream_url = format!("http://127.0.0.1:{}{}", port, path_and_query);
 
-    let client = reqwest::Client::new();
+    let settings = state.settings().await;
+
+    // Idle-timeout backstop: `read_timeout` fires when the upstream produces no
+    // bytes (no response headers, or no further stream chunk) for this long — the
+    // signature of a wedged instance. Long by design; the watchdog and liveness
+    // probe catch the common cases far sooner. The same client is cloned into the
+    // streaming path, so both non-streaming and SSE inherit the backstop.
+    let idle_timeout = settings
+        .watchdog
+        .enabled
+        .then_some(settings.watchdog.idle_timeout_secs)
+        .filter(|s| *s > 0)
+        .map(std::time::Duration::from_secs);
+    let client = {
+        let mut b = reqwest::Client::builder();
+        if let Some(d) = idle_timeout {
+            b = b.read_timeout(d);
+        }
+        b.build().unwrap_or_else(|_| reqwest::Client::new())
+    };
+
     let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
 
-    let settings = state.settings().await;
     let outbound_body =
         loop_guard::guard_request(parts.uri.path(), &body_bytes, &settings.loop_guards.tool)
             .unwrap_or_else(|| body_bytes.to_vec());
@@ -163,6 +197,18 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
 
     let upstream = match builder.send().await {
         Ok(r) => r,
+        Err(e) if e.is_timeout() => {
+            warn!(
+                upstream = upstream_url,
+                "no response before idle timeout; recycling wedged instance"
+            );
+            let pid = guard.pid;
+            drop(guard);
+            state
+                .recycle_instance(pid, "idle timeout before response headers")
+                .await;
+            return unresponsive_response(&model_id);
+        }
         Err(e) => {
             error!(upstream = upstream_url, error = %e, "upstream request failed");
             return (
@@ -204,6 +250,18 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     if !is_sse {
         let body_bytes = match upstream.bytes().await {
             Ok(b) => b,
+            Err(e) if e.is_timeout() => {
+                warn!(
+                    upstream = upstream_url,
+                    "stalled mid-body before idle timeout; recycling wedged instance"
+                );
+                let pid = guard.pid;
+                drop(guard);
+                state
+                    .recycle_instance(pid, "idle timeout mid-response")
+                    .await;
+                return unresponsive_response(&model_id);
+            }
             Err(e) => {
                 error!(upstream = upstream_url, error = %e, "reading upstream body failed");
                 return (

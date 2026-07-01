@@ -117,6 +117,10 @@ pub(super) struct StreamSession {
     /// For folding the response `timings` into the model's throughput average.
     state: AppState,
     model_id: String,
+    /// PID of the instance serving this request, so a mid-stream stall (idle
+    /// timeout) can recycle exactly that process. Set in `into_response` from
+    /// the request guard.
+    pid: i32,
     /// One perf record per request — the timings ride in the final SSE event.
     perf_recorded: bool,
 }
@@ -158,6 +162,7 @@ impl StreamSession {
             choices: HashMap::new(),
             state,
             model_id,
+            pid: 0,
             perf_recorded: false,
         })
     }
@@ -178,8 +183,29 @@ impl StreamSession {
     }
 
     pub(super) async fn into_response(mut self, guard: RequestGuard) -> Response {
+        self.pid = guard.pid;
         let first = match self.send_upstream().await {
             Ok(response) => response,
+            Err(e) if e.is_timeout() => {
+                warn!(
+                    upstream = self.upstream_url,
+                    "no response before idle timeout; recycling wedged instance"
+                );
+                let pid = guard.pid;
+                drop(guard);
+                self.state
+                    .recycle_instance(pid, "idle timeout before response headers")
+                    .await;
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({
+                        "error": format!("model '{}' was unresponsive and is being restarted; please retry", self.model_id),
+                        "model": self.model_id,
+                        "retry": true,
+                    })),
+                )
+                    .into_response();
+            }
             Err(e) => {
                 error!(upstream = self.upstream_url, error = %e, "upstream request failed");
                 return (
@@ -237,6 +263,21 @@ impl StreamSession {
             match self.attempt_once(upstream, &tx).await {
                 Outcome::FinishedNaturally => return,
                 Outcome::ClientDisconnected => return,
+                Outcome::IdleTimeout => {
+                    warn!(
+                        endpoint = self.spec.name(),
+                        attempt, "stream stalled past idle timeout; recycling wedged instance",
+                    );
+                    self.state
+                        .recycle_instance(self.pid, "idle timeout mid-stream")
+                        .await;
+                    self.write_stream_error(
+                        &tx,
+                        "model was unresponsive and is being restarted; please retry",
+                    )
+                    .await;
+                    return;
+                }
                 Outcome::UpstreamError(e) => {
                     error!(
                         endpoint = self.spec.name(),
@@ -341,6 +382,12 @@ impl StreamSession {
                             }
                         }
                         Some(Err(e)) => {
+                            // A read timeout mid-stream is the idle-timeout
+                            // backstop firing on a wedged instance; other errors
+                            // are ordinary upstream failures.
+                            if e.is_timeout() {
+                                return Outcome::IdleTimeout;
+                            }
                             return Outcome::UpstreamError(e.to_string());
                         }
                         None => {
@@ -458,11 +505,25 @@ impl StreamSession {
         let out = self.spec.format_halt_delta(attempts, period);
         let _ = tx.send(Ok(Bytes::from(out))).await;
     }
+
+    /// Emit a terminal SSE error event followed by `[DONE]` so a client whose
+    /// stream we're aborting (wedged instance recycled) sees a clear error and
+    /// stops waiting, rather than the connection just going quiet.
+    async fn write_stream_error(&self, tx: &mpsc::Sender<Result<Bytes, io::Error>>, msg: &str) {
+        let payload = json!({
+            "error": { "message": msg, "type": "router_recycle", "model": self.model_id },
+        });
+        let out = format!("data: {payload}\n\ndata: [DONE]\n\n");
+        let _ = tx.send(Ok(Bytes::from(out))).await;
+    }
 }
 
 enum Outcome {
     FinishedNaturally,
     ClientDisconnected,
+    /// Upstream produced no further bytes within the idle-timeout window — the
+    /// signature of a wedged instance.
+    IdleTimeout,
     LoopDetected {
         choice_index: i64,
         period: usize,

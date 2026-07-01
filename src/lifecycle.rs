@@ -96,6 +96,11 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Self-heal watchdogs: recover instances wedged by a GPU engine reset
+    // (which leaves the process alive + /health green but unable to decode).
+    let watchdog_handle = tokio::spawn(orchestrator.clone().run_engine_reset_watchdog());
+    let liveness_handle = tokio::spawn(orchestrator.clone().run_liveness_probe());
+
     let app_state: AppState = orchestrator.clone();
 
     let router = build_router(app_state);
@@ -113,6 +118,10 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     // the abort is just scheduled and the Arc may linger past `run`'s return.
     reconcile_handle.abort();
     let _ = reconcile_handle.await;
+    watchdog_handle.abort();
+    let _ = watchdog_handle.await;
+    liveness_handle.abort();
+    let _ = liveness_handle.await;
 
     info!("orchestrator shutting down; killing any running inference servers");
     // `drop(orchestrator)` fires as we fall out of scope: Arc refcount → 0,

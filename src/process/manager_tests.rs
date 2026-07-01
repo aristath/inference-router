@@ -320,6 +320,26 @@ fn extra_args_can_override_fitted_args_when_user_asks_for_it() {
 }
 
 #[test]
+fn gpu_classification_uses_final_extra_args() {
+    let mut m = gguf_model();
+    m.n_gpu_layers = Some(50);
+    m.extra_args = vec!["-ngl".into(), "0".into()];
+    assert!(!instance_uses_gpu(&m, &build_command_args(&m, None, 9001)));
+
+    let mut m = gguf_model();
+    m.extra_args = vec!["-ngl".into(), "99".into()];
+    assert!(instance_uses_gpu(&m, &build_command_args(&m, None, 9001)));
+
+    let mut m = gguf_model();
+    m.extra_args = vec!["--device=Vulkan0".into()];
+    assert!(instance_uses_gpu(&m, &build_command_args(&m, None, 9001)));
+
+    let mut m = gguf_model();
+    m.weights_format = WeightsFormat::Safetensors;
+    assert!(instance_uses_gpu(&m, &build_command_args(&m, None, 9001)));
+}
+
+#[test]
 fn extra_args_can_override_router_fit_policy_when_user_asks_for_it() {
     let mut m = gguf_model();
     m.n_gpu_layers = Some(50);
@@ -513,6 +533,20 @@ fn acquire_any_instance_picks_idle_then_least_busy() {
     assert_eq!(g4.port, 9002);
 
     drop((g1, g2, g3, g4));
+}
+
+#[test]
+fn idle_instances_excludes_active_requests() {
+    let mut pm = ProcessManager::default();
+    pm.register_existing_instance("m", 123, 9001);
+    pm.register_existing_instance("m", 124, 9002);
+
+    let active = pm.acquire_idle_instance("m").unwrap();
+    assert_eq!(active.pid, 123);
+    assert_eq!(pm.idle_instances(), vec![("m".into(), 124, 9002)]);
+
+    drop(active);
+    assert_eq!(pm.idle_instances().len(), 2);
 }
 
 #[test]

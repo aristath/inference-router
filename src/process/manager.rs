@@ -21,6 +21,10 @@ pub struct InstanceInfo {
     pub port: u16,
     /// Number of in-flight requests currently routed to this instance.
     pub active: Arc<AtomicUsize>,
+    /// True when this instance was placed on a GPU (so a GPU engine-reset should
+    /// recycle it). Recorded at spawn from the resolved placement, which is the
+    /// only reliable source — the persisted `ModelConfig.device` is `serde(skip)`.
+    pub uses_gpu: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,6 +41,10 @@ pub struct ModelRuntime {
 #[derive(Debug)]
 pub struct RequestGuard {
     pub port: u16,
+    /// PID of the instance this request is routed to, so a caller that detects a
+    /// stall (idle timeout) can ask the orchestrator to recycle that exact
+    /// process.
+    pub pid: i32,
     active: Arc<AtomicUsize>,
     request_done: Arc<Notify>,
 }
@@ -80,6 +88,7 @@ pub struct PendingChild {
     pub pid: i32,
     pub port: u16,
     model_id: String,
+    uses_gpu: bool,
     child: tokio::process::Child,
     kv_bytes_rx: tokio::sync::oneshot::Receiver<u64>,
 }
@@ -96,6 +105,7 @@ impl ProcessManager {
         *self.pending_instances.entry(model.id.clone()).or_insert(0) += 1;
 
         let args = build_command_args(model, draft, port);
+        let uses_gpu = instance_uses_gpu(model, &args);
 
         info!(
             model = model.id,
@@ -138,6 +148,7 @@ impl ProcessManager {
             pid,
             port,
             model_id: model.id.clone(),
+            uses_gpu,
             child,
             kv_bytes_rx: kv_rx,
         })
@@ -148,14 +159,16 @@ impl ProcessManager {
     pub fn register(&mut self, pending: PendingChild) -> RequestGuard {
         let active = Arc::new(AtomicUsize::new(1));
         let port = pending.port;
+        let pid = pending.pid;
         self.release_pending(&pending.model_id, pending.port);
         self.instances
             .entry(pending.model_id.clone())
             .or_default()
             .push(InstanceInfo {
-                pid: pending.pid,
+                pid,
                 port,
                 active: active.clone(),
+                uses_gpu: pending.uses_gpu,
             });
         self.running.insert(
             pending.pid,
@@ -167,6 +180,7 @@ impl ProcessManager {
         );
         RequestGuard {
             port,
+            pid,
             active,
             request_done: self.request_done.clone(),
         }
@@ -187,6 +201,7 @@ impl ProcessManager {
                 inst.active.fetch_add(1, Ordering::Relaxed);
                 return Some(RequestGuard {
                     port: inst.port,
+                    pid: inst.pid,
                     active: inst.active.clone(),
                     request_done: self.request_done.clone(),
                 });
@@ -209,6 +224,7 @@ impl ProcessManager {
         inst.active.fetch_add(1, Ordering::Relaxed);
         Some(RequestGuard {
             port: inst.port,
+            pid: inst.pid,
             active: inst.active.clone(),
             request_done: self.request_done.clone(),
         })
@@ -278,6 +294,44 @@ impl ProcessManager {
             }
         }
         dead
+    }
+
+    /// `(model_id, pid)` for every live GPU-backed instance. Used by the
+    /// engine-reset watchdog to recycle exactly the instances a GPU hang could
+    /// have wedged, leaving CPU-only instances untouched.
+    pub fn gpu_instances(&self) -> Vec<(String, i32)> {
+        let mut out = Vec::new();
+        for (model_id, insts) in &self.instances {
+            for inst in insts {
+                if inst.uses_gpu {
+                    out.push((model_id.clone(), inst.pid));
+                }
+            }
+        }
+        out
+    }
+
+    /// `(model_id, pid, port)` for every idle live instance. Used by the
+    /// background liveness probe; active requests rely on the proxy idle-timeout
+    /// path so the probe does not interrupt legitimate long generations.
+    pub fn idle_instances(&self) -> Vec<(String, i32, u16)> {
+        let mut out = Vec::new();
+        for (model_id, insts) in &self.instances {
+            for inst in insts {
+                if inst.active.load(Ordering::Relaxed) == 0 {
+                    out.push((model_id.clone(), inst.pid, inst.port));
+                }
+            }
+        }
+        out
+    }
+
+    /// The model id owning `pid`, if any instance currently maps to it.
+    pub fn model_id_for_pid(&self, pid: i32) -> Option<String> {
+        self.instances
+            .iter()
+            .find(|(_, insts)| insts.iter().any(|i| i.pid == pid))
+            .map(|(id, _)| id.clone())
     }
 
     /// Returns all pids for instances of `model_id` (used by stop_model_inner).
@@ -352,7 +406,12 @@ impl ProcessManager {
         self.instances
             .entry(model_id.into())
             .or_default()
-            .push(InstanceInfo { pid, port, active });
+            .push(InstanceInfo {
+                pid,
+                port,
+                active,
+                uses_gpu: false,
+            });
     }
 
     /// Registers an external backend by port when the process id is not tracked.
@@ -541,6 +600,86 @@ pub fn build_command_args(
 
 fn gguf_has_fitted_placement(model: &ModelConfig) -> bool {
     model.n_gpu_layers.is_some() || model.tensor_split.is_some() || model.override_tensor.is_some()
+}
+
+fn instance_uses_gpu(model: &ModelConfig, args: &[String]) -> bool {
+    match model.weights_format {
+        WeightsFormat::Safetensors => true,
+        WeightsFormat::Gguf => gguf_args_use_gpu(args),
+    }
+}
+
+fn gguf_args_use_gpu(args: &[String]) -> bool {
+    let target_ngl = last_flag_value(args, &["-ngl", "--n-gpu-layers", "--gpu-layers"]);
+    let draft_ngl = last_flag_value(args, &["-ngld"]);
+
+    if draft_ngl.as_deref().is_some_and(layers_value_uses_gpu) {
+        return true;
+    }
+    if target_ngl.as_deref().is_some_and(layers_value_uses_gpu) {
+        return true;
+    }
+
+    let explicit_target_cpu = target_ngl
+        .as_deref()
+        .is_some_and(|value| !layers_value_uses_gpu(value));
+    if explicit_target_cpu {
+        return false;
+    }
+
+    last_flag_value(args, &["--tensor-split", "-ts"])
+        .as_deref()
+        .is_some_and(split_value_uses_gpu)
+        || last_flag_value(args, &["--device", "-dev"])
+            .as_deref()
+            .is_some_and(device_value_uses_gpu)
+        || last_flag_value(args, &["-devd"])
+            .as_deref()
+            .is_some_and(device_value_uses_gpu)
+}
+
+fn layers_value_uses_gpu(value: &str) -> bool {
+    value
+        .parse::<i32>()
+        .map(|n| n > 0 || n == -1)
+        .unwrap_or(false)
+}
+
+fn split_value_uses_gpu(value: &str) -> bool {
+    value
+        .split(',')
+        .filter_map(|part| part.trim().parse::<f32>().ok())
+        .any(|n| n > 0.0)
+}
+
+fn device_value_uses_gpu(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && !value.eq_ignore_ascii_case("cpu")
+        && !value.eq_ignore_ascii_case("host")
+        && !value.eq_ignore_ascii_case("none")
+}
+
+fn last_flag_value(args: &[String], flags: &[&str]) -> Option<String> {
+    let mut found = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if flags.contains(&arg) {
+            if let Some(value) = args.get(idx + 1) {
+                found = Some(value.clone());
+            }
+            idx += 2;
+            continue;
+        }
+        for flag in flags {
+            if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+                found = Some(value.to_string());
+            }
+        }
+        idx += 1;
+    }
+    found
 }
 
 async fn wait_for_health_or_exit(

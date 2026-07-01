@@ -1252,6 +1252,195 @@ impl Orchestrator {
         Ok(())
     }
 
+    // ----- self-heal / watchdog -----
+
+    /// Kill one wedged instance so the next request respawns it clean. Marks the
+    /// model `Idle` (not `Error`) when its last instance is gone, so a follow-up
+    /// request reloads it automatically. Returns `false` if the pid is no longer
+    /// tracked (already gone). Safe to call from any background task.
+    pub async fn recycle_instance(&self, pid: i32, reason: &str) -> bool {
+        let model_id = { self.process_manager.lock().await.model_id_for_pid(pid) };
+        let Some(model_id) = model_id else {
+            return false;
+        };
+        warn!(pid, model = %model_id, reason, "recycling wedged inference instance");
+        self.record_event(
+            "warn",
+            format!("recycling {model_id} (pid {pid}): {reason}"),
+        )
+        .await;
+
+        self.process_manager.lock().await.stop(pid).await;
+
+        if self.process_manager.lock().await.instance_count(&model_id) == 0 {
+            let mut data = self.data.lock().await;
+            if let Some(m) = data.models.get_mut(&model_id) {
+                m.state = ModelState::Idle;
+                m.pid = None;
+            }
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        self.notify(&format!(
+            "inference-router recycled {model_id} (pid {pid}): {reason}"
+        ))
+        .await;
+        true
+    }
+
+    /// Recycle every live GPU-backed instance. Called by the engine-reset
+    /// watchdog: a GPU hang can wedge any instance resident on the GPU, and
+    /// CPU-only instances are unaffected. Returns how many were recycled.
+    pub async fn recycle_gpu_instances(&self, reason: &str) -> usize {
+        let gpu = { self.process_manager.lock().await.gpu_instances() };
+        let mut recycled = 0;
+        for (_, pid) in gpu {
+            if self.recycle_instance(pid, reason).await {
+                recycled += 1;
+            }
+        }
+        recycled
+    }
+
+    /// Fire-and-forget notification so an auto-recovery is never silent. POSTs
+    /// `{"text": msg}` to the configured webhook; no-op when unset.
+    async fn notify(&self, msg: &str) {
+        let url = {
+            self.settings
+                .lock()
+                .await
+                .watchdog
+                .notify_webhook_url
+                .clone()
+        };
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        let body = serde_json::json!({ "text": msg });
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            if let Err(e) = client
+                .post(&url)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                warn!(error = %e, "watchdog notify webhook failed");
+            }
+        });
+    }
+
+    /// Background task: watch the DRM `devcoredump` node for GPU engine resets
+    /// and recycle GPU-backed instances when one fires. Spawned once by
+    /// `lifecycle::run`. Runs until the process exits.
+    pub async fn run_engine_reset_watchdog(self: Arc<Self>) {
+        let (enabled, poll, drm_root, capture_dir) = {
+            let s = self.settings.lock().await;
+            (
+                s.watchdog.enabled && s.watchdog.engine_reset_watch,
+                s.watchdog.engine_reset_poll_secs.max(1),
+                s.watchdog.drm_root.clone(),
+                s.watchdog.devcoredump_capture_dir.clone(),
+            )
+        };
+        if !enabled {
+            info!("engine-reset watchdog disabled by settings");
+            return;
+        }
+        let mut watcher = crate::system::gpu_watchdog::CoredumpWatcher::new(&drm_root);
+        info!(drm_root = %drm_root, poll_secs = poll, "engine-reset watchdog armed");
+
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(poll));
+        loop {
+            ticker.tick().await;
+            let fresh = watcher.poll_new();
+            if fresh.is_empty() {
+                continue;
+            }
+            for sig in &fresh {
+                warn!(path = %sig.path.display(), "GPU devcoredump detected — engine reset");
+                if !capture_dir.trim().is_empty() {
+                    match crate::system::gpu_watchdog::capture(&sig.path, &capture_dir) {
+                        Ok(saved) => info!(saved = %saved.display(), "captured devcoredump"),
+                        Err(e) => warn!(
+                            error = %e,
+                            "could not capture devcoredump payload (likely root-only); continuing with recycle"
+                        ),
+                    }
+                }
+            }
+            let n = self
+                .recycle_gpu_instances("GPU engine reset (devcoredump detected)")
+                .await;
+            self.record_event(
+                "error",
+                format!("GPU engine reset detected; recycled {n} GPU instance(s)"),
+            )
+            .await;
+        }
+    }
+
+    /// Background task: probe each live instance on a path a wedged server fails
+    /// to answer (`/slots`) and recycle it after repeated timeouts. Catches
+    /// wedges that never produced a devcoredump. Spawned once by `lifecycle::run`.
+    pub async fn run_liveness_probe(self: Arc<Self>) {
+        let (enabled, interval, timeout, path, max_fail) = {
+            let s = self.settings.lock().await;
+            (
+                s.watchdog.enabled && s.watchdog.liveness_enabled,
+                s.watchdog.liveness_interval_secs.max(1),
+                s.watchdog.liveness_timeout_secs.max(1),
+                s.watchdog.liveness_probe_path.clone(),
+                s.watchdog.liveness_failures_to_recycle.max(1),
+            )
+        };
+        if !enabled {
+            info!("liveness probe disabled by settings");
+            return;
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        info!(path = %path, interval_secs = interval, "liveness probe armed");
+
+        let mut fails: HashMap<i32, u32> = HashMap::new();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+        loop {
+            ticker.tick().await;
+            let instances = { self.process_manager.lock().await.idle_instances() };
+            let live_pids: HashSet<i32> = instances.iter().map(|(_, pid, _)| *pid).collect();
+            fails.retain(|pid, _| live_pids.contains(pid));
+
+            for (model_id, pid, port) in instances {
+                let url = format!("http://127.0.0.1:{}{}", port, path);
+                // Any HTTP reply (even 404/501) proves the server loop is alive.
+                // Only a *timeout* signals a wedge; connection errors mean the
+                // process is gone, which the reconcile reaper handles.
+                let timed_out = match client.get(&url).send().await {
+                    Ok(_) => false,
+                    Err(e) => e.is_timeout(),
+                };
+                if timed_out {
+                    let c = fails.entry(pid).or_insert(0);
+                    *c += 1;
+                    warn!(model = %model_id, pid, port, path = %path, count = *c, "liveness probe timed out");
+                    if *c >= max_fail {
+                        self.recycle_instance(
+                            pid,
+                            &format!("liveness probe timed out {c}x on {path}"),
+                        )
+                        .await;
+                        fails.remove(&pid);
+                    }
+                } else {
+                    fails.remove(&pid);
+                }
+            }
+        }
+    }
+
     // ----- reconcile -----
 
     /// Refresh VRAM from sysfs, detect dead processes, persist if dirty.
