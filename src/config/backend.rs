@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 /// CUDA order for CUDA, Vulkan order for Vulkan). Positional backend flags like
 /// `--tensor-split` / `--device` MUST be expressed in the active backend's order
 /// — never a different backend's. This enum is the anchor for that ordering.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     Vulkan,

@@ -317,7 +317,7 @@ async fn build_proxy_orchestrator(upstream_port: u16) -> Arc<Orchestrator> {
         .process_manager
         .lock()
         .await
-        .register_port("fake", upstream_port);
+        .register_existing_port("fake", upstream_port);
 
     orchestrator
 }

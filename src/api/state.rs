@@ -1,6 +1,6 @@
-use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
+use axum::Json;
 use serde::Serialize;
 
 use crate::config::{ModelState, WeightsFormat};

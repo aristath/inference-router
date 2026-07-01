@@ -1,17 +1,18 @@
 use crate::config::{
-    AppSettings, Backend, BinaryPreset, ConfigError, GpuTagOverride, JsonStore, ModelAlias,
-    ModelConfig, ModelPerf, ModelState, WeightsFormat, tag_overrides_by_pci,
+    tag_overrides_by_pci, AppSettings, Backend, BinaryPreset, ConfigError, GpuTagOverride,
+    JsonStore, ModelAlias, ModelConfig, ModelPerf, ModelState, WeightsFormat,
 };
 use crate::orchestrator::allocation::plan_fit_placement;
-use crate::orchestrator::eviction::{EvictionAction, decide_eviction};
+use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
 use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
 use crate::system::stats::{SystemStats, SystemTracker};
-use crate::vram::estimator::VramEstimate;
+use crate::vram::estimator::GgufMeta;
+use crate::vram::llama_fit::{apply_sizing_to_model, fit_binary_for_server, run_llama_fit_sizing};
 use crate::vram::tracker::{GpuInfo, VRAMTracker};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -61,13 +62,13 @@ pub struct Orchestrator {
     pub presets_store: Arc<JsonStore<Vec<BinaryPreset>>>,
     pub aliases_store: Arc<JsonStore<Vec<ModelAlias>>>,
     /// Operator overrides of per-GPU backend tags (`gpus.json`). `None` in
-    /// minimal/test constructors. Applied to `vram_tracker` at startup and on
-    /// every edit.
+    /// minimal constructors. Applied to `vram_tracker` at startup and on every
+    /// edit.
     pub gpu_tags_store: Option<Arc<JsonStore<Vec<GpuTagOverride>>>>,
     pub settings_store: Option<Arc<JsonStore<AppSettings>>>,
-    /// Per-model throughput averages (`model_perf.json`). `None` in
-    /// minimal/test constructors. Updated per request from the upstream
-    /// response `timings`; persisted by reconcile when `perf_dirty`.
+    /// Per-model throughput averages (`model_perf.json`). `None` in minimal
+    /// constructors. Updated per request from the upstream response `timings`;
+    /// persisted by reconcile when `perf_dirty`.
     pub perf_store: Option<Arc<JsonStore<HashMap<String, ModelPerf>>>>,
     pub dirty: Arc<AtomicBool>,
     /// Set when presets change so reconcile persists presets.json.
@@ -268,7 +269,9 @@ impl Orchestrator {
     /// `timings`) into the model's running average. Sync + cheap (a HashMap
     /// update under a sync mutex); the disk write happens in reconcile.
     pub fn record_perf(&self, model_id: &str, decode: f64, prefill: f64) {
-        let Some(store) = &self.perf_store else { return };
+        let Some(store) = &self.perf_store else {
+            return;
+        };
         store.with_mut(|map| {
             map.entry(model_id.to_string())
                 .or_default()
@@ -280,7 +283,9 @@ impl Orchestrator {
     /// Drop a model's accumulated averages — called when its config changes, so
     /// stale timings don't blend with the new setup.
     pub fn reset_perf(&self, model_id: &str) {
-        let Some(store) = &self.perf_store else { return };
+        let Some(store) = &self.perf_store else {
+            return;
+        };
         let removed = store.with_mut(|map| map.remove(model_id).is_some());
         if removed {
             self.perf_dirty.store(true, Ordering::Relaxed);
@@ -309,11 +314,6 @@ impl Orchestrator {
         while events.len() > MAX_EVENTS {
             events.pop_back();
         }
-    }
-
-    #[cfg(test)]
-    pub async fn get_model(&self, id: &str) -> Option<ModelConfig> {
-        self.data.lock().await.models.get(id).cloned()
     }
 
     // ----- GPU capability tags -----
@@ -527,8 +527,7 @@ impl Orchestrator {
             let kv_invalidated = existing.model_path != updated.model_path
                 || existing.context != updated.context
                 || existing.cache_type_k != updated.cache_type_k
-                || existing.cache_type_v != updated.cache_type_v
-                || existing.n_gpu_layers != updated.n_gpu_layers;
+                || existing.cache_type_v != updated.cache_type_v;
             if kv_invalidated {
                 updated.estimated_vram = 0;
             } else {
@@ -780,12 +779,8 @@ impl Orchestrator {
     /// a 180-second health poll can't block a second model from starting
     /// on a different GPU.
     async fn do_load(&self, id: &str) -> Result<RequestGuard, LoadError> {
-        // Accumulated weight file sizes (target + draft if present). Set
-        // inside the admission block during GGUF reads; used after the health
-        // check to recompute estimated_vram from the measured KV bytes.
-        let mut weight_file_size: u64 = 0;
-        // Per-GPU VRAM safety caps drive the --fit-target margins handed to
-        // llama.cpp's -fit (see `plan_fit_placement`).
+        // Per-GPU VRAM safety caps become the fit margins handed to llama.cpp's
+        // own sizing logic.
         let (gpu_cap_pct, display_cap_pct) = {
             let s = self.settings.lock().await;
             (s.gpu_vram_cap_pct, s.display_gpu_vram_cap_pct)
@@ -842,111 +837,38 @@ impl Orchestrator {
                 normalize_model_device_for_llama(d, &gpus);
             }
 
-            if model.weights_format == WeightsFormat::Gguf {
-                // Honour the model's configured cache_type_{k,v} so the
-                // KV-cache portion of the estimate matches what the
-                // backend will actually allocate at run time.
-                use crate::config::CacheType;
-                use crate::vram::estimator::{GgufInfo, KvPerElement};
-                let kv_bytes = KvPerElement::from_types(
-                    model.cache_type_k.unwrap_or(CacheType::F16),
-                    model.cache_type_v.unwrap_or(CacheType::F16),
-                );
-                match GgufInfo::read(&model.model_path) {
-                    Ok(info) => {
-                        weight_file_size = info.file_size;
-                        let kv = info.kv_cache_bytes(model.context, kv_bytes);
-                        // A single coarse estimate (full weights + KV) feeds only
-                        // the eviction heuristic and the dashboard — placement
-                        // itself is delegated to llama.cpp's -fit, which packs
-                        // each GPU to ground-truth sizes and spills the rest to
-                        // CPU. For a big MoE this over-states GPU use (experts
-                        // offload), which is the safe direction for eviction.
-                        let est = VramEstimate::compute(
-                            info.file_size,
-                            kv,
-                            info.n_layers,
-                            model.n_gpu_layers,
-                        );
-                        model.estimated_vram = est.total_vram;
-                        if info.is_moe() {
-                            info!(
-                                model = id,
-                                dense_gib = info.dense_weight_bytes() >> 30,
-                                experts_gib = info.expert_weight_bytes >> 30,
-                                n_layers = info.n_layers,
-                                est_gib = est.total_vram >> 30,
-                                "MoE model; expert offload delegated to -fit"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!(model = id, error = %e, "gguf parse failed; loading without estimate")
-                    }
-                }
-                // Fold the draft's VRAM (weights + KV cache at its own
-                // context, with its own KV quant) into the target's
-                // estimate. Admission, eviction, and allocation all key
-                // off this single number — without the fold, a 256k
-                // target + a 2B draft would slip through admission
-                // based on target-only VRAM and then OOM at spawn.
-                if let Some(ref d) = draft {
-                    let d_kv = KvPerElement::from_types(
-                        d.cache_type_k.unwrap_or(CacheType::F16),
-                        d.cache_type_v.unwrap_or(CacheType::F16),
-                    );
-                    match GgufInfo::read(&d.model_path) {
-                        Ok(info) => {
-                            weight_file_size += info.file_size;
-                            let kv = info.kv_cache_bytes(d.context, d_kv);
-                            let est = VramEstimate::compute(
-                                info.file_size,
-                                kv,
-                                info.n_layers,
-                                d.n_gpu_layers,
-                            );
-                            model.estimated_vram =
-                                model.estimated_vram.saturating_add(est.total_vram);
-                        }
-                        Err(e) => warn!(
-                            target = id, draft = d.id,
-                            error = %e,
-                            "draft gguf parse failed; loading without draft VRAM estimate",
-                        ),
-                    }
-                }
-                let mut data = self.data.lock().await;
-                if let Some(m) = data.models.get_mut(id) {
-                    m.estimated_vram = model.estimated_vram;
-                }
-            }
-
-            // Delegate placement to llama.cpp's -fit: `try_place` hands the
-            // backend's eligible GPUs a `--device` list + per-device
-            // `--fit-target` margins. The coarse estimate only steers *eviction*
-            // — when it exceeds current GPU room we free idle models so -fit
-            // packs the new model into as much VRAM as possible, but the model
-            // loads either way (experts/overflow spill to CPU). We only error
-            // when no eligible GPU has any free VRAM at all. Reserved VRAM
-            // (concurrent in-flight loads) is subtracted inside `try_place`.
+            // GGUF sizing and fitted runtime args come from llama.cpp itself.
+            // The custom GGUF parser is only catalog metadata; it is not a
+            // placement oracle.
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
             let caps = (gpu_cap_pct, display_cap_pct);
-            match try_place(&mut model, &target_backends, &gpus, already_reserved, caps) {
+            match place_model(
+                &mut model,
+                draft.as_ref(),
+                &target_backends,
+                &gpus,
+                already_reserved,
+                caps,
+            )
+            .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?
+            {
                 PlaceOutcome::Placed {
                     backend,
                     gpus_used,
                     free,
+                    ..
                 } => {
                     if free < model.estimated_vram {
                         // Not enough free GPU to hold the whole model — evict
-                        // idle models to give -fit more room, then re-plan. The
-                        // load still proceeds if eviction frees nothing.
+                        // idle models to give llama.cpp's fit probe more room,
+                        // then re-plan. The load still proceeds if eviction
+                        // frees nothing.
                         let snapshot = self.data.lock().await.models.clone();
                         let idle_models = self.process_manager.lock().await.idle_model_ids();
                         for EvictionAction::Evict(victim) in
                             decide_eviction(&snapshot, free, model.estimated_vram, &idle_models)
                         {
-                            info!(victim = victim, "evicting to free GPU for -fit");
+                            info!(victim = victim, "evicting to free GPU for fit probe");
                             self.record_event("info", format!("evicting {victim} to load {id}"))
                                 .await;
                             if let Err(e) = self.stop_model_inner(&victim).await {
@@ -955,17 +877,25 @@ impl Orchestrator {
                         }
                         let gpus_after = self.vram_tracker.refresh();
                         self.data.lock().await.gpus = gpus_after.clone();
-                        // Re-plan against the freed GPUs (fit-target margins now
-                        // reflect the extra room).
-                        try_place(&mut model, &target_backends, &gpus_after, already_reserved, caps);
+                        // Re-plan against the freed GPUs so the probe sees the
+                        // extra room.
+                        place_model(
+                            &mut model,
+                            draft.as_ref(),
+                            &target_backends,
+                            &gpus_after,
+                            already_reserved,
+                            caps,
+                        )
+                        .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?;
                     }
                     info!(
                         model = id,
                         ?backend,
                         gpus_used,
                         device = ?model.device,
-                        fit_target = ?model.fit_target,
-                        "auto-placed via -fit"
+                        estimated_mib = model.estimated_vram / 1024 / 1024,
+                        "auto-placed from llama.cpp fit probe"
                     );
                 }
                 PlaceOutcome::Fits => {}
@@ -987,7 +917,15 @@ impl Orchestrator {
                     // Re-read VRAM after eviction so placement sees freed space.
                     let gpus_after = self.vram_tracker.refresh();
                     self.data.lock().await.gpus = gpus_after.clone();
-                    match try_place(&mut model, &target_backends, &gpus_after, already_reserved, caps)
+                    match place_model(
+                        &mut model,
+                        draft.as_ref(),
+                        &target_backends,
+                        &gpus_after,
+                        already_reserved,
+                        caps,
+                    )
+                    .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?
                     {
                         PlaceOutcome::Placed { .. } | PlaceOutcome::Fits => {}
                         PlaceOutcome::DoesNotFit { free } => {
@@ -998,6 +936,12 @@ impl Orchestrator {
                             });
                         }
                     }
+                }
+            }
+            {
+                let mut data = self.data.lock().await;
+                if let Some(m) = data.models.get_mut(id) {
+                    m.estimated_vram = model.estimated_vram;
                 }
             }
 
@@ -1029,7 +973,7 @@ impl Orchestrator {
             .wait_for_health(std::time::Duration::from_secs(180))
             .await
         {
-            Ok(kv_bytes) => {
+            Ok(_kv_bytes) => {
                 // Weights are now in VRAM and sysfs reflects reality — release reservation.
                 if vram_reservation > 0 {
                     self.reserved_vram
@@ -1044,15 +988,6 @@ impl Orchestrator {
                         m.state = ModelState::Running;
                         m.pid = Some(pid);
                         m.last_used = Some(unix_now());
-                        if kv_bytes > 0 && weight_file_size > 0 {
-                            m.estimated_vram = ((weight_file_size + kv_bytes) as f64 * 1.1) as u64;
-                            info!(
-                                model = id,
-                                kv_mib = kv_bytes / 1024 / 1024,
-                                total_mib = m.estimated_vram / 1024 / 1024,
-                                "updated VRAM estimate from llama.cpp startup logs",
-                            );
-                        }
                     }
                 }
                 self.dirty.store(true, Ordering::Relaxed);
@@ -1152,19 +1087,40 @@ impl Orchestrator {
                 let s = self.settings.lock().await;
                 (s.gpu_vram_cap_pct, s.display_gpu_vram_cap_pct)
             };
-            match try_place(&mut model, &target_backends, &gpus, already_reserved, caps) {
+            match place_model(
+                &mut model,
+                draft.as_ref(),
+                &target_backends,
+                &gpus,
+                already_reserved,
+                caps,
+            )
+            .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?
+            {
                 PlaceOutcome::Placed {
                     backend,
                     gpus_used,
+                    fully_on_gpu,
                     ..
                 } => {
+                    if !scale_out_accepts_placement(fully_on_gpu) {
+                        info!(
+                            model = id,
+                            ?backend,
+                            gpus_used,
+                            device = ?model.device,
+                            estimated_mib = model.estimated_vram / 1024 / 1024,
+                            "skipping scale-out because extra instance would spill to CPU"
+                        );
+                        return Ok(None);
+                    }
                     info!(
                         model = id,
                         ?backend,
                         gpus_used,
                         device = ?model.device,
-                        fit_target = ?model.fit_target,
-                        "scaling out onto free backend devices"
+                        estimated_mib = model.estimated_vram / 1024 / 1024,
+                        "scaling out from llama.cpp fit probe"
                     );
                 }
                 PlaceOutcome::Fits => {}
@@ -1446,6 +1402,9 @@ pub enum LoadError {
     #[error("spawn failed: {0}")]
     SpawnFailed(SpawnError),
 
+    #[error("llama.cpp fit probe failed: {0}")]
+    FitProbeFailed(String),
+
     #[error("not enough idle VRAM to load '{model}': need {:.1} GiB, have {:.1} GiB (active requests are not evicted)", bytes_to_gib(*needed), bytes_to_gib(*free))]
     InsufficientVram {
         model: String,
@@ -1627,21 +1586,16 @@ fn spawn_config_changed(old: &ModelConfig, new: &ModelConfig) -> bool {
         || old.presence_penalty != new.presence_penalty
         || old.repeat_penalty != new.repeat_penalty
         || old.flash_attn != new.flash_attn
-        || old.n_gpu_layers != new.n_gpu_layers
         || old.mlock != new.mlock
         || old.no_mmap != new.no_mmap
         || old.parallel_slots != new.parallel_slots
         || old.cache_type_k != new.cache_type_k
         || old.cache_type_v != new.cache_type_v
-        || old.split_mode != new.split_mode
-        || old.main_gpu != new.main_gpu
-        || old.tensor_split != new.tensor_split
         || old.threads != new.threads
         || old.cache_ram_mib != new.cache_ram_mib
         || old.reasoning_format != new.reasoning_format
         || old.reasoning_budget != new.reasoning_budget
         || old.chat_template_kwargs != new.chat_template_kwargs
-        || old.device != new.device
         || old.draft_model_id != new.draft_model_id
         || old.mtp_tokens != new.mtp_tokens
         || old.draft_max != new.draft_max
@@ -1685,14 +1639,15 @@ fn resolve_targets(model: &ModelConfig, presets: &HashMap<String, BinaryPreset>)
 
 /// Result of attempting to place a model on the current GPUs.
 enum PlaceOutcome {
-    /// Auto-placed GGUF: `model.device` + `model.fit_target` were set for -fit.
+    /// Auto-placed GGUF: `model.device` and llama.cpp-fitted runtime args were set.
     /// `free` is the chosen backend's allocatable VRAM, so the caller can decide
     /// whether to evict idle models for more room (placement succeeds either way
-    /// — -fit spills overflow to CPU).
+    /// because llama.cpp may spill overflow to CPU).
     Placed {
         backend: Backend,
         gpus_used: usize,
         free: u64,
+        fully_on_gpu: bool,
     },
     /// Explicit-device or non-GGUF model that fits by total free VRAM.
     Fits,
@@ -1701,15 +1656,252 @@ enum PlaceOutcome {
     DoesNotFit { free: u64 },
 }
 
+fn place_model(
+    model: &mut ModelConfig,
+    draft: Option<&ModelConfig>,
+    targets: &[Backend],
+    gpus: &[GpuInfo],
+    reserved: u64,
+    caps: (u8, u8),
+) -> Result<PlaceOutcome, crate::vram::llama_fit::LlamaFitError> {
+    if model.weights_format == WeightsFormat::Gguf {
+        return place_gguf_with_llama_fit(model, draft, targets, gpus, reserved, caps);
+    }
+    Ok(try_place(model, targets, gpus, reserved, caps))
+}
+
+#[derive(Clone)]
+struct FitCandidate {
+    backend: Backend,
+    device: String,
+    free: u64,
+    gpus_used: usize,
+    sizing: crate::vram::llama_fit::LlamaFitSizing,
+}
+
+fn place_gguf_with_llama_fit(
+    model: &mut ModelConfig,
+    draft: Option<&ModelConfig>,
+    targets: &[Backend],
+    gpus: &[GpuInfo],
+    reserved: u64,
+    caps: (u8, u8),
+) -> Result<PlaceOutcome, crate::vram::llama_fit::LlamaFitError> {
+    let fit_binary = fit_binary_for_server(&model.binary);
+    let adjusted = subtract_reserved_from_gpus(gpus.to_vec(), reserved);
+    let (gpu_cap_pct, display_cap_pct) = caps;
+    let n_layers = model_n_layers(model).unwrap_or(0);
+
+    if let Some(device) = configured_llama_device_value(model) {
+        let eligible = model_visible_gpus(model, adjusted);
+        let free: u64 = eligible
+            .iter()
+            .map(|g| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
+            .sum();
+        if eligible.is_empty() {
+            return Ok(PlaceOutcome::DoesNotFit { free });
+        }
+        let fit_target = eligible
+            .iter()
+            .map(|g| fit_target_for_probe_mib(g, gpus, gpu_cap_pct, display_cap_pct).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sizing = run_llama_fit_sizing(&fit_binary, model, draft, &device, &fit_target)?;
+        let fully_on_gpu = fitted_fully_on_gpu(&sizing, n_layers);
+        apply_sizing_to_model(model, &sizing);
+        model.device = Some(device);
+        return Ok(PlaceOutcome::Placed {
+            backend: targets.first().copied().unwrap_or(Backend::Vulkan),
+            gpus_used: eligible.len(),
+            free,
+            fully_on_gpu,
+        });
+    }
+
+    let mut best_free = 0u64;
+    let mut last_error = None;
+
+    for &backend in targets {
+        let mut by_alloc: Vec<GpuInfo> = adjusted
+            .iter()
+            .filter(|g| !g.integrated && g.supports(backend))
+            .cloned()
+            .collect();
+        if by_alloc.is_empty() {
+            continue;
+        }
+        by_alloc.sort_by_key(|g| {
+            std::cmp::Reverse(g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
+        });
+
+        let mut spill: Option<FitCandidate> = None;
+        for count in 1..=by_alloc.len() {
+            let mut chosen = by_alloc[..count].to_vec();
+            chosen.sort_by_key(|g| g.backend_index(backend).unwrap_or(usize::MAX));
+            let free: u64 = chosen
+                .iter()
+                .map(|g| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
+                .sum();
+            best_free = best_free.max(free);
+
+            let device = chosen
+                .iter()
+                .filter_map(|g| g.backend_device_name(backend))
+                .collect::<Vec<_>>()
+                .join(",");
+            if device.is_empty() {
+                continue;
+            }
+            let fit_target = chosen
+                .iter()
+                .map(|g| {
+                    fit_target_for_probe_mib(g, gpus, gpu_cap_pct, display_cap_pct).to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            match run_llama_fit_sizing(&fit_binary, model, draft, &device, &fit_target) {
+                Ok(sizing) => {
+                    let candidate = FitCandidate {
+                        backend,
+                        device,
+                        free,
+                        gpus_used: chosen.len(),
+                        sizing,
+                    };
+                    if fitted_fully_on_gpu(&candidate.sizing, n_layers) {
+                        apply_fit_candidate(model, &candidate);
+                        return Ok(PlaceOutcome::Placed {
+                            backend: candidate.backend,
+                            gpus_used: candidate.gpus_used,
+                            free: candidate.free,
+                            fully_on_gpu: true,
+                        });
+                    }
+                    keep_best_spill_candidate(&mut spill, candidate);
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+
+        if let Some(candidate) = spill {
+            apply_fit_candidate(model, &candidate);
+            return Ok(PlaceOutcome::Placed {
+                backend: candidate.backend,
+                gpus_used: candidate.gpus_used,
+                free: candidate.free,
+                fully_on_gpu: false,
+            });
+        }
+    }
+
+    if let Some(e) = last_error {
+        Err(e)
+    } else {
+        Ok(PlaceOutcome::DoesNotFit { free: best_free })
+    }
+}
+
+fn apply_fit_candidate(model: &mut ModelConfig, candidate: &FitCandidate) {
+    apply_sizing_to_model(model, &candidate.sizing);
+    model.device = Some(candidate.device.clone());
+}
+
+fn scale_out_accepts_placement(fully_on_gpu: bool) -> bool {
+    fully_on_gpu
+}
+
+fn keep_best_spill_candidate(best: &mut Option<FitCandidate>, candidate: FitCandidate) {
+    let should_replace = best.as_ref().map_or(true, |current| {
+        candidate.gpus_used > current.gpus_used
+            || (candidate.gpus_used == current.gpus_used
+                && candidate.sizing.device_vram > current.sizing.device_vram)
+    });
+    if should_replace {
+        *best = Some(candidate);
+    }
+}
+
+fn fitted_fully_on_gpu(sizing: &crate::vram::llama_fit::LlamaFitSizing, n_layers: u32) -> bool {
+    if fitted_uses_cpu_override(sizing) {
+        return false;
+    }
+    if n_layers == 0 {
+        return true;
+    }
+    match sizing.fitted.n_gpu_layers {
+        Some(n) if n < 0 => true,
+        Some(n) => n as u32 >= n_layers,
+        None => true,
+    }
+}
+
+fn fitted_uses_cpu_override(sizing: &crate::vram::llama_fit::LlamaFitSizing) -> bool {
+    sizing
+        .fitted
+        .override_tensor
+        .as_deref()
+        .map(override_tensor_uses_cpu)
+        .unwrap_or(false)
+}
+
+fn override_tensor_uses_cpu(value: &str) -> bool {
+    value.split(',').any(|entry| {
+        entry
+            .rsplit_once('=')
+            .map(|(_, target)| target.trim().eq_ignore_ascii_case("cpu"))
+            .unwrap_or(false)
+    })
+}
+
+fn model_n_layers(model: &ModelConfig) -> Option<u32> {
+    model
+        .gguf_meta
+        .as_ref()
+        .map(|m| m.n_layers)
+        .or_else(|| GgufMeta::read(&model.model_path).ok().map(|m| m.n_layers))
+}
+
+fn fit_target_for_probe_mib(
+    adjusted_gpu: &GpuInfo,
+    original_gpus: &[GpuInfo],
+    gpu_cap_pct: u8,
+    display_cap_pct: u8,
+) -> u64 {
+    let cap = if adjusted_gpu.display_attached {
+        display_cap_pct
+    } else {
+        gpu_cap_pct
+    }
+    .clamp(1, 100) as u64;
+    let base_margin = adjusted_gpu.total_vram.saturating_mul(100 - cap) / 100;
+    let original_used = original_gpus
+        .iter()
+        .find(|g| same_gpu(g, adjusted_gpu))
+        .map(|g| g.used_vram)
+        .unwrap_or(adjusted_gpu.used_vram);
+    let reserved = adjusted_gpu.used_vram.saturating_sub(original_used);
+    bytes_to_mib_ceil(base_margin.saturating_add(reserved))
+}
+
+fn same_gpu(a: &GpuInfo, b: &GpuInfo) -> bool {
+    a.pci_bus_id
+        .as_ref()
+        .zip(b.pci_bus_id.as_ref())
+        .map(|(a, b)| a == b)
+        .unwrap_or(false)
+        || a.id == b.id
+}
+
+fn bytes_to_mib_ceil(bytes: u64) -> u64 {
+    bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024)
+}
+
 /// Decide where `model` runs on `gpus` (reserved VRAM subtracted inside).
 ///
-/// For an auto-placed GGUF model, walks `targets` in priority order and, on the
-/// first backend with an eligible free-VRAM GPU, sets an explicit `--device`
-/// list + the `--fit-target` margins and clears any manual placement knobs —
-/// llama.cpp's `-fit` then packs the GPUs and offloads the remainder to CPU.
-/// Because the device list is explicit, placement is correct even when backends
-/// enumerate GPUs in different orders. Explicit-device and non-GGUF models keep
-/// their config and are only VRAM-checked.
+/// GGUF models are handled by `place_gguf_with_llama_fit`, which asks
+/// llama.cpp for concrete fitted args before launch. The generic estimator path
+/// below remains for non-GGUF models and legacy callers.
 fn try_place(
     model: &mut ModelConfig,
     targets: &[Backend],
@@ -1721,8 +1913,7 @@ fn try_place(
     let (gpu_cap_pct, display_cap_pct) = caps;
 
     // Explicit pin or non-GGUF: trust the config, just check it fits.
-    if model.weights_format != WeightsFormat::Gguf
-        || configured_llama_device_value(model).is_some()
+    if model.weights_format != WeightsFormat::Gguf || configured_llama_device_value(model).is_some()
     {
         let eligible = model_visible_gpus(model, adjusted);
         let free: u64 = eligible
@@ -1767,6 +1958,7 @@ fn try_place(
                 backend,
                 gpus_used: p.gpus_used,
                 free,
+                fully_on_gpu: free >= model.estimated_vram,
             };
         }
     }
@@ -1821,22 +2013,7 @@ fn configured_llama_devices(model: &ModelConfig) -> Option<Vec<String>> {
 }
 
 fn configured_llama_device_value(model: &ModelConfig) -> Option<String> {
-    let mut configured = model.device.clone();
-    let args = &model.extra_args;
-    for (idx, arg) in args.iter().enumerate() {
-        if arg == "--device" || arg == "-dev" {
-            configured = args.get(idx + 1).cloned();
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--device=") {
-            configured = Some(value.into());
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("-dev=") {
-            configured = Some(value.into());
-        }
-    }
-    configured
+    model.device.clone()
 }
 
 fn split_device_list(device: &str) -> Vec<String> {
@@ -1853,10 +2030,8 @@ fn split_device_list(device: &str) -> Vec<String> {
 
 fn normalize_model_device_for_llama(model: &mut ModelConfig, gpus: &[GpuInfo]) {
     let Some(device) = configured_llama_device_value(model) else {
-        strip_target_device_args(&mut model.extra_args);
         return;
     };
-    strip_target_device_args(&mut model.extra_args);
     if device.trim().eq_ignore_ascii_case("none") {
         model.device = Some("none".into());
         return;
@@ -1923,25 +2098,6 @@ fn gpu_matches_device(gpu: &GpuInfo, device: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn strip_target_device_args(args: &mut Vec<String>) {
-    let mut out = Vec::with_capacity(args.len());
-    let mut idx = 0;
-    while idx < args.len() {
-        let arg = &args[idx];
-        if arg == "--device" || arg == "-dev" {
-            idx += 2;
-            continue;
-        }
-        if arg.starts_with("--device=") || arg.starts_with("-dev=") {
-            idx += 1;
-            continue;
-        }
-        out.push(arg.clone());
-        idx += 1;
-    }
-    *args = out;
-}
-
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.parse::<usize>().ok()
 }
@@ -1965,869 +2121,5 @@ fn is_configuration_load_error(e: &LoadError) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use tempfile::TempDir;
-
-    fn orch(tmp: &TempDir) -> Arc<Orchestrator> {
-        let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(
-            tmp.path().join("models.json"),
-        ));
-        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
-            tmp.path().join("presets.json"),
-        ));
-        let aliases = Arc::new(JsonStore::<Vec<ModelAlias>>::new(
-            tmp.path().join("aliases.json"),
-        ));
-        Arc::new(Orchestrator::new(store, presets, aliases, 8080))
-    }
-
-    fn model(id: &str) -> ModelConfig {
-        ModelConfig {
-            id: id.into(),
-            name: id.into(),
-            binary: PathBuf::from("/bin/true"),
-            model_path: PathBuf::from("/tmp/m.gguf"),
-            ..ModelConfig::default()
-        }
-    }
-
-    #[test]
-    fn default_instance_cap_is_vram_limited() {
-        assert_eq!(DEFAULT_MAX_INSTANCES_PER_MODEL, usize::MAX);
-    }
-
-    fn gpu(id: &str, pci: &str, vulkan_index: usize) -> GpuInfo {
-        GpuInfo {
-            id: id.into(),
-            pci_bus_id: Some(pci.into()),
-            vulkan_device: Some(format!("Vulkan{vulkan_index}")),
-            vulkan_index: Some(vulkan_index),
-            cuda_device: None,
-            cuda_index: None,
-            rocm_index: None,
-            sycl_index: None,
-            tags: Default::default(),
-            integrated: false,
-            total_vram: 32 * 1024 * 1024 * 1024,
-            used_vram: 0,
-            busy_pct: 0,
-            temp_c: None,
-            display_attached: false,
-        }
-    }
-
-    #[test]
-    fn model_visible_gpus_filters_by_vulkan_or_pci_device() {
-        let gpus = vec![gpu("1", "0000:03:00.0", 1), gpu("4", "0000:1b:00.0", 0)];
-        let mut m = model("a");
-        m.device = Some("pci:0000:1b:00.0".into());
-        normalize_model_device_for_llama(&mut m, &gpus);
-        assert_eq!(m.device.as_deref(), Some("Vulkan0"));
-
-        let selected = model_visible_gpus(&m, gpus);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].pci_bus_id.as_deref(), Some("0000:1b:00.0"));
-    }
-
-    #[test]
-    fn extra_args_device_wins_and_is_normalized_into_structured_device() {
-        let gpus = vec![gpu("1", "0000:03:00.0", 1), gpu("4", "0000:1b:00.0", 0)];
-        let mut m = model("a");
-        m.device = Some("Vulkan1".into());
-        m.extra_args = vec![
-            "--device".into(),
-            "pci:0000:1b:00.0".into(),
-            "--threads".into(),
-            "16".into(),
-        ];
-
-        normalize_model_device_for_llama(&mut m, &gpus);
-
-        assert_eq!(m.device.as_deref(), Some("Vulkan0"));
-        assert_eq!(m.extra_args, vec!["--threads", "16"]);
-        let selected = model_visible_gpus(&m, gpus);
-        assert_eq!(selected[0].vulkan_device.as_deref(), Some("Vulkan0"));
-    }
-
-    #[test]
-    fn device_list_is_canonicalized_to_vulkan_order() {
-        let gpus = vec![
-            gpu("1", "0000:03:00.0", 1),
-            gpu("3", "0000:0a:00.0", 3),
-            gpu("4", "0000:1b:00.0", 0),
-        ];
-        let mut m = model("a");
-        m.device = Some("Vulkan3,pci:0000:1b:00.0,Vulkan1".into());
-
-        normalize_model_device_for_llama(&mut m, &gpus);
-
-        assert_eq!(m.device.as_deref(), Some("Vulkan0,Vulkan1,Vulkan3"));
-        let selected = model_visible_gpus(&m, gpus);
-        assert_eq!(
-            selected
-                .iter()
-                .map(|g| g.vulkan_device.as_deref().unwrap())
-                .collect::<Vec<_>>(),
-            vec!["Vulkan0", "Vulkan1", "Vulkan3"]
-        );
-    }
-
-    #[test]
-    fn model_visible_gpus_filters_by_cuda_device() {
-        let gpus = vec![GpuInfo {
-            id: "cuda0".into(),
-            pci_bus_id: Some("0000:1c:00.0".into()),
-            vulkan_device: None,
-            vulkan_index: None,
-            cuda_device: Some("CUDA0".into()),
-            cuda_index: Some(0),
-            rocm_index: None,
-            sycl_index: None,
-            tags: Default::default(),
-            integrated: false,
-            total_vram: 24 * 1024 * 1024 * 1024,
-            used_vram: 0,
-            busy_pct: 0,
-            temp_c: None,
-            display_attached: false,
-        }];
-        let mut m = model("cuda-target");
-        m.device = Some("CUDA0".into());
-
-        normalize_model_device_for_llama(&mut m, &gpus);
-
-        assert_eq!(m.device.as_deref(), Some("CUDA0"));
-        let selected = model_visible_gpus(&m, gpus);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].cuda_device.as_deref(), Some("CUDA0"));
-    }
-
-    #[test]
-    fn automatic_vulkan_pool_excludes_accounting_only_gpus() {
-        let mut raw = gpu("0", "0000:1e:00.0", 4);
-        raw.vulkan_device = None;
-        raw.vulkan_index = None;
-        let amd = gpu("1", "0000:03:00.0", 0);
-
-        let mut auto = model("auto");
-        auto.binary_preset = Some("llama-vulkan".into());
-
-        let visible = model_visible_gpus(&auto, vec![raw, amd]);
-
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].pci_bus_id.as_deref(), Some("0000:03:00.0"));
-    }
-
-    #[test]
-    fn automatic_cuda_pool_uses_cuda_devices() {
-        let cuda = GpuInfo {
-            id: "cuda0".into(),
-            pci_bus_id: Some("0000:1c:00.0".into()),
-            vulkan_device: None,
-            vulkan_index: None,
-            cuda_device: Some("CUDA0".into()),
-            cuda_index: Some(0),
-            rocm_index: None,
-            sycl_index: None,
-            tags: Default::default(),
-            integrated: false,
-            total_vram: 24 * 1024 * 1024 * 1024,
-            used_vram: 0,
-            busy_pct: 0,
-            temp_c: None,
-            display_attached: false,
-        };
-        let vulkan = gpu("1", "0000:03:00.0", 0);
-        let mut auto = model("auto-cuda");
-        auto.binary_preset = Some("llama-cuda".into());
-
-        let visible = model_visible_gpus(&auto, vec![cuda, vulkan]);
-
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].cuda_device.as_deref(), Some("CUDA0"));
-    }
-
-    #[test]
-    fn integrated_gpu_excluded_from_auto_pool_but_selectable_explicitly() {
-        let mut igpu = gpu("0", "0000:08:00.0", 2);
-        igpu.integrated = true;
-        let dgpu = gpu("1", "0000:03:00.0", 0);
-
-        // No device configured → automatic placement: the iGPU is excluded.
-        let auto = model("auto");
-        let visible = model_visible_gpus(&auto, vec![igpu.clone(), dgpu.clone()]);
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].pci_bus_id.as_deref(), Some("0000:03:00.0"));
-
-        // Explicitly targeting the iGPU runs the model there.
-        let mut targeted = model("on-igpu");
-        targeted.device = Some("Vulkan2".into());
-        let visible = model_visible_gpus(&targeted, vec![igpu, dgpu]);
-        assert_eq!(visible.len(), 1);
-        assert!(visible[0].integrated);
-        assert_eq!(visible[0].pci_bus_id.as_deref(), Some("0000:08:00.0"));
-    }
-
-    #[tokio::test]
-    async fn add_list_remove_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("a")).await.unwrap();
-        assert_eq!(o.list_models().await.len(), 1);
-        o.remove_model("a").await.unwrap();
-        assert_eq!(o.list_models().await.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn add_model_duplicate_id_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("a")).await.unwrap();
-        let err = o.add_model(model("a")).await.unwrap_err();
-        assert!(matches!(err, MutationError::Conflict(_)));
-    }
-
-    #[tokio::test]
-    async fn mark_used_updates_last_used_and_marks_dirty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("a")).await.unwrap();
-        // last_used starts as None.
-        assert!(o.get_model("a").await.unwrap().last_used.is_none());
-
-        o.dirty.store(false, Ordering::Relaxed);
-        o.mark_used("a").await;
-        assert!(o.get_model("a").await.unwrap().last_used.is_some());
-        assert!(
-            o.dirty.load(Ordering::Relaxed),
-            "mark_used must mark dirty so reconcile persists"
-        );
-    }
-
-    #[tokio::test]
-    async fn mark_used_unknown_model_is_a_noop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.dirty.store(false, Ordering::Relaxed);
-        o.mark_used("does-not-exist").await;
-        assert!(!o.dirty.load(Ordering::Relaxed));
-    }
-
-    #[tokio::test]
-    async fn remove_model_clears_per_model_load_guard() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("a")).await.unwrap();
-
-        // Prime the load-guard entry (ensure_loaded would insert one).
-        o.load_guards
-            .lock()
-            .await
-            .entry("a".into())
-            .or_insert_with(|| Arc::new(Mutex::new(())));
-        assert!(o.load_guards.lock().await.contains_key("a"));
-
-        o.remove_model("a").await.unwrap();
-        assert!(
-            !o.load_guards.lock().await.contains_key("a"),
-            "load_guards must drop entries for removed models so the map doesn't grow forever"
-        );
-    }
-
-    #[tokio::test]
-    async fn ensure_loaded_state_transition_survives_caller_cancellation() {
-        // Regression: when the HTTP handler's future is cancelled
-        // mid-load (client disconnect, tab reload, etc.), the model
-        // must still transition out of `Loading` — either to `Running`
-        // or to `Error` — so users don't see a forever-loading row.
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("a")).await.unwrap();
-
-        // Start the load in a spawned task we can abort below.
-        // /bin/true exits immediately, so `wait_for_health_or_exit`
-        // observes ChildExited and the detached task sets Error.
-        let ensure = {
-            let o = o.clone();
-            tokio::spawn(async move { o.ensure_loaded("a").await })
-        };
-        // Give the task a moment to hit `tokio::spawn(...)` inside
-        // ensure_loaded, then simulate the caller going away.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        ensure.abort();
-
-        // Wait up to ~3s for the detached load task to finish and
-        // write the final state.
-        for _ in 0..60 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let state = o.get_model("a").await.unwrap().state;
-            if matches!(state, ModelState::Error(_)) || state == ModelState::Idle {
-                return;
-            }
-        }
-        let final_state = o.get_model("a").await.unwrap().state;
-        panic!("state never left Loading after caller cancellation: {final_state:?}");
-    }
-
-    #[tokio::test]
-    async fn ensure_loaded_reuses_busy_instance_after_waiting_on_load_guard() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("a")).await.unwrap();
-
-        let guard = Arc::new(Mutex::new(()));
-        let locked = guard.lock().await;
-        o.load_guards.lock().await.insert("a".into(), guard.clone());
-
-        let ensure = {
-            let o = o.clone();
-            tokio::spawn(async move { o.ensure_loaded("a").await })
-        };
-
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        o.process_manager
-            .lock()
-            .await
-            .register_test_instance("a", -1, 9000);
-        let _busy = o
-            .process_manager
-            .lock()
-            .await
-            .acquire_idle_instance("a")
-            .unwrap();
-
-        drop(locked);
-
-        let reused = ensure.await.unwrap().unwrap();
-        assert_eq!(reused.port, 9000);
-    }
-
-    #[tokio::test]
-    async fn list_models_returns_sorted_by_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("charlie")).await.unwrap();
-        o.add_model(model("alpha")).await.unwrap();
-        o.add_model(model("bravo")).await.unwrap();
-        let ids: Vec<String> = o.list_models().await.into_iter().map(|m| m.id).collect();
-        assert_eq!(ids, vec!["alpha", "bravo", "charlie"]);
-    }
-
-    #[tokio::test]
-    async fn update_model_clears_estimate_when_path_changes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        let mut m = model("a");
-        m.estimated_vram = 7_000_000_000;
-        o.add_model(m.clone()).await.unwrap();
-        // set vram directly to simulate a load
-        {
-            let mut d = o.data.lock().await;
-            d.models.get_mut("a").unwrap().estimated_vram = 7_000_000_000;
-        }
-        let mut updated = m.clone();
-        updated.model_path = PathBuf::from("/tmp/m2.gguf");
-        o.update_model(updated).await.unwrap();
-        assert_eq!(o.get_model("a").await.unwrap().estimated_vram, 0);
-    }
-
-    #[tokio::test]
-    async fn update_running_model_name_only_keeps_running() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        let mut m = model("a");
-        m.state = ModelState::Running;
-        m.pid = Some(123);
-        o.add_model(m.clone()).await.unwrap();
-
-        m.name = "renamed".into();
-        o.update_model(m).await.unwrap();
-
-        let after = o.get_model("a").await.unwrap();
-        assert_eq!(after.name, "renamed");
-        assert_eq!(after.state, ModelState::Running);
-        assert_eq!(after.pid, Some(123));
-    }
-
-    #[tokio::test]
-    async fn update_running_model_spawn_change_stops_to_apply_new_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        let mut m = model("a");
-        m.state = ModelState::Running;
-        m.pid = Some(123);
-        o.add_model(m.clone()).await.unwrap();
-
-        m.context = 8192;
-        o.update_model(m).await.unwrap();
-
-        let after = o.get_model("a").await.unwrap();
-        assert_eq!(after.context, 8192);
-        assert_eq!(after.state, ModelState::Idle);
-        assert_eq!(after.pid, None);
-        assert_eq!(after.estimated_vram, 0);
-    }
-
-    #[tokio::test]
-    async fn restart_clears_stale_running_state() {
-        // Write a models.json with a model in Running state; rebuilding the
-        // orchestrator must reset it to Idle (the process is obviously not
-        // alive across restarts).
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("models.json");
-        let mut m = model("a");
-        m.state = ModelState::Running;
-        m.pid = Some(12345);
-        std::fs::write(&path, serde_json::to_string(&vec![m]).unwrap()).unwrap();
-
-        let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(path));
-        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
-            tmp.path().join("presets.json"),
-        ));
-        let aliases = Arc::new(JsonStore::<Vec<ModelAlias>>::new(
-            tmp.path().join("aliases.json"),
-        ));
-        let o = Arc::new(Orchestrator::new(store, presets, aliases, 8080));
-        let loaded = o.get_model("a").await.unwrap();
-        assert_eq!(loaded.state, ModelState::Idle);
-        assert_eq!(loaded.pid, None);
-    }
-
-    #[tokio::test]
-    async fn reconcile_marks_dead_process_as_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        let mut m = model("a");
-        m.state = ModelState::Running;
-        m.pid = Some(999_999);
-        o.add_model(m).await.unwrap();
-
-        // Register a synthetic instance with a definitely-dead pid.
-        o.process_manager
-            .lock()
-            .await
-            .register_test_instance("a", 999_999, 9000);
-
-        o.reconcile().await;
-        let after = o.get_model("a").await.unwrap();
-        match after.state {
-            ModelState::Error(msg) => assert!(msg.contains("999999") || msg.contains("died")),
-            other => panic!("expected Error, got {:?}", other),
-        }
-        assert_eq!(after.pid, None);
-    }
-
-    // ----- Speculative decoding -----
-
-    fn draft_model(id: &str) -> ModelConfig {
-        ModelConfig {
-            id: id.into(),
-            name: id.into(),
-            model_path: PathBuf::from("/tmp/draft.gguf"),
-            context: 16384,
-            device: Some("Vulkan1".into()),
-            ..ModelConfig::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn add_model_with_draft_reference() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(draft_model("d")).await.unwrap();
-        let mut t = model("t");
-        t.draft_model_id = Some("d".into());
-        t.draft_max = Some(16);
-        t.ctx_checkpoints = Some(4);
-        o.add_model(t).await.unwrap();
-        assert_eq!(o.list_models().await.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn add_model_referencing_nonexistent_draft_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        let mut t = model("t");
-        t.draft_model_id = Some("missing".into());
-        let err = o.add_model(t).await.unwrap_err();
-        assert!(matches!(
-            err,
-            MutationError::InvalidConfig(ConfigError::DraftNotFound { .. }),
-        ));
-    }
-
-    #[tokio::test]
-    async fn model_cannot_reference_itself_as_draft() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        let mut t = model("t");
-        t.draft_model_id = Some("t".into());
-        let err = o.add_model(t).await.unwrap_err();
-        assert!(matches!(
-            err,
-            MutationError::InvalidConfig(ConfigError::DraftSelfReference),
-        ));
-    }
-
-    #[tokio::test]
-    async fn remove_model_in_use_as_draft_errors_with_referrers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(draft_model("d")).await.unwrap();
-        let mut t1 = model("t1");
-        t1.draft_model_id = Some("d".into());
-        let mut t2 = model("t2");
-        t2.draft_model_id = Some("d".into());
-        o.add_model(t1).await.unwrap();
-        o.add_model(t2).await.unwrap();
-
-        let err = o.remove_model("d").await.unwrap_err();
-        match err {
-            MutationError::DraftInUse { id, mut targets } => {
-                assert_eq!(id, "d");
-                targets.sort();
-                assert_eq!(targets, vec!["t1".to_string(), "t2".to_string()]);
-            }
-            other => panic!("expected DraftInUse, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn remove_model_after_unreferencing_succeeds() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(draft_model("d")).await.unwrap();
-        let mut t = model("t");
-        t.draft_model_id = Some("d".into());
-        o.add_model(t.clone()).await.unwrap();
-
-        // Clear the reference, then delete.
-        t.draft_model_id = None;
-        o.update_model(t).await.unwrap();
-        assert!(o.remove_model("d").await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn reserved_vram_prevents_concurrent_overcommit() {
-        // Simulates the race: two concurrent do_load calls both see enough
-        // free VRAM individually, but together would OOM. The reservation
-        // counter must block the second one.
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-
-        // Inject a fake GPU with 10 GiB free.
-        {
-            let mut data = o.data.lock().await;
-            data.gpus = vec![GpuInfo {
-                id: "card0".into(),
-                pci_bus_id: None,
-                vulkan_device: None,
-                vulkan_index: None,
-                cuda_device: None,
-                cuda_index: None,
-                rocm_index: None,
-                sycl_index: None,
-                tags: Default::default(),
-                integrated: false,
-                total_vram: 10 * 1024 * 1024 * 1024,
-                used_vram: 0,
-                busy_pct: 0,
-                temp_c: None,
-                display_attached: false,
-            }];
-        }
-
-        // Model A needs 6 GiB; model B needs 6 GiB. Together they need 12 GiB > 10 GiB.
-        let six_gib: u64 = 6 * 1024 * 1024 * 1024;
-
-        // Simulate: model A has been fork/exec'd (reservation active) but
-        // sysfs hasn't caught up yet (vram_used still 0).
-        o.reserved_vram
-            .store(six_gib, std::sync::atomic::Ordering::SeqCst);
-
-        // Now the admission logic for model B should see only 4 GiB free.
-        let already_reserved = o.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
-        let data = o.data.lock().await;
-        let raw_free: u64 = data.gpus.iter().map(|g| g.free_vram()).sum();
-        let effective_free = raw_free.saturating_sub(already_reserved);
-        drop(data);
-
-        assert_eq!(
-            raw_free,
-            10 * 1024 * 1024 * 1024,
-            "sysfs still shows 10 GiB"
-        );
-        assert_eq!(
-            effective_free,
-            4 * 1024 * 1024 * 1024,
-            "but effective free is only 4 GiB"
-        );
-        assert!(
-            effective_free < six_gib,
-            "model B (6 GiB) must be rejected when only 4 GiB is effectively available"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconcile_persists_only_when_dirty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("models.json");
-        let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(path.clone()));
-        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
-            tmp.path().join("presets.json"),
-        ));
-        let aliases = Arc::new(JsonStore::<Vec<ModelAlias>>::new(
-            tmp.path().join("aliases.json"),
-        ));
-        let o = Arc::new(Orchestrator::new(store, presets, aliases, 8080));
-
-        // First reconcile: nothing dirty, no file written.
-        o.reconcile().await;
-        assert!(!path.exists());
-
-        // Add a model → dirty → reconcile writes the file.
-        o.add_model(model("a")).await.unwrap();
-        o.reconcile().await;
-        assert!(path.exists());
-        let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-
-        // Second idle reconcile: no rewrite.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        o.reconcile().await;
-        let second_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(first_mtime, second_mtime);
-    }
-
-    #[tokio::test]
-    async fn reconcile_persists_settings_when_dirty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let settings_path = tmp.path().join("settings.json");
-        let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(
-            tmp.path().join("models.json"),
-        ));
-        let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
-            tmp.path().join("presets.json"),
-        ));
-        let aliases = Arc::new(JsonStore::<Vec<ModelAlias>>::new(
-            tmp.path().join("aliases.json"),
-        ));
-        let settings = Arc::new(JsonStore::<AppSettings>::new(settings_path.clone()));
-        let gpu_tags = Arc::new(JsonStore::<Vec<GpuTagOverride>>::new(
-            tmp.path().join("gpus.json"),
-        ));
-        let perf = Arc::new(JsonStore::<HashMap<String, ModelPerf>>::new(
-            tmp.path().join("model_perf.json"),
-        ));
-        let o = Arc::new(Orchestrator::new_with_settings_store(
-            store, presets, aliases, settings, gpu_tags, perf, 8080,
-        ));
-
-        let mut next = o.settings().await;
-        next.loop_guards.streaming.repeats = 7;
-        next.loop_guards.streaming.action = crate::config::StreamingLoopAction::Log;
-        next.loop_guards.tool.window_messages = 24;
-        o.update_settings(next).await;
-        o.reconcile().await;
-
-        let saved: AppSettings =
-            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(saved.loop_guards.streaming.repeats, 7);
-        assert_eq!(
-            saved.loop_guards.streaming.action,
-            crate::config::StreamingLoopAction::Log,
-        );
-        assert_eq!(saved.loop_guards.tool.window_messages, 24);
-    }
-
-    fn alias(name: &str, target: &str) -> ModelAlias {
-        ModelAlias {
-            alias: name.into(),
-            target: target.into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn add_alias_requires_existing_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        // Target model does not exist yet.
-        let err = o.add_alias(alias("fast", "qwen")).await.unwrap_err();
-        assert!(matches!(err, MutationError::AliasTargetMissing { .. }));
-
-        o.add_model(model("qwen")).await.unwrap();
-        o.add_alias(alias("fast", "qwen")).await.unwrap();
-        assert_eq!(o.list_aliases().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn alias_resolves_to_target_and_passthrough_for_unknown() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("qwen")).await.unwrap();
-        o.add_alias(alias("fast", "qwen")).await.unwrap();
-
-        assert_eq!(o.resolve_model_id("fast").await, "qwen");
-        // A non-alias name passes through unchanged.
-        assert_eq!(o.resolve_model_id("qwen").await, "qwen");
-        assert_eq!(o.resolve_model_id("unknown").await, "unknown");
-    }
-
-    #[tokio::test]
-    async fn alias_cannot_shadow_model_id_or_duplicate() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("qwen")).await.unwrap();
-        o.add_model(model("llama")).await.unwrap();
-
-        // Alias name equal to an existing model id is rejected.
-        let err = o.add_alias(alias("llama", "qwen")).await.unwrap_err();
-        assert!(matches!(err, MutationError::AliasShadowsModel(_)));
-
-        o.add_alias(alias("fast", "qwen")).await.unwrap();
-        // Duplicate alias name is rejected.
-        let err = o.add_alias(alias("fast", "llama")).await.unwrap_err();
-        assert!(matches!(err, MutationError::AliasConflict(_)));
-    }
-
-    #[tokio::test]
-    async fn deleting_model_unassigns_aliases_but_keeps_them() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("qwen")).await.unwrap();
-        o.add_model(model("llama")).await.unwrap();
-        o.add_alias(alias("fast", "qwen")).await.unwrap();
-        o.add_alias(alias("big", "llama")).await.unwrap();
-
-        o.remove_model("qwen").await.unwrap();
-
-        // Both aliases survive; the one pointing at "qwen" is now unassigned.
-        let aliases = o.list_aliases().await;
-        assert_eq!(aliases, vec![alias("big", "llama"), alias("fast", "")]);
-        // An unassigned alias resolves to an empty target (handled as an error
-        // at the proxy layer).
-        assert_eq!(o.resolve_model_id("fast").await, "");
-    }
-
-    #[tokio::test]
-    async fn add_alias_rejects_invalid_names() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("qwen")).await.unwrap();
-        let too_long = "x".repeat(65);
-        for bad in ["Planner", "my alias", "a/b", "café", "", too_long.as_str()] {
-            let err = o.add_alias(alias(bad, "qwen")).await.unwrap_err();
-            assert!(
-                matches!(err, MutationError::AliasInvalid(_)),
-                "expected {bad:?} to be rejected as invalid",
-            );
-        }
-        // Canonical names are accepted.
-        o.add_alias(alias("gpt-4o.fast_v2", "qwen")).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn alias_can_target_another_alias_and_follows_repoints() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("qwen")).await.unwrap();
-        o.add_model(model("llama")).await.unwrap();
-        o.add_alias(alias("default", "qwen")).await.unwrap();
-        // Several aliases reference `default` instead of a concrete model.
-        o.add_alias(alias("coder", "default")).await.unwrap();
-        o.add_alias(alias("planner", "default")).await.unwrap();
-
-        assert_eq!(o.resolve_model_id("coder").await, "qwen");
-        assert_eq!(o.resolve_model_id("planner").await, "qwen");
-
-        // Repointing `default` propagates to every alias that references it,
-        // without touching those aliases.
-        o.update_alias(alias("default", "llama")).await.unwrap();
-        assert_eq!(o.resolve_model_id("coder").await, "llama");
-        assert_eq!(o.resolve_model_id("planner").await, "llama");
-        // The referencing aliases still store the reference, not the model.
-        let coder = o
-            .list_aliases()
-            .await
-            .into_iter()
-            .find(|a| a.alias == "coder")
-            .unwrap();
-        assert_eq!(coder.target, "default");
-    }
-
-    #[tokio::test]
-    async fn alias_chain_through_unassigned_resolves_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_alias(alias("default", "")).await.unwrap(); // unassigned
-        o.add_alias(alias("coder", "default")).await.unwrap();
-        assert_eq!(o.resolve_model_id("coder").await, "");
-    }
-
-    #[tokio::test]
-    async fn alias_cycles_are_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("qwen")).await.unwrap();
-        o.add_alias(alias("a", "qwen")).await.unwrap();
-        o.add_alias(alias("b", "a")).await.unwrap();
-        // a → b would close the loop a → b → a.
-        let err = o.update_alias(alias("a", "b")).await.unwrap_err();
-        assert!(matches!(err, MutationError::AliasCycle { .. }));
-        // Resolution is unaffected (the cyclic update was rejected).
-        assert_eq!(o.resolve_model_id("b").await, "qwen");
-    }
-
-    #[tokio::test]
-    async fn deleting_alias_unassigns_aliases_referencing_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        o.add_model(model("qwen")).await.unwrap();
-        o.add_alias(alias("default", "qwen")).await.unwrap();
-        o.add_alias(alias("coder", "default")).await.unwrap();
-
-        o.remove_alias("default").await.unwrap();
-        let coder = o
-            .list_aliases()
-            .await
-            .into_iter()
-            .find(|a| a.alias == "coder")
-            .unwrap();
-        assert_eq!(
-            coder.target, "",
-            "coder should be unassigned after default is deleted"
-        );
-    }
-
-    #[tokio::test]
-    async fn alias_can_be_created_unassigned_then_pointed_at_a_model() {
-        let tmp = tempfile::tempdir().unwrap();
-        let o = orch(&tmp);
-        // Canonical interface name defined before any model is assigned.
-        o.add_alias(alias("planner", "")).await.unwrap();
-        assert_eq!(o.resolve_model_id("planner").await, "");
-
-        o.add_model(model("qwen")).await.unwrap();
-        o.update_alias(alias("planner", "qwen")).await.unwrap();
-        assert_eq!(o.resolve_model_id("planner").await, "qwen");
-
-        // Reassigning to a non-existent model is still rejected.
-        let err = o.update_alias(alias("planner", "ghost")).await.unwrap_err();
-        assert!(matches!(err, MutationError::AliasTargetMissing { .. }));
-    }
-
-    #[tokio::test]
-    async fn reconcile_persists_aliases_when_dirty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let aliases_path = tmp.path().join("aliases.json");
-        let o = orch(&tmp);
-        o.add_model(model("qwen")).await.unwrap();
-        o.add_alias(alias("fast", "qwen")).await.unwrap();
-        o.reconcile().await;
-
-        let saved: Vec<ModelAlias> =
-            serde_json::from_str(&std::fs::read_to_string(&aliases_path).unwrap()).unwrap();
-        assert_eq!(saved, vec![alias("fast", "qwen")]);
-    }
-}
+#[path = "engine_tests.rs"]
+mod tests;

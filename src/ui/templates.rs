@@ -1,6 +1,6 @@
 use askama::Template;
 
-use crate::config::{CacheType, ModelConfig, ModelState, WeightsFormat};
+use crate::config::{ModelConfig, ModelState, WeightsFormat};
 use crate::system::stats::SystemStats;
 use crate::vram::tracker::GpuInfo;
 
@@ -196,6 +196,7 @@ pub struct ModelDisplay {
     pub file_size_bytes: u64,
     pub file_size_gib_str: String,
     pub required_vram_bytes: u64,
+    #[allow(dead_code)] // read by Askama templates
     pub required_vram_gib_str: String,
     pub state_display: String,
     pub state_class: String,
@@ -443,44 +444,25 @@ fn gib_or_dash(bytes: u64) -> String {
     }
 }
 
-/// Compute on-disk weights size and estimated required VRAM (weights + KV
-/// cache at `m.context` + 10% overhead). Best-effort — returns `0` when the
-/// file is missing or the GGUF header is unreadable.
+/// Compute on-disk weights size plus the last llama.cpp-backed required VRAM.
+/// The router no longer calculates placement size from GGUF headers; runtime
+/// sizing is populated by the `llama-fit-params` probe when a model loads.
 ///
-/// For GGUF models we go through `GgufInfo::read`, which sums sibling
-/// shards for multi-file models (`foo.gguf-00001-of-00005.gguf`) so the
-/// displayed size reflects the whole model rather than only the file
-/// the config points at.
+/// GGUF metadata still supplies total sharded file size for display.
 fn compute_sizes(m: &ModelConfig) -> (u64, u64) {
-    use crate::vram::estimator::{GgufInfo, KvPerElement, VramEstimate};
-
     match m.weights_format {
         WeightsFormat::Gguf => {
-            let info = m
+            let file_size = m
                 .gguf_meta
                 .as_ref()
-                .map(GgufInfo::from)
-                .or_else(|| GgufInfo::read(&m.model_path).ok());
-            match info {
-                Some(info) => {
-                    // Honour the model's configured KV cache quantization so
-                    // q8_0/q4_0 shrink the Required VRAM column, matching
-                    // what llama-server actually allocates at run time.
-                    // Unset falls back to f16, which is also llama.cpp's
-                    // default.
-                    let kv_bytes = KvPerElement::from_types(
-                        m.cache_type_k.unwrap_or(CacheType::F16),
-                        m.cache_type_v.unwrap_or(CacheType::F16),
-                    );
-                    let kv = info.kv_cache_bytes(m.context, kv_bytes);
-                    let estimate =
-                        VramEstimate::compute(info.file_size, kv, info.n_layers, m.n_gpu_layers);
-                    (info.file_size, estimate.total_vram)
-                }
-                // Header unreadable (missing file, non-GGUF, etc.) — show a
-                // dash (the gib_or_dash formatter handles 0).
-                None => (0, 0),
-            }
+                .map(|meta| meta.file_size)
+                .or_else(|| {
+                    crate::vram::estimator::GgufMeta::read(&m.model_path)
+                        .ok()
+                        .map(|meta| meta.file_size)
+                })
+                .unwrap_or(0);
+            (file_size, m.estimated_vram)
         }
         // Safetensors: sum the directory's regular files for size, and
         // leave required VRAM blank — estimating vLLM's memory without
@@ -584,225 +566,5 @@ pub struct DashboardFragmentTemplate {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{ModelConfig, ModelState};
-
-    /// Builds a display straight from a minimal config. File/VRAM sizes resolve
-    /// to 0 (empty "—") because the default paths don't exist — which is what
-    /// the empty-cell ordering test relies on.
-    fn model(id: &str, name: &str, state: ModelState, context: u32) -> ModelDisplay {
-        ModelDisplay::from_model(&ModelConfig {
-            id: id.into(),
-            name: name.into(),
-            state,
-            context,
-            ..ModelConfig::default()
-        })
-    }
-
-    fn ids(rows: &[ModelDisplay]) -> Vec<&str> {
-        rows.iter().map(|m| m.id.as_str()).collect()
-    }
-
-    #[test]
-    fn loaded_models_float_to_the_top_regardless_of_column() {
-        let rows = vec![
-            model("a", "Alpha", ModelState::Idle, 4096),
-            model("z", "Zeta", ModelState::Running, 2048),
-        ];
-        // Name-ascending would put Alpha first, but Running outranks Idle.
-        let out = sort_and_filter(rows, ModelSort::new("name", "asc"), "");
-        assert_eq!(ids(&out), ["z", "a"]);
-    }
-
-    #[test]
-    fn name_sort_honours_direction_within_the_loaded_group() {
-        let rows = vec![
-            model("a", "Alpha", ModelState::Idle, 1),
-            model("c", "Charlie", ModelState::Idle, 1),
-            model("b", "Bravo", ModelState::Idle, 1),
-        ];
-        let asc = sort_and_filter(rows.clone(), ModelSort::new("name", "asc"), "");
-        assert_eq!(ids(&asc), ["a", "b", "c"]);
-        let desc = sort_and_filter(rows, ModelSort::new("name", "desc"), "");
-        assert_eq!(ids(&desc), ["c", "b", "a"]);
-    }
-
-    #[test]
-    fn context_sort_is_numeric() {
-        let rows = vec![
-            model("a", "A", ModelState::Idle, 8192),
-            model("b", "B", ModelState::Idle, 1024),
-            model("c", "C", ModelState::Idle, 131072),
-        ];
-        let out = sort_and_filter(rows, ModelSort::new("context", "asc"), "");
-        assert_eq!(ids(&out), ["b", "a", "c"]);
-    }
-
-    #[test]
-    fn empty_numeric_cells_sort_last_in_both_directions() {
-        let mut big = model("big", "Big", ModelState::Idle, 1);
-        big.file_size_bytes = 1_000_000;
-        big.file_size_gib_str = "0.9".into();
-        let mut small = model("small", "Small", ModelState::Idle, 1);
-        small.file_size_bytes = 1_000;
-        small.file_size_gib_str = "0.1".into();
-        let empty = model("empty", "Empty", ModelState::Idle, 1); // 0 bytes -> "—"
-
-        let asc = sort_and_filter(
-            vec![empty.clone(), big.clone(), small.clone()],
-            ModelSort::new("file-size", "asc"),
-            "",
-        );
-        assert_eq!(ids(&asc), ["small", "big", "empty"]);
-
-        // Reversing the direction flips the populated rows but keeps the empty
-        // cell at the bottom.
-        let desc = sort_and_filter(
-            vec![empty, big, small],
-            ModelSort::new("file-size", "desc"),
-            "",
-        );
-        assert_eq!(ids(&desc), ["big", "small", "empty"]);
-    }
-
-    #[test]
-    fn activity_sort_uses_active_plus_pending() {
-        let rows = vec![
-            model("idle", "Idle", ModelState::Running, 1).with_runtime(1, 0, 0),
-            model("busy", "Busy", ModelState::Running, 1).with_runtime(1, 2, 1),
-            model("warm", "Warm", ModelState::Running, 1).with_runtime(1, 1, 0),
-        ];
-        let out = sort_and_filter(rows, ModelSort::new("activity", "desc"), "");
-        assert_eq!(ids(&out), ["busy", "warm", "idle"]);
-    }
-
-    #[test]
-    fn status_sort_ranks_running_by_requests_then_groups_by_state() {
-        let rows = vec![
-            model("err", "Err", ModelState::Error("boom".into()), 1),
-            model("idle", "Idle", ModelState::Idle, 1),
-            model("loading", "Loading", ModelState::Loading, 1).with_runtime(0, 0, 1),
-            model("warm", "Warm", ModelState::Running, 1).with_runtime(1, 0, 0),
-            model("busy", "Busy", ModelState::Running, 1).with_runtime(1, 3, 0),
-        ];
-        // desc = busiest first; loaded rows (running/loading) still float above
-        // idle/error via loaded_sort_key.
-        let out = sort_and_filter(rows, ModelSort::new("status", "desc"), "");
-        assert_eq!(ids(&out), ["busy", "warm", "loading", "idle", "err"]);
-    }
-
-    #[test]
-    fn filter_matches_id_name_and_state_case_insensitively() {
-        let rows = vec![
-            model("qwen3", "Qwen 3", ModelState::Running, 1),
-            model("llama", "Llama", ModelState::Idle, 1),
-        ];
-        // by name fragment
-        let by_name = sort_and_filter(rows.clone(), ModelSort::new("name", "asc"), "QWEN");
-        assert_eq!(ids(&by_name), ["qwen3"]);
-        // by state
-        let by_state = sort_and_filter(rows.clone(), ModelSort::new("name", "asc"), "running");
-        assert_eq!(ids(&by_state), ["qwen3"]);
-        // no match
-        let none = sort_and_filter(rows, ModelSort::new("name", "asc"), "mistral");
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn model_sort_parses_direction_and_indicators() {
-        assert!(ModelSort::new("name", "asc").ascending);
-        assert!(ModelSort::new("name", "").ascending); // default
-        assert!(!ModelSort::new("name", "desc").ascending);
-        assert!(!ModelSort::new("name", "DESC").ascending); // case-insensitive
-        assert_eq!(ModelSort::new("name", "asc").dir_class(), "sort-asc");
-        assert_eq!(ModelSort::new("name", "desc").dir_class(), "sort-desc");
-        assert_eq!(ModelSort::new("name", "asc").aria(), "ascending");
-        assert_eq!(ModelSort::new("name", "desc").aria(), "descending");
-    }
-
-    #[test]
-    fn event_display_formats_a_timestamp() {
-        let ev = EventDisplay::new(0.0, "info", "started".into());
-        assert_eq!(ev.level, "info");
-        assert_eq!(ev.message, "started");
-        // HH:MM:SS, zero-padded.
-        assert_eq!(ev.time_str.len(), 8);
-        assert_eq!(ev.time_str.matches(':').count(), 2);
-    }
-
-    fn gpu(id: &str, total: u64, used: u64, busy: u8) -> GpuInfo {
-        GpuInfo {
-            id: id.into(),
-            pci_bus_id: None,
-            vulkan_device: None,
-            vulkan_index: None,
-            cuda_device: None,
-            cuda_index: None,
-            rocm_index: None,
-            sycl_index: None,
-            tags: Default::default(),
-            integrated: false,
-            total_vram: total,
-            used_vram: used,
-            busy_pct: busy,
-            temp_c: None,
-            display_attached: false,
-        }
-    }
-
-    #[test]
-    fn gpu_totals_sum_vram_and_average_activity() {
-        const GIB: u64 = 1_073_741_824;
-        let gpus = [
-            gpu("0", 32 * GIB, 8 * GIB, 40),
-            gpu("1", 32 * GIB, 24 * GIB, 60),
-        ];
-        let t = GpuTotals::from_gpus(&gpus);
-        assert_eq!(t.count, 2);
-        // VRAM is summed across devices.
-        assert_eq!(t.vram_used_gib_str, "32.0"); // 8 + 24
-        assert_eq!(t.vram_total_gib_str, "64.0");
-        assert_eq!(t.vram_free_gib_str, "32.0");
-        assert_eq!(t.vram_pct_str, "50"); // 32 / 64
-                                          // Activity is the mean utilization, not a sum.
-        assert_eq!(t.busy_pct_str, "50"); // (40 + 60) / 2
-    }
-
-    #[test]
-    fn gpu_totals_with_no_devices_is_zeroed() {
-        let t = GpuTotals::from_gpus(&[]);
-        assert_eq!(t.count, 0);
-        assert_eq!(t.vram_pct_str, "0");
-        assert_eq!(t.busy_pct_str, "0");
-    }
-
-    #[test]
-    fn fragment_template_wraps_regions_for_oob_morph() {
-        let tpl = DashboardFragmentTemplate {
-            system: SystemDisplay::from_stats(SystemStats {
-                cpu_pct: 0.0,
-                ram_used: 0,
-                ram_total: 0,
-                cpu_temp_c: None,
-            }),
-            gpus: vec![],
-            gpu_totals: GpuTotals::from_gpus(&[]),
-            events: vec![],
-            models: vec![model("m1", "Model One", ModelState::Idle, 1)],
-            has_any_models: true,
-            sort_key: "name".into(),
-            sort_dir_class: "sort-asc".into(),
-            sort_aria: "ascending".into(),
-        };
-        let html = tpl.render().unwrap();
-        // Both live regions are tagged for an out-of-band morph...
-        assert!(html.contains(r#"id="live-left" hx-swap-oob="morph""#));
-        assert!(html.contains(r#"id="live-models" hx-swap-oob="morph""#));
-        // ...and the model row is keyed by id so idiomorph matches it in place.
-        assert!(html.contains(r#"id="model-row-m1""#));
-        // The active sort column carries its arrow class.
-        assert!(html.contains("sort-asc"));
-    }
-}
+#[path = "templates_tests.rs"]
+mod tests;

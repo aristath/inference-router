@@ -1,7 +1,7 @@
-use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::path::Path as StdPath;
 use std::time::Duration;
@@ -47,7 +47,6 @@ pub async fn validate_model(
     Json(model): Json<ModelConfig>,
 ) -> impl IntoResponse {
     let presets = state.list_presets().await;
-    let gpus = state.list_gpus().await;
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
@@ -67,7 +66,6 @@ pub async fn validate_model(
         validate_binary_path(path, &mut errors);
     }
     validate_model_path(&model, &mut errors);
-    validate_tensor_split(&model, gpus.len(), &mut errors, &mut warnings);
     validate_context(&model, &mut warnings);
     validate_cache_quantization(&model, &mut warnings);
 
@@ -201,36 +199,6 @@ fn validate_model_path(model: &ModelConfig, errors: &mut Vec<String>) {
     }
 }
 
-fn validate_tensor_split(
-    model: &ModelConfig,
-    gpu_count: usize,
-    errors: &mut Vec<String>,
-    warnings: &mut Vec<String>,
-) {
-    let Some(split) = model.tensor_split.as_deref() else {
-        return;
-    };
-    let parts: Vec<&str> = split.split(',').map(str::trim).collect();
-    if gpu_count > 0 && parts.len() != gpu_count {
-        warnings.push(format!(
-            "tensor_split has {} entries but {} GPUs were detected",
-            parts.len(),
-            gpu_count,
-        ));
-    }
-    let mut non_zero = false;
-    for part in parts {
-        match part.parse::<f32>() {
-            Ok(v) if v > 0.0 => non_zero = true,
-            Ok(_) => {}
-            Err(_) => errors.push(format!("tensor_split entry '{part}' is not a number")),
-        }
-    }
-    if !non_zero {
-        errors.push("tensor_split must contain at least one positive entry".into());
-    }
-}
-
 fn validate_context(model: &ModelConfig, warnings: &mut Vec<String>) {
     if let Some(meta) = &model.gguf_meta {
         if model.context > meta.max_context {
@@ -317,6 +285,11 @@ pub async fn load_model(
         Err(LoadError::SpawnFailed(e)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": format!("spawn failed: {e}")})),
+        )
+            .into_response(),
+        Err(LoadError::FitProbeFailed(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": format!("fit probe failed: {e}")})),
         )
             .into_response(),
         Err(e @ LoadError::InsufficientVram { .. }) => (
