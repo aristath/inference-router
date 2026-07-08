@@ -32,7 +32,7 @@ pub struct GpuDisplay {
 }
 
 impl GpuDisplay {
-    pub fn from_gpu(gpu: &GpuInfo, gpu_cap_pct: u64, display_cap_pct: u64) -> Self {
+    pub fn from_gpu(gpu: &GpuInfo, gpu_cap_pct: f64, display_cap_pct: f64) -> Self {
         let total_gib = gpu.total_vram as f64 / 1_073_741_824.0;
         let used_gib = gpu.used_vram as f64 / 1_073_741_824.0;
         let free_gib = gpu.free_vram() as f64 / 1_073_741_824.0;
@@ -63,7 +63,7 @@ impl GpuDisplay {
                 .collect::<Vec<_>>()
                 .join(" · "),
             display_attached: gpu.display_attached,
-            vram_cap_str: format!("{}%", gpu.vram_cap_pct(gpu_cap_pct, display_cap_pct)),
+            vram_cap_str: format_pct(gpu.vram_cap_pct(gpu_cap_pct, display_cap_pct)),
             used_gib_str: format!("{:.1}", used_gib),
             total_gib_str: format!("{:.1}", total_gib),
             free_gib_str: format!("{:.1}", free_gib),
@@ -74,6 +74,14 @@ impl GpuDisplay {
             temp_c_str,
             temp_class,
         }
+    }
+}
+
+fn format_pct(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{value:.0}%")
+    } else {
+        format!("{value:.1}%")
     }
 }
 

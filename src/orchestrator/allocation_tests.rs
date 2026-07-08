@@ -36,7 +36,7 @@ fn fit_emits_explicit_device_in_index_order() {
         rocm_gpu(2, 32_000_000_000),
         rocm_gpu(3, 32_000_000_000),
     ];
-    let p = plan_fit_placement(Backend::Rocm, &gpus, 50_000_000_000, 98, 80).unwrap();
+    let p = plan_fit_placement(Backend::Rocm, &gpus, 50_000_000_000, 98.0, 80.0).unwrap();
     assert_eq!(p.device, "ROCm2,ROCm3");
     assert_eq!(p.gpus_used, 2);
     assert_eq!(p.fit_target.split(',').count(), 2);
@@ -47,17 +47,28 @@ fn fit_emits_explicit_device_in_index_order() {
 fn fit_none_when_backend_has_no_devices() {
     // GPUs are Vulkan-only; a ROCm placement finds nothing.
     let gpus = vec![gpu("a", 40_000_000_000)];
-    assert!(plan_fit_placement(Backend::Rocm, &gpus, 10_000_000_000, 98, 80).is_none());
+    assert!(plan_fit_placement(Backend::Rocm, &gpus, 10_000_000_000, 98.0, 80.0).is_none());
 }
 
 #[test]
 fn fit_target_is_margin_to_leave_free() {
     // A 32 GiB card at 98% leaves 2% free ≈ 640 MiB.
     let gpus = vec![rocm_gpu(0, 30_000_000_000)];
-    let p = plan_fit_placement(Backend::Rocm, &gpus, 10_000_000_000, 98, 80).unwrap();
-    let total_mib = gpus[0].total_vram >> 20;
-    let expect = total_mib * 2 / 100;
+    let p = plan_fit_placement(Backend::Rocm, &gpus, 10_000_000_000, 98.0, 80.0).unwrap();
+    let expect =
+        (((gpus[0].total_vram as f64) * 0.02).ceil() as u64).saturating_add(1024 * 1024 - 1) >> 20;
     assert_eq!(p.fit_target.parse::<u64>().unwrap(), expect);
+}
+
+#[test]
+fn fit_target_accepts_decimal_caps() {
+    let gpus = vec![rocm_gpu(0, 30_000_000_000)];
+    let p = plan_fit_placement(Backend::Rocm, &gpus, 10_000_000_000, 99.9, 80.0).unwrap();
+    let margin_mib = p.fit_target.parse::<u64>().unwrap();
+    let expect =
+        (((gpus[0].total_vram as f64) * 0.001).ceil() as u64).saturating_add(1024 * 1024 - 1) >> 20;
+    assert_eq!(margin_mib, expect);
+    assert!(margin_mib < 64, "99.9% should leave only a tiny margin");
 }
 
 #[test]
@@ -67,7 +78,7 @@ fn display_gpu_gets_a_larger_margin_than_a_normal_gpu() {
     let a = rocm_gpu(0, 30_000_000_000);
     let mut b = rocm_gpu(1, 30_000_000_000);
     b.display_attached = true;
-    let p = plan_fit_placement(Backend::Rocm, &[a, b], 45_000_000_000, 98, 80).unwrap();
+    let p = plan_fit_placement(Backend::Rocm, &[a, b], 45_000_000_000, 98.0, 80.0).unwrap();
     let parts: Vec<u64> = p
         .fit_target
         .split(',')
@@ -83,7 +94,7 @@ fn display_gpu_gets_a_larger_margin_than_a_normal_gpu() {
 fn fit_skips_full_gpus_but_keeps_those_with_any_free() {
     // A card with even a sliver of free VRAM is still offered to -fit.
     let gpus = vec![rocm_gpu(0, 0), rocm_gpu(1, 1_000_000_000)];
-    let p = plan_fit_placement(Backend::Rocm, &gpus, 500_000_000, 98, 80).unwrap();
+    let p = plan_fit_placement(Backend::Rocm, &gpus, 500_000_000, 98.0, 80.0).unwrap();
     assert_eq!(p.device, "ROCm1");
     assert_eq!(p.gpus_used, 1);
 }
@@ -97,7 +108,7 @@ fn fit_uses_one_gpu_when_the_model_fits_on_one() {
         rocm_gpu(1, 32_000_000_000),
         rocm_gpu(2, 32_000_000_000),
     ];
-    let p = plan_fit_placement(Backend::Rocm, &gpus, 20_000_000_000, 98, 80).unwrap();
+    let p = plan_fit_placement(Backend::Rocm, &gpus, 20_000_000_000, 98.0, 80.0).unwrap();
     assert_eq!(p.gpus_used, 1, "must not split a 1-GPU model");
     assert_eq!(p.device, "ROCm0");
 }
@@ -106,7 +117,7 @@ fn fit_uses_one_gpu_when_the_model_fits_on_one() {
 fn fit_picks_the_most_free_gpu_not_a_busy_one() {
     // A 20 GB model: skip the nearly-full card, land on the free one.
     let gpus = vec![rocm_gpu(0, 5_000_000_000), rocm_gpu(1, 32_000_000_000)];
-    let p = plan_fit_placement(Backend::Rocm, &gpus, 20_000_000_000, 98, 80).unwrap();
+    let p = plan_fit_placement(Backend::Rocm, &gpus, 20_000_000_000, 98.0, 80.0).unwrap();
     assert_eq!(p.gpus_used, 1);
     assert_eq!(p.device, "ROCm1");
 }
@@ -116,7 +127,7 @@ fn fit_falls_back_to_all_gpus_when_nothing_covers_it() {
     // A huge MoE larger than all GPUs combined → use every eligible GPU and
     // let -fit spill the overflow to CPU (NOT None, NOT a single GPU).
     let gpus = vec![rocm_gpu(0, 32_000_000_000), rocm_gpu(1, 32_000_000_000)];
-    let p = plan_fit_placement(Backend::Rocm, &gpus, 500_000_000_000, 98, 80).unwrap();
+    let p = plan_fit_placement(Backend::Rocm, &gpus, 500_000_000_000, 98.0, 80.0).unwrap();
     assert_eq!(p.gpus_used, 2);
     assert_eq!(p.device, "ROCm0,ROCm1");
 }
@@ -125,6 +136,6 @@ fn fit_falls_back_to_all_gpus_when_nothing_covers_it() {
 fn fit_zero_estimate_uses_all_eligible_gpus() {
     // No usable estimate (gguf parse failed) → can't size, so use everything.
     let gpus = vec![rocm_gpu(0, 32_000_000_000), rocm_gpu(1, 32_000_000_000)];
-    let p = plan_fit_placement(Backend::Rocm, &gpus, 0, 98, 80).unwrap();
+    let p = plan_fit_placement(Backend::Rocm, &gpus, 0, 98.0, 80.0).unwrap();
     assert_eq!(p.gpus_used, 2);
 }

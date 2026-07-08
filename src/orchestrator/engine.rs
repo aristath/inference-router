@@ -1854,7 +1854,7 @@ fn place_model(
     targets: &[Backend],
     gpus: &[GpuInfo],
     reserved: u64,
-    caps: (u8, u8),
+    caps: (f64, f64),
 ) -> Result<PlaceOutcome, crate::vram::llama_fit::LlamaFitError> {
     if model.weights_format == WeightsFormat::Gguf {
         return place_gguf_with_llama_fit(model, draft, targets, gpus, reserved, caps);
@@ -1878,7 +1878,7 @@ fn place_gguf_with_llama_fit(
     targets: &[Backend],
     gpus: &[GpuInfo],
     reserved: u64,
-    caps: (u8, u8),
+    caps: (f64, f64),
 ) -> Result<PlaceOutcome, crate::vram::llama_fit::LlamaFitError> {
     let fit_binary = fit_binary_for_server(&model.binary);
     let adjusted = subtract_reserved_from_gpus(gpus.to_vec(), reserved);
@@ -1889,14 +1889,17 @@ fn place_gguf_with_llama_fit(
         let eligible = model_visible_gpus(model, adjusted);
         let free: u64 = eligible
             .iter()
-            .map(|g| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
+            .map(|g| g.allocatable_vram(gpu_cap_pct, display_cap_pct))
             .sum();
         if eligible.is_empty() {
             return Ok(PlaceOutcome::DoesNotFit { free });
         }
         let fit_target = eligible
             .iter()
-            .map(|g| fit_target_for_probe_mib(g, gpus, gpu_cap_pct, display_cap_pct).to_string())
+            .map(|g| {
+                fit_target_for_model_probe_mib(model, g, gpus, gpu_cap_pct, display_cap_pct)
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join(",");
         let sizing = run_llama_fit_sizing(&fit_binary, model, draft, &device, &fit_target)?;
@@ -1928,9 +1931,8 @@ fn place_gguf_with_llama_fit(
         if by_alloc.is_empty() {
             continue;
         }
-        by_alloc.sort_by_key(|g| {
-            std::cmp::Reverse(g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
-        });
+        by_alloc
+            .sort_by_key(|g| std::cmp::Reverse(g.allocatable_vram(gpu_cap_pct, display_cap_pct)));
 
         let mut spill: Option<FitCandidate> = None;
         for count in 1..=by_alloc.len() {
@@ -1938,7 +1940,7 @@ fn place_gguf_with_llama_fit(
             chosen.sort_by_key(|g| g.backend_index(backend).unwrap_or(usize::MAX));
             let free: u64 = chosen
                 .iter()
-                .map(|g| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
+                .map(|g| g.allocatable_vram(gpu_cap_pct, display_cap_pct))
                 .sum();
             best_free = best_free.max(free);
 
@@ -1953,7 +1955,8 @@ fn place_gguf_with_llama_fit(
             let fit_target = chosen
                 .iter()
                 .map(|g| {
-                    fit_target_for_probe_mib(g, gpus, gpu_cap_pct, display_cap_pct).to_string()
+                    fit_target_for_model_probe_mib(model, g, gpus, gpu_cap_pct, display_cap_pct)
+                        .to_string()
                 })
                 .collect::<Vec<_>>()
                 .join(",");
@@ -2104,16 +2107,22 @@ fn model_n_layers(model: &ModelConfig) -> Option<u32> {
 fn fit_target_for_probe_mib(
     adjusted_gpu: &GpuInfo,
     original_gpus: &[GpuInfo],
-    gpu_cap_pct: u8,
-    display_cap_pct: u8,
+    gpu_cap_pct: f64,
+    display_cap_pct: f64,
 ) -> u64 {
     let cap = if adjusted_gpu.display_attached {
         display_cap_pct
     } else {
         gpu_cap_pct
-    }
-    .clamp(1, 100) as u64;
-    let base_margin = adjusted_gpu.total_vram.saturating_mul(100 - cap) / 100;
+    };
+    let cap = if cap.is_finite() {
+        cap.clamp(1.0, 100.0)
+    } else if adjusted_gpu.display_attached {
+        80.0
+    } else {
+        98.0
+    };
+    let base_margin = ((adjusted_gpu.total_vram as f64) * (100.0 - cap) / 100.0).ceil() as u64;
     let original_used = original_gpus
         .iter()
         .find(|g| same_gpu(g, adjusted_gpu))
@@ -2121,6 +2130,27 @@ fn fit_target_for_probe_mib(
         .unwrap_or(adjusted_gpu.used_vram);
     let reserved = adjusted_gpu.used_vram.saturating_sub(original_used);
     bytes_to_mib_ceil(base_margin.saturating_add(reserved))
+}
+
+fn fit_target_for_model_probe_mib(
+    model: &ModelConfig,
+    adjusted_gpu: &GpuInfo,
+    original_gpus: &[GpuInfo],
+    gpu_cap_pct: f64,
+    display_cap_pct: f64,
+) -> u64 {
+    let original_used = original_gpus
+        .iter()
+        .find(|g| same_gpu(g, adjusted_gpu))
+        .map(|g| g.used_vram)
+        .unwrap_or(adjusted_gpu.used_vram);
+    let reserved = adjusted_gpu.used_vram.saturating_sub(original_used);
+    model
+        .fit_target_margin_mib
+        .map(|margin| margin.saturating_add(bytes_to_mib_ceil(reserved)))
+        .unwrap_or_else(|| {
+            fit_target_for_probe_mib(adjusted_gpu, original_gpus, gpu_cap_pct, display_cap_pct)
+        })
 }
 
 fn same_gpu(a: &GpuInfo, b: &GpuInfo) -> bool {
@@ -2146,7 +2176,7 @@ fn try_place(
     targets: &[Backend],
     gpus: &[GpuInfo],
     reserved: u64,
-    caps: (u8, u8),
+    caps: (f64, f64),
 ) -> PlaceOutcome {
     let adjusted = subtract_reserved_from_gpus(gpus.to_vec(), reserved);
     let (gpu_cap_pct, display_cap_pct) = caps;
@@ -2157,7 +2187,7 @@ fn try_place(
         let eligible = model_visible_gpus(model, adjusted);
         let free: u64 = eligible
             .iter()
-            .map(|g| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
+            .map(|g| g.allocatable_vram(gpu_cap_pct, display_cap_pct))
             .sum();
         return if model.estimated_vram == 0 || free >= model.estimated_vram {
             PlaceOutcome::Fits
@@ -2175,7 +2205,7 @@ fn try_place(
             .collect();
         let free: u64 = candidates
             .iter()
-            .map(|g| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64))
+            .map(|g| g.allocatable_vram(gpu_cap_pct, display_cap_pct))
             .sum();
         best_free = best_free.max(free);
         if let Some(p) = plan_fit_placement(

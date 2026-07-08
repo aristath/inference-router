@@ -48,8 +48,8 @@ pub fn plan_fit_placement(
     backend: Backend,
     candidates: &[GpuInfo],
     needed_vram: u64,
-    gpu_cap_pct: u8,
-    display_cap_pct: u8,
+    gpu_cap_pct: f64,
+    display_cap_pct: f64,
 ) -> Option<FitPlacement> {
     let eligible: Vec<&GpuInfo> = candidates
         .iter()
@@ -59,7 +59,7 @@ pub fn plan_fit_placement(
         return None;
     }
 
-    let alloc = |g: &GpuInfo| g.allocatable_vram(gpu_cap_pct as u64, display_cap_pct as u64);
+    let alloc = |g: &GpuInfo| g.allocatable_vram(gpu_cap_pct, display_cap_pct);
 
     // Greedy most-free-first: fewest GPUs that cover the model.
     let mut by_alloc = eligible.clone();
@@ -104,15 +104,21 @@ pub fn plan_fit_placement(
 
 /// The `--fit-target` margin for one GPU, in MiB: the VRAM `-fit` must leave
 /// free so the GPU ends at its cap. `(100 - cap%) × total_vram`.
-fn fit_target_mib(gpu: &GpuInfo, gpu_cap_pct: u8, display_cap_pct: u8) -> u64 {
+fn fit_target_mib(gpu: &GpuInfo, gpu_cap_pct: f64, display_cap_pct: f64) -> u64 {
     let cap = if gpu.display_attached {
         display_cap_pct
     } else {
         gpu_cap_pct
-    }
-    .clamp(1, 100) as u64;
-    let margin_bytes = gpu.total_vram.saturating_mul(100 - cap) / 100;
-    margin_bytes >> 20
+    };
+    let cap = if cap.is_finite() {
+        cap.clamp(1.0, 100.0)
+    } else if gpu.display_attached {
+        80.0
+    } else {
+        98.0
+    };
+    let margin_bytes = ((gpu.total_vram as f64) * (100.0 - cap) / 100.0).ceil() as u64;
+    margin_bytes.saturating_add(1024 * 1024 - 1) >> 20
 }
 
 #[cfg(test)]

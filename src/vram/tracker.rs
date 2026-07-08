@@ -72,13 +72,19 @@ impl GpuInfo {
     /// `gpu_cap_pct`. Both come from `AppSettings` (the single source of truth).
     /// A placement guard, not a hard limit — it keeps a safety margin so a
     /// fully-packed model can't OOM the GPU.
-    pub fn vram_cap_pct(&self, gpu_cap_pct: u64, display_cap_pct: u64) -> u64 {
+    pub fn vram_cap_pct(&self, gpu_cap_pct: f64, display_cap_pct: f64) -> f64 {
         let pct = if self.display_attached {
             display_cap_pct
         } else {
             gpu_cap_pct
         };
-        pct.clamp(1, 100)
+        if pct.is_finite() {
+            pct.clamp(1.0, 100.0)
+        } else if self.display_attached {
+            80.0
+        } else {
+            98.0
+        }
     }
 
     /// VRAM (bytes) the router may still allocate on this GPU without crossing
@@ -86,11 +92,10 @@ impl GpuInfo {
     /// heuristic sizes against this, not raw `free_vram`, so a GPU is never
     /// treated as filled past its margin (existing desktop usage on a display
     /// GPU is already part of `used`).
-    pub fn allocatable_vram(&self, gpu_cap_pct: u64, display_cap_pct: u64) -> u64 {
-        let cap = self
-            .total_vram
-            .saturating_mul(self.vram_cap_pct(gpu_cap_pct, display_cap_pct))
-            / 100;
+    pub fn allocatable_vram(&self, gpu_cap_pct: f64, display_cap_pct: f64) -> u64 {
+        let cap = ((self.total_vram as f64) * self.vram_cap_pct(gpu_cap_pct, display_cap_pct)
+            / 100.0)
+            .floor() as u64;
         cap.saturating_sub(self.used_vram)
     }
 

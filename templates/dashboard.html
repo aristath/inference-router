@@ -308,6 +308,11 @@
                                     <small class="field-help">Concurrent request slots. 0 = llama.cpp default.</small>
                                 </div>
                             </div>
+                            <div class="form-group">
+                                <label for="fit_target_margin_mib">Fit target margin MiB (<code>--fit-target</code>)</label>
+                                <input type="number" id="fit_target_margin_mib" name="fit_target_margin_mib" min="0" step="1" placeholder="global cap-derived">
+                                <small class="field-help">Per-device free margin for llama.cpp fit. Blank = derive from GPU caps.</small>
+                            </div>
                             <div class="form-group" id="n_gpu_layers_group">
                                 <label for="n_gpu_layers">
                                     GPU layers (<code>-ngl</code>)
@@ -597,12 +602,12 @@
                     <div class="form-row">
                         <div class="form-group">
                             <label for="gpu-vram-cap">GPU cap (%)</label>
-                            <input type="number" id="gpu-vram-cap" min="1" max="100" step="1">
+                            <input type="number" id="gpu-vram-cap" min="1" max="100" step="0.1">
                             <small class="field-help">How full llama.cpp's <code>-fit</code> packs each GPU. The remainder becomes the per-device <code>--fit-target</code> margin.</small>
                         </div>
                         <div class="form-group">
                             <label for="display-vram-cap">Display GPU cap (%)</label>
-                            <input type="number" id="display-vram-cap" min="1" max="100" step="1">
+                            <input type="number" id="display-vram-cap" min="1" max="100" step="0.1">
                             <small class="field-help">Lower cap for a GPU driving a monitor, leaving headroom for the desktop.</small>
                         </div>
                     </div>
@@ -801,6 +806,7 @@ const MODEL_DEFAULTS = {
     presence_penalty: 0.0, repeat_penalty: 1.0,
     flash_attn: false, n_gpu_layers: null, n_cpu_moe: null, mlock: false, no_mmap: false,
     parallel_slots: null, cache_type_k: null, cache_type_v: null,
+    fit_target_margin_mib: null,
     split_mode: null, main_gpu: null, tensor_split: null,
     threads: null, cache_ram_mib: null,
     reasoning_format: null, reasoning_budget: null,
@@ -1184,6 +1190,7 @@ function updateTabBadges() {
         b('no_mmap'),
         !!v('n_gpu_layers'),
         !!v('parallel_slots'),
+        !!v('fit_target_margin_mib'),
         !!v('split_mode'),
         !!v('tensor_split'),
         !!v('mmproj_path'),
@@ -1386,6 +1393,8 @@ function populateModelForm(m, mode) {
     applyMoeVisibility(m.gguf_meta || (mode === 'edit' ? _editingModelGgufMeta : _currentGgufMeta));
     setOptionalSlider('n_cpu_moe', m.n_cpu_moe);
     setOptionalSlider('parallel_slots', m.parallel_slots);
+    f.fit_target_margin_mib.value =
+        m.fit_target_margin_mib == null ? '' : String(m.fit_target_margin_mib);
     f.cache_type_k.value = m.cache_type_k ?? '';
     f.cache_type_v.value = m.cache_type_v ?? '';
     f.split_mode.value = m.split_mode ?? '';
@@ -2068,7 +2077,7 @@ function readLoopGuardSettings() {
         el.style.color = kind === 'error' ? '#fca5a5' : (kind === 'ok' ? '#86efac' : '#94a3b8');
     };
     const clampPct = (id, fallback) => {
-        const n = parseInt((document.getElementById(id) || {}).value, 10);
+        const n = parseFloat((document.getElementById(id) || {}).value);
         if (!Number.isFinite(n)) return fallback;
         return Math.min(100, Math.max(1, n));
     };
@@ -2367,6 +2376,7 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         mlock: f.mlock.checked,
         no_mmap: f.no_mmap.checked,
         parallel_slots: toOptInt(f.parallel_slots.value),
+        fit_target_margin_mib: toOptInt(f.fit_target_margin_mib.value),
         cache_type_k: toOptStr(f.cache_type_k.value),
         cache_type_v: toOptStr(f.cache_type_v.value),
         split_mode: toOptStr(f.split_mode.value),

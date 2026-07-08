@@ -167,6 +167,23 @@ fn server_owned_fit_keeps_device_and_target_without_fixed_placement() {
 }
 
 #[test]
+fn model_fit_target_margin_overrides_cap_margin() {
+    let mut g = gpu("1", "0000:03:00.0", 1);
+    g.total_vram = 32 * 1024 * 1024 * 1024;
+    g.used_vram = 4 * 1024 * 1024 * 1024;
+    let mut adjusted = g.clone();
+    adjusted.used_vram += 512 * 1024 * 1024;
+
+    let mut m = model("a");
+    m.fit_target_margin_mib = Some(128);
+
+    assert_eq!(
+        fit_target_for_model_probe_mib(&m, &adjusted, &[g], 99.9, 80.0),
+        640
+    );
+}
+
+#[test]
 fn device_list_is_canonicalized_to_vulkan_order() {
     let gpus = vec![
         gpu("1", "0000:03:00.0", 1),

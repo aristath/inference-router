@@ -81,14 +81,21 @@ fn allocatable_vram_applies_caps_and_subtracts_used() {
         display_attached: false,
     };
     // 98% cap on a normal GPU.
-    assert_eq!(g.allocatable_vram(98, 80), 32 * gib * 98 / 100);
+    assert_eq!(g.allocatable_vram(98.0, 80.0), 32 * gib * 98 / 100);
+    assert_eq!(
+        g.allocatable_vram(99.9, 80.0),
+        ((32 * gib) as f64 * 0.999).floor() as u64
+    );
     // Existing usage is subtracted.
     g.used_vram = 10 * gib;
-    assert_eq!(g.allocatable_vram(98, 80), 32 * gib * 98 / 100 - 10 * gib);
+    assert_eq!(
+        g.allocatable_vram(98.0, 80.0),
+        32 * gib * 98 / 100 - 10 * gib
+    );
     // Display GPU drops to the 80% cap.
     g.display_attached = true;
     g.used_vram = 0;
-    assert_eq!(g.allocatable_vram(98, 80), 32 * gib * 80 / 100);
+    assert_eq!(g.allocatable_vram(98.0, 80.0), 32 * gib * 80 / 100);
 }
 
 #[test]

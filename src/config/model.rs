@@ -178,6 +178,10 @@ pub struct ModelConfig {
     /// Legacy/internal only; normal loads probe first and launch fitted args.
     #[serde(skip)]
     pub fit_target: Option<String>,
+    /// Optional per-device fit margin in MiB for llama.cpp `--fit-target`.
+    /// When unset, the router derives margins from the global GPU caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_target_margin_mib: Option<u64>,
     #[serde(default)]
     pub mlock: bool,
     #[serde(default)]
@@ -304,6 +308,7 @@ impl Default for ModelConfig {
             n_cpu_moe: None,
             override_tensor: None,
             fit_target: None,
+            fit_target_margin_mib: None,
             mlock: false,
             no_mmap: false,
             parallel_slots: None,

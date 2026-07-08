@@ -15,11 +15,11 @@ pub struct AppSettings {
     pub model_exposure: ModelExposure,
     /// Percent of a GPU's VRAM the router lets llama.cpp fill (`--fit-target`
     /// margin = the remainder). Keeps a safety margin so a packed model can't
-    /// OOM the GPU. 1..=100.
-    pub gpu_vram_cap_pct: u8,
+    /// OOM the GPU. 1.0..=100.0.
+    pub gpu_vram_cap_pct: f64,
     /// Same, but for a GPU driving a monitor — lower, to leave headroom for the
-    /// desktop/compositor. 1..=100.
-    pub display_gpu_vram_cap_pct: u8,
+    /// desktop/compositor. 1.0..=100.0.
+    pub display_gpu_vram_cap_pct: f64,
     /// Watchdog / self-heal configuration for wedged inference instances.
     pub watchdog: WatchdogSettings,
 }
@@ -30,8 +30,8 @@ impl Default for AppSettings {
             models_folder: default_models_folder(),
             loop_guards: LoopGuardSettings::default(),
             model_exposure: ModelExposure::default(),
-            gpu_vram_cap_pct: 98,
-            display_gpu_vram_cap_pct: 80,
+            gpu_vram_cap_pct: 98.0,
+            display_gpu_vram_cap_pct: 80.0,
             watchdog: WatchdogSettings::default(),
         }
     }
@@ -46,9 +46,9 @@ impl AppSettings {
                 .unwrap_or_else(default_models_folder),
             loop_guards: LoopGuardSettings::from_env(),
             model_exposure: ModelExposure::from_env(),
-            gpu_vram_cap_pct: env_pct("INFERENCE_ROUTER_GPU_VRAM_CAP_PCT").unwrap_or(98),
+            gpu_vram_cap_pct: env_pct("INFERENCE_ROUTER_GPU_VRAM_CAP_PCT").unwrap_or(98.0),
             display_gpu_vram_cap_pct: env_pct("INFERENCE_ROUTER_DISPLAY_VRAM_CAP_PCT")
-                .unwrap_or(80),
+                .unwrap_or(80.0),
             watchdog: WatchdogSettings::from_env(),
         }
     }
@@ -57,8 +57,8 @@ impl AppSettings {
         if self.models_folder.trim().is_empty() {
             self.models_folder = default_models_folder();
         }
-        self.gpu_vram_cap_pct = self.gpu_vram_cap_pct.clamp(1, 100);
-        self.display_gpu_vram_cap_pct = self.display_gpu_vram_cap_pct.clamp(1, 100);
+        self.gpu_vram_cap_pct = sanitize_pct(self.gpu_vram_cap_pct, 98.0);
+        self.display_gpu_vram_cap_pct = sanitize_pct(self.display_gpu_vram_cap_pct, 80.0);
         self.loop_guards.sanitize();
         self.watchdog.sanitize();
         self
@@ -201,13 +201,21 @@ impl WatchdogSettings {
     }
 }
 
-fn env_pct(name: &str) -> Option<u8> {
+fn env_pct(name: &str) -> Option<f64> {
     std::env::var(name)
         .ok()?
         .trim()
-        .parse::<u8>()
+        .parse::<f64>()
         .ok()
-        .filter(|p| (1..=100).contains(p))
+        .filter(|p| p.is_finite() && (1.0..=100.0).contains(p))
+}
+
+fn sanitize_pct(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(1.0, 100.0)
+    } else {
+        fallback
+    }
 }
 
 fn default_models_folder() -> String {

@@ -235,7 +235,7 @@ async fn collect_live_data(state: &AppState, sort: &str, dir: &str, query: &str)
     let sys = state.system_stats();
     let (gpu_cap, display_cap) = {
         let s = state.settings().await;
-        (s.gpu_vram_cap_pct as u64, s.display_gpu_vram_cap_pct as u64)
+        (s.gpu_vram_cap_pct, s.display_gpu_vram_cap_pct)
     };
 
     let perf = state.perf_snapshot();

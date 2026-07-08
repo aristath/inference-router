@@ -66,8 +66,8 @@ struct GpuResponse {
     temp_c: Option<f32>,
     /// True when a monitor is connected to this GPU (gets a larger VRAM margin)
     display_attached: bool,
-    /// Percentage of VRAM the router will fill on this GPU (95, or 75 w/ display)
-    vram_cap_pct: u64,
+    /// Percentage of VRAM the router will fill on this GPU.
+    vram_cap_pct: f64,
 }
 
 /// Model configuration and runtime state.
@@ -132,7 +132,7 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
     let sys = state.system_stats();
     let (gpu_cap, display_cap) = {
         let s = state.settings().await;
-        (s.gpu_vram_cap_pct as u64, s.display_gpu_vram_cap_pct as u64)
+        (s.gpu_vram_cap_pct, s.display_gpu_vram_cap_pct)
     };
 
     let response = StatusResponse {

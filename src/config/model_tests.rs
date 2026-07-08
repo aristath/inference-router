@@ -13,6 +13,7 @@ fn sample() -> ModelConfig {
         context: 32768,
         flash_attn: true,
         n_gpu_layers: Some(99),
+        fit_target_margin_mib: Some(256),
         mlock: true,
         parallel_slots: Some(4),
         cache_type_k: Some(CacheType::Q8_0),
@@ -77,6 +78,7 @@ fn runtime_fields_default_when_absent() {
     // New llama.cpp flags all default to off/unset.
     assert!(!parsed.flash_attn);
     assert_eq!(parsed.n_gpu_layers, None);
+    assert_eq!(parsed.fit_target_margin_mib, None);
     assert!(!parsed.mlock);
     assert!(!parsed.no_mmap);
     assert_eq!(parsed.parallel_slots, None);
