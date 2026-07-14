@@ -8,7 +8,8 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::config::{
-    AppSettings, Backend, BinaryPreset, CacheType, ModelAlias, ModelConfig, WeightsFormat,
+    AppSettings, Backend, BinaryPreset, CacheType, ModelAlias, ModelConfig, ModelState,
+    WeightsFormat,
 };
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
 use crate::vram::estimator::GgufMeta;
@@ -27,6 +28,26 @@ impl Serialize for ModelResponse {
         let object = value
             .as_object_mut()
             .ok_or_else(|| serde::ser::Error::custom("ModelConfig did not serialize to object"))?;
+        let (state, state_message) = match &self.model.state {
+            ModelState::Idle => ("idle", None),
+            ModelState::Loading => ("loading", None),
+            ModelState::Running => ("running", None),
+            ModelState::Error(msg) => ("error", Some(msg.clone())),
+        };
+        object.insert("state".into(), serde_json::Value::from(state));
+        object.insert(
+            "state_message".into(),
+            state_message
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "pid".into(),
+            self.model
+                .pid
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
         object
             .entry("file_size_bytes")
             .or_insert_with(|| serde_json::Value::from(self.file_size_bytes));

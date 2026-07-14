@@ -184,6 +184,24 @@ async fn api_models_exposes_file_size_bytes_for_dropdown_sorting() {
 }
 
 #[tokio::test]
+async fn api_models_exposes_runtime_state_without_persisting_it() {
+    let port = serve(orchestrator_with_two_models().await).await;
+    let (status, body) = get(port, "/api/models").await;
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let models: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let zulu = models
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "zulu")
+        .unwrap();
+    assert_eq!(zulu["state"], "running");
+    assert!(zulu.get("state_message").is_some());
+    assert!(zulu.get("pid").is_some());
+}
+
+#[tokio::test]
 async fn fragment_filters_server_side() {
     let port = serve(orchestrator_with_two_models().await).await;
 
@@ -241,4 +259,14 @@ async fn index_page_loads_libraries_and_live_regions() {
     // ...and the live regions exist for the poll loop to morph into.
     assert!(body.contains(r#"id="live-left""#));
     assert!(body.contains(r#"id="live-models""#));
+    // The tabbed editor handles validation in JS so hidden tab fields cannot
+    // block submission with the browser's "not focusable" native error.
+    assert!(body.contains(r#"id="model-form" novalidate"#));
+    // Context presets keep common large values one click away.
+    assert!(body.contains(r#"id="context-presets""#));
+    assert!(body.contains(r#"data-context-preset="131072">128K"#));
+    assert!(body.contains(r#"data-context-preset="max">Max"#));
+    // HTML pattern attributes are compiled by modern browsers with the `v`
+    // regexp flag, where `-` must be escaped in this character class.
+    assert!(body.contains(r#"pattern="[a-z0-9._\-]+""#));
 }

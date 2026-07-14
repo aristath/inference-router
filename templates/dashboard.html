@@ -50,7 +50,7 @@
                         <label for="alias-name">Alias</label>
                         <input type="text" id="alias-name" placeholder="e.g. gpt-4o"
                                autocapitalize="off" autocorrect="off" spellcheck="false"
-                               pattern="[a-z0-9._-]+" maxlength="64">
+                               pattern="[a-z0-9._\-]+" maxlength="64">
                         <small class="field-help">Unique. Lowercase letters, digits, <code>.</code> <code>_</code> <code>-</code>. Can't collide with a model id. Renaming is allowed.</small>
                     </div>
                     <div class="form-group">
@@ -134,7 +134,7 @@
                     <button type="button" class="tab-btn" data-tab="advanced" onclick="switchTab('advanced')">Advanced<span class="tab-badge" id="badge-advanced"></span></button>
                 </div>
 
-                <form id="model-form">
+                <form id="model-form" novalidate>
                     <input type="hidden" id="model_path" name="model_path">
 
                     <!-- ── Essentials ── -->
@@ -182,7 +182,18 @@
                                 Context
                                 <span id="context-model-max" style="color:#94a3b8; font-weight:normal; font-size:1rem; margin-left:0.5rem;"></span>
                             </label>
-                            <input type="number" id="context" name="context" min="0" required>
+                            <div class="context-control">
+                                <input type="number" id="context" name="context" min="0" required>
+                                <div class="context-presets" id="context-presets" aria-label="Context presets">
+                                    <button type="button" data-context-preset="8192">8K</button>
+                                    <button type="button" data-context-preset="16384">16K</button>
+                                    <button type="button" data-context-preset="32768">32K</button>
+                                    <button type="button" data-context-preset="65536">64K</button>
+                                    <button type="button" data-context-preset="131072">128K</button>
+                                    <button type="button" data-context-preset="262144">256K</button>
+                                    <button type="button" data-context-preset="max">Max</button>
+                                </div>
+                            </div>
                             <input type="range" id="context-slider" min="0" max="131072" step="1024"
                                    style="display:none; margin-top:0.5rem;">
                             <div id="vram-readout" style="display:none; margin-top:0.5rem; font-size:1rem; color:#38bdf8;"></div>
@@ -719,6 +730,13 @@
 
 <style>
 .slider-number { width: 5.5rem; text-align: right; }
+.context-control { display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center; }
+.context-control input[type="number"] { width:9rem; }
+.context-presets { display:flex; flex-wrap:wrap; gap:0.35rem; align-items:center; }
+.context-presets button { border:1px solid #334155; background:#0f172a; color:#cbd5e1; border-radius:6px; padding:0.32rem 0.58rem; font:inherit; font-size:0.9rem; line-height:1.1; cursor:pointer; min-width:3.1rem; }
+.context-presets button:hover:not(:disabled) { border-color:#38bdf8; color:#e0f2fe; }
+.context-presets button.active { background:#0369a1; border-color:#38bdf8; color:#f8fafc; }
+.context-presets button:disabled { opacity:0.38; cursor:not-allowed; }
 .field-help { display: block; color: #94a3b8; font-size: 1rem; margin-top: 0.25rem; line-height: 1.5; }
 .field-help code { background: #334155; padding: 0 0.25rem; border-radius: 3px; font-size: 1em; }
 .tab-bar { display:flex; gap:0; border-bottom:2px solid #334155; margin-bottom:0.75rem; overflow-x:auto; }
@@ -823,6 +841,7 @@ const MODEL_DEFAULTS = {
 let _currentGgufMeta = null;
 let _editingModelGgufMeta = null;
 let _ggufApplyInfo = null;     // set by GGUF preview IIFE once mounted
+let _ggufResetInfo = null;
 let _step1BrowserCwd = null;
 let _lastModelScan = null;
 
@@ -1428,6 +1447,7 @@ function populateModelForm(m, mode) {
     const ctxHint = document.getElementById('context-hint');
     ctxHint.style.display = '';
     ctxHint.textContent = 'Select a GGUF file to get a VRAM estimate and slider.';
+    if (_ggufResetInfo) _ggufResetInfo();
 
     // If we already have GgufMeta (from step 1 or stored on the model),
     // apply it immediately to the VRAM preview.
@@ -1600,9 +1620,48 @@ document.addEventListener('click', (e) => {
     const readout = document.getElementById('vram-readout');
     const modelMaxEl = document.getElementById('context-model-max');
     const hint = document.getElementById('context-hint');
+    const presetButtons = [...document.querySelectorAll('[data-context-preset]')];
     let info = null;
 
     function gib(bytes) { return (bytes / 1073741824).toFixed(2); }
+
+    function currentLimit() {
+        return info && info.max_context ? info.max_context : null;
+    }
+
+    function parseContextValue() {
+        return parseInt(ctxInput.value, 10) || 0;
+    }
+
+    function clampContext(value) {
+        const limit = currentLimit();
+        const parsed = Math.max(parseInt(value, 10) || 0, 0);
+        return limit ? Math.min(parsed, limit) : parsed;
+    }
+
+    function refreshPresets(activeContext) {
+        const limit = currentLimit();
+        const active = activeContext == null ? parseContextValue() : activeContext;
+        presetButtons.forEach(btn => {
+            const raw = btn.dataset.contextPreset;
+            const value = raw === 'max' ? limit : parseInt(raw, 10);
+            const disabled = !value || (limit && value > limit);
+            btn.disabled = !!disabled;
+            btn.classList.toggle('active', !disabled && value === active);
+        });
+    }
+
+    function setContext(value, notify) {
+        const ctx = clampContext(value);
+        ctxInput.value = ctx;
+        if (info) slider.value = ctx;
+        refreshPresets(ctx);
+        recompute(ctx);
+        if (notify) {
+            ctxInput.dispatchEvent(new Event('input', { bubbles: true }));
+            ctxInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
 
     function cacheBytes(sel) {
         const v = (document.getElementById(sel) || {}).value || '';
@@ -1633,6 +1692,12 @@ document.addEventListener('click', (e) => {
             `Weights ${gib(info.file_size)} GiB  +  KV ${gib(kv)} GiB  =  ${gib(total)} GiB total`;
     }
 
+    function resetInfo() {
+        info = null;
+        ctxInput.removeAttribute('max');
+        refreshPresets(parseContextValue());
+    }
+
     function applyInfo(newInfo) {
         info = newInfo;
         modelMaxEl.textContent = `(trained for ${info.max_context.toLocaleString()} tokens)`;
@@ -1644,6 +1709,7 @@ document.addEventListener('click', (e) => {
         ctxInput.value = current;
         slider.value = current;
         ctxInput.max = info.max_context;
+        refreshPresets(current);
 
         const ngl = document.getElementById('n_gpu_layers_slider');
         const nglHidden = document.getElementById('n_gpu_layers');
@@ -1664,17 +1730,20 @@ document.addEventListener('click', (e) => {
     // Expose so that _showStep2 / populateModelForm can trigger a preview
     // without needing a user-visible path input field.
     _ggufApplyInfo = applyInfo;
+    _ggufResetInfo = resetInfo;
 
     slider.addEventListener('input', () => {
-        ctxInput.value = slider.value;
-        recompute(parseInt(slider.value, 10));
+        setContext(slider.value, false);
     });
     ctxInput.addEventListener('input', () => {
-        if (info) {
-            const v = Math.min(Math.max(parseInt(ctxInput.value, 10) || 0, 0), info.max_context);
-            slider.value = v;
-            recompute(v);
-        }
+        setContext(ctxInput.value, false);
+    });
+    presetButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const raw = btn.dataset.contextPreset;
+            const value = raw === 'max' ? currentLimit() : parseInt(raw, 10);
+            if (value) setContext(value, true);
+        });
     });
     document.getElementById('cache_type_k').addEventListener('change', () => {
         if (info) recompute(parseInt(slider.value || ctxInput.value, 10) || 0);
@@ -1682,6 +1751,7 @@ document.addEventListener('click', (e) => {
     document.getElementById('cache_type_v').addEventListener('change', () => {
         if (info) recompute(parseInt(slider.value || ctxInput.value, 10) || 0);
     });
+    refreshPresets(parseContextValue());
 })();
 
 // ----- Wire tab badge updates to all form field changes -----
@@ -2338,8 +2408,7 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = e.target;
     const mode = document.getElementById('form-mode').value;
-    const extraRaw = f.extra_args.value || '';
-    const extra = extraRaw.split('\n').map(s => s.trim()).filter(s => s.length > 0);
+    const field = (name) => f.elements.namedItem(name);
     const toOptInt = (v) => {
         const s = (v || '').toString().trim();
         if (!s) return null;
@@ -2356,49 +2425,85 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         const n = parseFloat(s);
         return Number.isNaN(n) ? null : n;
     };
+    const extraRaw = field('extra_args').value || '';
+    const extra = extraRaw.split('\n').map(s => s.trim()).filter(s => s.length > 0);
+    const focusInvalid = (tab, field, message) => {
+        switchTab(tab);
+        field.focus();
+        alert(message);
+        return false;
+    };
+    const requireText = (field, tab, label) => {
+        if ((field.value || '').trim()) return true;
+        return focusInvalid(tab, field, `${label} is required.`);
+    };
+    const requireInt = (field, tab, label) => {
+        const value = parseInt(field.value, 10);
+        if (Number.isFinite(value)) return true;
+        return focusInvalid(tab, field, `${label} must be a number.`);
+    };
+    const requireFloat = (field, tab, label) => {
+        const value = parseFloat(field.value);
+        if (Number.isFinite(value)) return true;
+        return focusInvalid(tab, field, `${label} must be a number.`);
+    };
+    if (!requireText(field('id'), 'essentials', 'ID')) return;
+    if (!requireText(field('name'), 'essentials', 'Name')) return;
+    if (!requireInt(field('context'), 'essentials', 'Context')) return;
     const presetSel = document.getElementById('binary_preset');
     const presetChoice = presetSel ? presetSel.value : '__custom__';
+    if (presetChoice === '__custom__' && !requireText(field('binary'), 'essentials', 'Binary path')) return;
+    for (const [name, label] of [
+        ['temperature', 'Temperature'],
+        ['top_p', 'Top P'],
+        ['top_k', 'Top K'],
+        ['min_p', 'Min P'],
+        ['presence_penalty', 'Presence penalty'],
+        ['repeat_penalty', 'Repeat penalty'],
+    ]) {
+        if (!requireFloat(field(name), 'sampling', label)) return;
+    }
     const body = {
-        id: f.id.value.trim(),
-        name: f.name.value.trim(),
-        profile: toOptStr(f.profile.value),
-        weights_format: f.weights_format.value,
+        id: field('id').value.trim(),
+        name: field('name').value.trim(),
+        profile: toOptStr(field('profile').value),
+        weights_format: field('weights_format').value,
         binary_preset: presetChoice === '__custom__' ? null : presetChoice,
-        binary: presetChoice === '__custom__' ? f.binary.value.trim() : '',
-        model_path: f.model_path.value.trim(),
-        context: parseInt(f.context.value, 10),
-        temperature: parseFloat(f.temperature.value),
-        top_p: parseFloat(f.top_p.value),
-        top_k: parseInt(f.top_k.value, 10),
-        min_p: parseFloat(f.min_p.value),
-        presence_penalty: parseFloat(f.presence_penalty.value),
-        repeat_penalty: parseFloat(f.repeat_penalty.value),
-        flash_attn: f.flash_attn.checked,
-        n_gpu_layers: toOptInt(f.n_gpu_layers.value),
-        n_cpu_moe: toOptInt(f.n_cpu_moe.value),
-        mlock: f.mlock.checked,
-        no_mmap: f.no_mmap.checked,
-        parallel_slots: toOptInt(f.parallel_slots.value),
-        fit_target_margin_mib: toOptInt(f.fit_target_margin_mib.value),
-        cache_type_k: toOptStr(f.cache_type_k.value),
-        cache_type_v: toOptStr(f.cache_type_v.value),
-        split_mode: toOptStr(f.split_mode.value),
-        main_gpu: toOptInt(f.main_gpu.value),
-        tensor_split: toOptStr(f.tensor_split.value),
-        mmproj_path: toOptStr(f.mmproj_path.value),
-        threads: toOptInt(f.threads.value),
-        cache_ram_mib: toOptInt(f.cache_ram_mib.value),
-        reasoning_format: toOptStr(f.reasoning_format.value),
-        reasoning_budget: toOptInt(f.reasoning_budget.value),
-        chat_template_kwargs: toOptStr(f.chat_template_kwargs.value),
-        device: toOptStr(f.device.value),
-        draft_model_id: toOptStr(f.draft_model_id.value),
-        mtp_tokens: toOptInt(f.mtp_tokens.value),
-        draft_max: toOptInt(f.draft_max.value),
-        draft_min: toOptInt(f.draft_min.value),
-        draft_p_min: toOptFloat(f.draft_p_min.value),
-        ctx_checkpoints: toOptInt(f.ctx_checkpoints.value),
-        checkpoint_every_n_tokens: toOptInt(f.checkpoint_every_n_tokens.value),
+        binary: presetChoice === '__custom__' ? field('binary').value.trim() : '',
+        model_path: field('model_path').value.trim(),
+        context: parseInt(field('context').value, 10),
+        temperature: parseFloat(field('temperature').value),
+        top_p: parseFloat(field('top_p').value),
+        top_k: parseInt(field('top_k').value, 10),
+        min_p: parseFloat(field('min_p').value),
+        presence_penalty: parseFloat(field('presence_penalty').value),
+        repeat_penalty: parseFloat(field('repeat_penalty').value),
+        flash_attn: field('flash_attn').checked,
+        n_gpu_layers: toOptInt(field('n_gpu_layers').value),
+        n_cpu_moe: toOptInt(field('n_cpu_moe').value),
+        mlock: field('mlock').checked,
+        no_mmap: field('no_mmap').checked,
+        parallel_slots: toOptInt(field('parallel_slots').value),
+        fit_target_margin_mib: toOptInt(field('fit_target_margin_mib').value),
+        cache_type_k: toOptStr(field('cache_type_k').value),
+        cache_type_v: toOptStr(field('cache_type_v').value),
+        split_mode: toOptStr(field('split_mode').value),
+        main_gpu: toOptInt(field('main_gpu').value),
+        tensor_split: toOptStr(field('tensor_split').value),
+        mmproj_path: toOptStr(field('mmproj_path').value),
+        threads: toOptInt(field('threads').value),
+        cache_ram_mib: toOptInt(field('cache_ram_mib').value),
+        reasoning_format: toOptStr(field('reasoning_format').value),
+        reasoning_budget: toOptInt(field('reasoning_budget').value),
+        chat_template_kwargs: toOptStr(field('chat_template_kwargs').value),
+        device: toOptStr(field('device').value),
+        draft_model_id: toOptStr(field('draft_model_id').value),
+        mtp_tokens: toOptInt(field('mtp_tokens').value),
+        draft_max: toOptInt(field('draft_max').value),
+        draft_min: toOptInt(field('draft_min').value),
+        draft_p_min: toOptFloat(field('draft_p_min').value),
+        ctx_checkpoints: toOptInt(field('ctx_checkpoints').value),
+        checkpoint_every_n_tokens: toOptInt(field('checkpoint_every_n_tokens').value),
         extra_args: extra,
         gguf_meta: mode === 'add' ? (_currentGgufMeta || null) : (_editingModelGgufMeta || null),
     };

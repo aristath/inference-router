@@ -409,6 +409,27 @@ fn overhead_is_ten_percent() {
 }
 
 #[test]
+fn suggested_identity_prefers_unsloth_package_label_from_filename() {
+    let path = Path::new(
+        "/home/aristath/models/mimo-v2.5/UD-Q4_K_XL/MiMo-V2.5-UD-Q4_K_XL-00001-of-00005.gguf",
+    );
+    let (id, name) = suggested_identity(path, Some("MiMo-V2.5"), Some("MiMo-V2.5"), Some("Q4_K_M"));
+
+    assert_eq!(id, "mimo-v2.5-udq4kxl");
+    assert_eq!(name, "MiMo V2.5 UD-Q4_K_XL");
+}
+
+#[test]
+fn suggested_identity_preserves_mtp_parent_variant() {
+    let path =
+        Path::new("/home/aristath/models/qwen3.5/9b/MTP-UD-Q4_K_XL/Qwen3.5-9B-UD-Q4_K_XL.gguf");
+    let (id, name) = suggested_identity(path, None, None, Some("Q4_K_M"));
+
+    assert_eq!(id, "qwen3.5-9b-mtp-udq4kxl");
+    assert_eq!(name, "Qwen3.5 9B MTP UD-Q4_K_XL");
+}
+
+#[test]
 #[ignore = "reads a real multi-GB sharded GGUF; run explicitly with --ignored"]
 fn real_mimo_expert_split_is_sane() {
     let path = Path::new(

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::path::PathBuf;
 
 // Default values for sampling params. These are the llama.cpp defaults; we
@@ -22,6 +22,110 @@ pub fn default_presence_penalty() -> f32 {
 }
 pub fn default_repeat_penalty() -> f32 {
     1.0
+}
+fn default_context() -> u32 {
+    4096
+}
+
+fn is_none_or_empty_path(path: &PathBuf) -> bool {
+    path.as_os_str().is_empty()
+}
+
+fn is_default_context(context: &u32) -> bool {
+    *context == 4096
+}
+
+fn is_default_temperature(value: &f32) -> bool {
+    (*value - default_temperature()).abs() <= f32::EPSILON
+}
+
+fn is_default_top_p(value: &f32) -> bool {
+    (*value - default_top_p()).abs() <= f32::EPSILON
+}
+
+fn is_default_top_k(value: &i32) -> bool {
+    *value == default_top_k()
+}
+
+fn is_default_min_p(value: &f32) -> bool {
+    (*value - default_min_p()).abs() <= f32::EPSILON
+}
+
+fn is_default_presence_penalty(value: &f32) -> bool {
+    (*value - default_presence_penalty()).abs() <= f32::EPSILON
+}
+
+fn is_default_repeat_penalty(value: &f32) -> bool {
+    (*value - default_repeat_penalty()).abs() <= f32::EPSILON
+}
+
+fn is_default_weights_format(value: &WeightsFormat) -> bool {
+    *value == WeightsFormat::default()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Serialize)]
+struct SlimGgufMeta<'a> {
+    max_context: u32,
+    n_layers: u32,
+    n_embd: u32,
+    n_head: u32,
+    n_head_kv: u32,
+    key_length: u32,
+    key_length_swa: u32,
+    full_kv_heads: u64,
+    swa_kv_heads: u64,
+    kv_heads_total: u64,
+    sliding_window: u32,
+    file_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expert_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expert_used_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quant_label: Option<&'a String>,
+}
+
+impl<'a> From<&'a crate::vram::estimator::GgufMeta> for SlimGgufMeta<'a> {
+    fn from(meta: &'a crate::vram::estimator::GgufMeta) -> Self {
+        Self {
+            max_context: meta.max_context,
+            n_layers: meta.n_layers,
+            n_embd: meta.n_embd,
+            n_head: meta.n_head,
+            n_head_kv: meta.n_head_kv,
+            key_length: meta.key_length,
+            key_length_swa: meta.key_length_swa,
+            full_kv_heads: meta.full_kv_heads,
+            swa_kv_heads: meta.swa_kv_heads,
+            kv_heads_total: meta.kv_heads_total,
+            sliding_window: meta.sliding_window,
+            file_size: meta.file_size,
+            expert_count: meta.expert_count,
+            expert_used_count: meta.expert_used_count,
+            quant_label: meta.quant_label.as_ref(),
+        }
+    }
+}
+
+fn serialize_slim_gguf_meta<S>(
+    meta: &Option<crate::vram::estimator::GgufMeta>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match meta {
+        Some(meta) => SlimGgufMeta::from(meta).serialize(serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Weights file format. Drives the argv style used when spawning the backend.
@@ -142,41 +246,56 @@ impl CacheType {
 pub struct ModelConfig {
     pub id: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
 
+    #[serde(default, skip_serializing_if = "is_default_weights_format")]
     pub weights_format: WeightsFormat,
     /// If set, looked up in the presets table at spawn time to get the actual
     /// binary path. If `None`, `binary` below is used verbatim. Lets you
     /// change a binary once (e.g. rebuild llama.cpp) and have every model
     /// pick it up.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "is_none_or_empty_path")]
     pub binary: PathBuf,
     pub model_path: PathBuf,
     /// `--mmproj FILE`. Required by llama.cpp for GGUF vision inputs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mmproj_path: Option<PathBuf>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
 
+    #[serde(
+        default = "default_context",
+        skip_serializing_if = "is_default_context"
+    )]
     pub context: u32,
-    #[serde(default = "default_temperature")]
+    #[serde(
+        default = "default_temperature",
+        skip_serializing_if = "is_default_temperature"
+    )]
     pub temperature: f32,
-    #[serde(default = "default_top_p")]
+    #[serde(default = "default_top_p", skip_serializing_if = "is_default_top_p")]
     pub top_p: f32,
-    #[serde(default = "default_top_k")]
+    #[serde(default = "default_top_k", skip_serializing_if = "is_default_top_k")]
     pub top_k: i32,
-    #[serde(default = "default_min_p")]
+    #[serde(default = "default_min_p", skip_serializing_if = "is_default_min_p")]
     pub min_p: f32,
-    #[serde(default = "default_presence_penalty")]
+    #[serde(
+        default = "default_presence_penalty",
+        skip_serializing_if = "is_default_presence_penalty"
+    )]
     pub presence_penalty: f32,
-    #[serde(default = "default_repeat_penalty")]
+    #[serde(
+        default = "default_repeat_penalty",
+        skip_serializing_if = "is_default_repeat_penalty"
+    )]
     pub repeat_penalty: f32,
 
     // llama.cpp runtime flags. Placement is intentionally router-owned:
     // llama-fit-params chooses layer/split/expert placement at load time.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub flash_attn: bool,
     #[serde(skip)]
     pub n_gpu_layers: Option<u32>,
@@ -194,15 +313,15 @@ pub struct ModelConfig {
     /// When unset, the router derives margins from the global GPU caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fit_target_margin_mib: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub mlock: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub no_mmap: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_slots: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_type_k: Option<CacheType>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_type_v: Option<CacheType>,
 
     /// `--split-mode {none|layer|row|tensor}`. When unset, llama.cpp chooses
@@ -220,24 +339,24 @@ pub struct ModelConfig {
 
     /// `--threads N`. Number of CPU threads llama-server uses for generation.
     /// llama.cpp's default is `-1` (auto).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<i32>,
     /// `--cache-ram N` (MiB). Maximum cache size. llama.cpp defaults to 8192;
     /// `-1` = no limit, `0` = disabled.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ram_mib: Option<i32>,
     /// `--reasoning-format`. Controls how thought tags are returned in the
     /// OpenAI response body.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_format: Option<ReasoningFormat>,
     /// `--reasoning-budget N`. `-1` = unrestricted, `0` = immediate end,
     /// `N>0` = token budget.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_budget: Option<i32>,
     /// `--chat-template-kwargs STRING`. Raw JSON object passed verbatim to
     /// llama.cpp's Jinja chat template (template-family-specific keys like
     /// `enable_thinking`, `reasoning_effort`, `preserve_thinking`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<String>,
 
     // ===== Speculative decoding =====
@@ -255,48 +374,52 @@ pub struct ModelConfig {
 
     /// ID of another model to use as a speculative-decoding draft.
     /// Presence enables spec-decode.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_model_id: Option<String>,
 
     /// `--spec-type draft-mtp` + `--spec-draft-n-max N`. Embedded MTP draft
     /// tokens for models with MTP heads. `None` / `0` disables MTP.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp_tokens: Option<u32>,
 
     /// `--spec-draft-n-max N`. Max external draft tokens per step.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_max: Option<u32>,
     /// `--spec-draft-n-min N`. Min draft tokens before submitting to target.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_min: Option<u32>,
     /// `--spec-draft-p-min P`. Probability floor for greedy draft sampling.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_p_min: Option<f32>,
     /// `--ctx-checkpoints N`. Context-state snapshot slots. Required > 0
     /// for hybrid-recurrent targets (Qwen3.5 dense) so partial-draft
     /// rollback works via snapshot/restore instead of seq_rm.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ctx_checkpoints: Option<u32>,
     /// `--checkpoint-min-step N`. Minimum spacing between checkpoints.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_min_step: Option<u32>,
     /// Deprecated persisted field for the old checkpoint cadence flag. Kept
     /// only so older configs deserialize; it is not emitted as structured argv.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub checkpoint_every_n_tokens: Option<i32>,
 
-    #[serde(default)]
+    #[serde(skip)]
     pub state: ModelState,
-    #[serde(default)]
+    #[serde(skip)]
     pub pid: Option<i32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub estimated_vram: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<f64>,
     /// Rich GGUF metadata snapshot stored at model-creation time.
     /// Populated by the dashboard's 2-step "Add model" flow; absent for
     /// models added before this field existed or via the API without it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_slim_gguf_meta"
+    )]
     pub gguf_meta: Option<crate::vram::estimator::GgufMeta>,
 }
 

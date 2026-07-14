@@ -82,6 +82,7 @@ pub struct GgufMeta {
     pub quant_label: Option<String>,
     pub quantized_by: Option<String>,
     pub license: Option<String>,
+    #[serde(default)]
     pub tags: Vec<String>,
     // Provenance
     pub base_model_name: Option<String>,
@@ -100,7 +101,9 @@ pub struct GgufMeta {
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
     // Derived suggestions for the "Add model" form
+    #[serde(default)]
     pub suggested_id: String,
+    #[serde(default)]
     pub suggested_name: String,
 }
 
@@ -192,25 +195,16 @@ impl GgufMeta {
             .map(|v| v as u32);
 
         // --- Derived suggestions ---
-        let quant_lower = quant_label.as_deref().unwrap_or("").to_ascii_lowercase();
-        let base_slug = {
-            let raw = basename
-                .as_deref()
-                .or(name.as_deref())
-                .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("model"));
-            slug(raw)
-        };
-        let suggested_id = if quant_lower.is_empty() {
-            base_slug.clone()
-        } else {
-            format!("{base_slug}-{quant_lower}")
-        };
-        let display_name = name.as_deref().or(basename.as_deref()).unwrap_or("Model");
-        let suggested_name = if quant_label.as_deref().is_none_or(|q| q == "Unknown") {
-            display_name.to_owned()
-        } else {
-            format!("{} {}", display_name, quant_label.as_deref().unwrap_or(""))
-        };
+        //
+        // Prefer the packaging/filename label over GGML's internal tensor type.
+        // Dynamic Unsloth GGUFs, for example, advertise tensors as Q4_K_M while
+        // the artifact the user chose is clearly UD-Q4_K_XL.
+        let (suggested_id, suggested_name) = suggested_identity(
+            path,
+            name.as_deref(),
+            basename.as_deref(),
+            quant_label.as_deref(),
+        );
 
         Ok(Self {
             max_context,
@@ -274,6 +268,187 @@ fn slug(s: &str) -> String {
         out.pop();
     }
     out
+}
+
+fn suggested_identity(
+    path: &Path,
+    name: Option<&str>,
+    basename: Option<&str>,
+    quant_label: Option<&str>,
+) -> (String, String) {
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        let stem = stem_with_parent_variant(path, strip_gguf_shard_suffix(stem));
+        if package_label_from_filename(&stem).is_some() {
+            return (slug_model_id(&stem), display_model_name(&stem));
+        }
+    }
+
+    let display_name = name.or(basename).unwrap_or("Model");
+    let quant = quant_label.filter(|q| *q != "Unknown");
+    match quant {
+        Some(quant) => (
+            format!("{}-{}", slug(display_name), slug_quant_label(quant)),
+            format!("{} {}", display_name, quant),
+        ),
+        None => (slug(display_name), display_name.to_owned()),
+    }
+}
+
+fn stem_with_parent_variant(path: &Path, stem: &str) -> String {
+    let Some(parent) = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+    else {
+        return stem.to_owned();
+    };
+    let Some(package) = parent.strip_prefix("MTP-") else {
+        return stem.to_owned();
+    };
+    if model_stem_tokens(stem)
+        .iter()
+        .any(|part| part.eq_ignore_ascii_case("MTP"))
+    {
+        return stem.to_owned();
+    }
+    if let Some(pos) = stem.rfind(package) {
+        let mut with_parent = String::with_capacity(stem.len() + 4);
+        with_parent.push_str(&stem[..pos]);
+        with_parent.push_str("MTP-");
+        with_parent.push_str(&stem[pos..]);
+        with_parent
+    } else {
+        stem.to_owned()
+    }
+}
+
+fn strip_gguf_shard_suffix(stem: &str) -> &str {
+    let bytes = stem.as_bytes();
+    let Some(of_pos) = stem.rfind("-of-") else {
+        return stem;
+    };
+    if of_pos < 6 || of_pos + 4 >= bytes.len() {
+        return stem;
+    }
+    let before = &stem[of_pos - 6..of_pos];
+    let after = &stem[of_pos + 4..];
+    if before.len() == 6
+        && before.starts_with('-')
+        && before[1..].chars().all(|c| c.is_ascii_digit())
+        && after.len() == 5
+        && after.chars().all(|c| c.is_ascii_digit())
+    {
+        &stem[..of_pos - 6]
+    } else {
+        stem
+    }
+}
+
+fn package_label_from_filename(stem: &str) -> Option<&str> {
+    model_stem_tokens(stem)
+        .into_iter()
+        .rev()
+        .find(|part| quant_token_to_slug(part).is_some())
+}
+
+fn slug_model_id(stem: &str) -> String {
+    model_stem_tokens(stem)
+        .into_iter()
+        .map(|part| quant_token_to_slug(part).unwrap_or_else(|| slug(part)))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn model_stem_tokens(stem: &str) -> Vec<&str> {
+    let parts: Vec<&str> = stem.split('-').filter(|part| !part.is_empty()).collect();
+    let mut tokens = Vec::with_capacity(parts.len());
+    let mut i = 0;
+    while i < parts.len() {
+        if parts[i].eq_ignore_ascii_case("UD")
+            && i + 1 < parts.len()
+            && quant_token_to_slug(&format!("UD-{}", parts[i + 1])).is_some()
+        {
+            tokens.push(&stem[parts_prefix_len(&parts, i)..parts_prefix_len(&parts, i + 2) - 1]);
+            i += 2;
+        } else {
+            tokens.push(parts[i]);
+            i += 1;
+        }
+    }
+    tokens
+}
+
+fn parts_prefix_len(parts: &[&str], count: usize) -> usize {
+    parts.iter().take(count).map(|part| part.len() + 1).sum()
+}
+
+fn slug_quant_label(label: &str) -> String {
+    quant_token_to_slug(label).unwrap_or_else(|| slug(label))
+}
+
+fn quant_token_to_slug(token: &str) -> Option<String> {
+    let upper = token.to_ascii_uppercase();
+    match upper.as_str() {
+        "UD_Q2_K_XL" | "UD-Q2_K_XL" => Some("udq2kxl".into()),
+        "UD_Q3_K_XL" | "UD-Q3_K_XL" => Some("udq3kxl".into()),
+        "UD_Q4_K_XL" | "UD-Q4_K_XL" => Some("udq4kxl".into()),
+        "UD_Q5_K_XL" | "UD-Q5_K_XL" => Some("udq5kxl".into()),
+        "UD_Q6_K_XL" | "UD-Q6_K_XL" => Some("udq6kxl".into()),
+        "UD_Q8_K_XL" | "UD-Q8_K_XL" => Some("udq8kxl".into()),
+        "Q2_K_XL" => Some("q2kxl".into()),
+        "Q3_K_XL" => Some("q3kxl".into()),
+        "Q4_K_XL" => Some("q4kxl".into()),
+        "Q5_K_XL" => Some("q5kxl".into()),
+        "Q6_K_XL" => Some("q6kxl".into()),
+        "Q8_K_XL" => Some("q8kxl".into()),
+        "Q2_K_M" => Some("q2_k_m".into()),
+        "Q3_K_M" => Some("q3_k_m".into()),
+        "Q4_K_M" => Some("q4_k_m".into()),
+        "Q5_K_M" => Some("q5_k_m".into()),
+        "Q6_K" => Some("q6_k".into()),
+        "Q8_0" => Some("q8_0".into()),
+        "BF16" => Some("bf16".into()),
+        "F16" => Some("f16".into()),
+        "MXFP4" => Some("mxfp4".into()),
+        "MXFP4_MOE" => Some("mxfp4_moe".into()),
+        _ => None,
+    }
+}
+
+fn display_model_name(stem: &str) -> String {
+    model_stem_tokens(stem)
+        .into_iter()
+        .map(display_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn display_token(token: &str) -> String {
+    if quant_token_to_slug(token).is_some() {
+        token.to_ascii_uppercase()
+    } else if token.eq_ignore_ascii_case("it") {
+        "IT".into()
+    } else if is_size_token(token) || is_active_param_token(token) {
+        token.to_ascii_uppercase()
+    } else {
+        token.to_owned()
+    }
+}
+
+fn is_size_token(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower
+        .strip_suffix('b')
+        .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn is_active_param_token(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower
+        .strip_prefix('a')
+        .and_then(|n| n.strip_suffix('b'))
+        .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Read an optional string from the GGUF metadata map.

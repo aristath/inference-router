@@ -381,12 +381,128 @@ fn cache_type_serializes_lowercase() {
 }
 
 #[test]
-fn error_state_roundtrips_with_message() {
-    let mut m = sample();
-    m.state = ModelState::Error("process 1234 died".into());
-    let json = serde_json::to_string(&m).unwrap();
-    let parsed: ModelConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed.state, ModelState::Error("process 1234 died".into()));
+fn runtime_state_is_ignored_at_config_boundary() {
+    let json = r#"{
+        "id": "m",
+        "name": "M",
+        "binary": "/bin/llama",
+        "model_path": "/m.gguf",
+        "state": {"Error": "process 1234 died"},
+        "pid": 1234
+    }"#;
+    let parsed: ModelConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.state, ModelState::Idle);
+    assert_eq!(parsed.pid, None);
+
+    let serialized = serde_json::to_value(&parsed).unwrap();
+    assert!(serialized.get("state").is_none());
+    assert!(serialized.get("pid").is_none());
+}
+
+#[test]
+fn model_config_serializes_sparse_defaults() {
+    let m = ModelConfig {
+        id: "m".into(),
+        name: "M".into(),
+        model_path: PathBuf::from("/m.gguf"),
+        ..ModelConfig::default()
+    };
+    let serialized = serde_json::to_value(&m).unwrap();
+    assert!(serialized.get("weights_format").is_none());
+    assert!(serialized.get("binary").is_none());
+    assert!(serialized.get("extra_args").is_none());
+    assert!(serialized.get("temperature").is_none());
+    assert!(serialized.get("top_p").is_none());
+    assert!(serialized.get("top_k").is_none());
+    assert!(serialized.get("min_p").is_none());
+    assert!(serialized.get("presence_penalty").is_none());
+    assert!(serialized.get("repeat_penalty").is_none());
+    assert!(serialized.get("flash_attn").is_none());
+    assert!(serialized.get("mlock").is_none());
+    assert!(serialized.get("no_mmap").is_none());
+    assert!(serialized.get("checkpoint_every_n_tokens").is_none());
+    assert!(serialized.get("estimated_vram").is_none());
+}
+
+#[test]
+fn gguf_meta_persists_only_runtime_useful_subset() {
+    let mut meta = crate::vram::estimator::GgufMeta {
+        max_context: 131_072,
+        n_layers: 42,
+        n_embd: 4096,
+        n_head: 32,
+        n_head_kv: 4,
+        key_length: 128,
+        key_length_swa: 64,
+        full_kv_heads: 128,
+        swa_kv_heads: 32,
+        kv_heads_total: 160,
+        sliding_window: 4096,
+        file_size: 123,
+        expert_weight_bytes: 99,
+        architecture: Some("qwen".into()),
+        name: Some("Qwen".into()),
+        basename: Some("Qwen".into()),
+        size_label: Some("7B".into()),
+        file_type: Some(7),
+        quant_label: Some("Q8_0".into()),
+        quantized_by: Some("Someone".into()),
+        license: Some("mit".into()),
+        tags: vec!["tag".into()],
+        base_model_name: Some("Base".into()),
+        base_model_org: Some("Org".into()),
+        base_model_repo: Some("https://example.test/model".into()),
+        feed_forward_length: Some(11),
+        expert_count: Some(8),
+        expert_used_count: Some(2),
+        rope_freq_base: Some(1_000_000.0),
+        ssm_inner_size: Some(12),
+        full_attention_interval: Some(3),
+        chat_template: Some("very long template".into()),
+        bos_token_id: Some(1),
+        eos_token_id: Some(2),
+        suggested_id: "suggested".into(),
+        suggested_name: "Suggested".into(),
+    };
+    let m = ModelConfig {
+        id: "m".into(),
+        name: "M".into(),
+        model_path: PathBuf::from("/m.gguf"),
+        gguf_meta: Some(meta.clone()),
+        ..ModelConfig::default()
+    };
+    let serialized = serde_json::to_value(&m).unwrap();
+    let stored_meta = serialized.get("gguf_meta").unwrap();
+    assert_eq!(stored_meta.get("max_context").unwrap(), 131_072);
+    assert_eq!(stored_meta.get("quant_label").unwrap(), "Q8_0");
+    assert_eq!(stored_meta.get("expert_count").unwrap(), 8);
+    assert!(stored_meta.get("chat_template").is_none());
+    assert!(stored_meta.get("architecture").is_none());
+    assert!(stored_meta.get("suggested_id").is_none());
+
+    let parsed: ModelConfig = serde_json::from_value(serialized).unwrap();
+    meta.chat_template = None;
+    meta.architecture = None;
+    meta.name = None;
+    meta.basename = None;
+    meta.size_label = None;
+    meta.file_type = None;
+    meta.quantized_by = None;
+    meta.license = None;
+    meta.tags = Vec::new();
+    meta.base_model_name = None;
+    meta.base_model_org = None;
+    meta.base_model_repo = None;
+    meta.feed_forward_length = None;
+    meta.expert_weight_bytes = 0;
+    meta.rope_freq_base = None;
+    meta.ssm_inner_size = None;
+    meta.full_attention_interval = None;
+    meta.bos_token_id = None;
+    meta.eos_token_id = None;
+    meta.suggested_id = String::new();
+    meta.suggested_name = String::new();
+    assert_eq!(parsed.gguf_meta, Some(meta));
 }
 
 // ----- Speculative decoding -----
