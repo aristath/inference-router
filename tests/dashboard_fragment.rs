@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use inference_router::config::{JsonStore, ModelConfig, ModelState};
+use inference_router::config::{JsonStore, ModelConfig, ModelState, WeightsFormat};
 use inference_router::lifecycle::build_router;
 use inference_router::orchestrator::{AppState, Orchestrator};
 use tokio::net::TcpListener;
@@ -51,6 +51,48 @@ async fn orchestrator_with_two_models() -> Arc<Orchestrator> {
         let mut data = orchestrator.data.lock().await;
         data.models.get_mut("zulu").unwrap().state = ModelState::Running;
     }
+    orchestrator
+}
+
+async fn orchestrator_with_sized_models() -> Arc<Orchestrator> {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(
+        tmp.path().join("models.json"),
+    ));
+    let presets = Arc::new(
+        JsonStore::<Vec<inference_router::config::BinaryPreset>>::new(
+            tmp.path().join("presets.json"),
+        ),
+    );
+    let aliases = Arc::new(JsonStore::<Vec<inference_router::config::ModelAlias>>::new(
+        tmp.path().join("aliases.json"),
+    ));
+
+    let big_dir = tmp.path().join("big-model");
+    let small_dir = tmp.path().join("small-model");
+    std::fs::create_dir_all(&big_dir).unwrap();
+    std::fs::create_dir_all(&small_dir).unwrap();
+    std::fs::write(big_dir.join("weights.safetensors"), vec![0u8; 16]).unwrap();
+    std::fs::write(small_dir.join("weights.safetensors"), vec![0u8; 4]).unwrap();
+
+    let orchestrator = Arc::new(Orchestrator::new(store, presets, aliases, 0));
+    for (id, name, path) in [("small", "Small", small_dir), ("big", "Big", big_dir)] {
+        orchestrator
+            .add_model(ModelConfig {
+                id: id.into(),
+                name: name.into(),
+                weights_format: WeightsFormat::Safetensors,
+                binary: std::path::PathBuf::from("/bin/true"),
+                model_path: path,
+                ..ModelConfig::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    // Leak the tempdir so the safetensors directories remain readable while
+    // the test server is running.
+    std::mem::forget(tmp);
     orchestrator
 }
 
@@ -104,6 +146,41 @@ async fn fragment_sorts_loaded_models_first() {
         zulu < alpha,
         "running 'zulu' should sort above idle 'alpha'"
     );
+}
+
+#[tokio::test]
+async fn fragment_defaults_to_file_size_desc() {
+    let port = serve(orchestrator_with_sized_models().await).await;
+    let (_status, body) = get(port, "/fragment/dashboard").await;
+
+    assert!(body
+        .contains(r#"data-sort-key="file-size" data-sort-type="number" aria-sort="descending""#));
+    let big = body.find("model-row-big").expect("big row present");
+    let small = body.find("model-row-small").expect("small row present");
+    assert!(big < small, "larger file should be first by default");
+}
+
+#[tokio::test]
+async fn api_models_exposes_file_size_bytes_for_dropdown_sorting() {
+    let port = serve(orchestrator_with_sized_models().await).await;
+    let (status, body) = get(port, "/api/models").await;
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let models: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let big = models
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "big")
+        .unwrap();
+    let small = models
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "small")
+        .unwrap();
+    assert_eq!(big["file_size_bytes"], 16);
+    assert_eq!(small["file_size_bytes"], 4);
 }
 
 #[tokio::test]

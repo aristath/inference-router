@@ -218,7 +218,7 @@ impl GgufInfo {
             full_attention_interval,
         );
         let kv_heads_total = full_kv_heads + swa_kv_heads;
-        let n_head_kv_max = kv_heads_per_layer.iter().copied().max().unwrap_or(0) as u32;
+        let n_head_kv_max = kv_heads_per_layer.iter().copied().max().unwrap_or(0);
 
         Ok(Self {
             max_context,

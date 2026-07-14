@@ -64,6 +64,18 @@ pub enum SplitMode {
     Tensor,
 }
 
+impl SplitMode {
+    /// The literal string llama.cpp expects on the command line.
+    pub fn as_arg(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Layer => "layer",
+            Self::Row => "row",
+            Self::Tensor => "tensor",
+        }
+    }
+}
+
 /// `--reasoning-format` enum exactly matching `common_reasoning_format` in
 /// llama.cpp (`common/common.h`). The comment there says not to extend the
 /// enum "unless you absolutely have to," so we mirror the four values
@@ -193,13 +205,17 @@ pub struct ModelConfig {
     #[serde(default)]
     pub cache_type_v: Option<CacheType>,
 
-    /// Manual placement knobs are ignored at the config/API boundary.
-    #[serde(skip)]
+    /// `--split-mode {none|layer|row|tensor}`. When unset, llama.cpp chooses
+    /// its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_mode: Option<SplitMode>,
-    #[serde(skip)]
+    /// `--main-gpu N`. Only meaningful for split modes that need a primary GPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main_gpu: Option<u32>,
-    /// Fitted at load time from llama-fit-params; not accepted from config.
-    #[serde(skip)]
+    /// `--tensor-split A,B,...`. User-configured values are persisted; fitted
+    /// runtime values are applied to a cloned load config and are not written
+    /// back to models.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tensor_split: Option<String>,
 
     /// `--threads N`. Number of CPU threads llama-server uses for generation.
@@ -343,13 +359,57 @@ impl Default for ModelConfig {
 /// Validation error returned when adding/updating a model config.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("model id cannot be empty")]
+    EmptyModelId,
     #[error("model references draft '{id}', but no model with that id exists")]
     DraftNotFound { id: String },
     #[error("model cannot reference itself as a draft")]
     DraftSelfReference,
 }
 
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    saturating_sum_bytes(
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len()),
+    )
+}
+
+fn saturating_sum_bytes(lengths: impl IntoIterator<Item = u64>) -> u64 {
+    lengths.into_iter().fold(0u64, u64::saturating_add)
+}
+
 impl ModelConfig {
+    /// On-disk model size in bytes for UI ordering/labels. GGUF prefers the
+    /// stored metadata snapshot and falls back to reading the file headers;
+    /// safetensors sums regular files in the configured model directory.
+    pub fn file_size_bytes(&self) -> u64 {
+        match self.weights_format {
+            WeightsFormat::Gguf => self
+                .gguf_meta
+                .as_ref()
+                .map(|meta| meta.file_size)
+                .or_else(|| {
+                    crate::vram::estimator::GgufMeta::read(&self.model_path)
+                        .ok()
+                        .map(|meta| meta.file_size)
+                })
+                .unwrap_or(0),
+            WeightsFormat::Safetensors => dir_size_bytes(&self.model_path),
+        }
+    }
+
     /// One-shot migration of raw `extra_args` into the structured fields
     /// added after the fact. Called once per model at orchestrator startup;
     /// returns `true` if anything was moved so the caller can mark the

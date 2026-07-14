@@ -1,8 +1,13 @@
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, SplitMode};
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const MIB: u64 = 1024 * 1024;
+const DEFAULT_FIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlamaFittedArgs {
@@ -38,6 +43,9 @@ pub enum LlamaFitError {
 
     #[error("could not parse llama-fit-params output: {0}")]
     Parse(String),
+
+    #[error("{binary} timed out after {}s", .timeout.as_secs())]
+    Timeout { binary: PathBuf, timeout: Duration },
 }
 
 pub fn fit_binary_for_server(server: &Path) -> PathBuf {
@@ -79,6 +87,9 @@ pub fn run_llama_fit_sizing(
 }
 
 pub fn needs_server_owned_fit(model: &ModelConfig, draft: Option<&ModelConfig>) -> bool {
+    if model.split_mode == Some(SplitMode::Tensor) {
+        return false;
+    }
     model.mmproj_path.is_some()
         || draft.is_some()
         || (draft.is_none()
@@ -110,7 +121,18 @@ fn base_args(model: &ModelConfig, device: &str) -> Vec<String> {
         args.push("--parallel".into());
         args.push(n.to_string());
     }
-
+    if let Some(mode) = model.split_mode {
+        args.push("--split-mode".into());
+        args.push(mode.as_arg().into());
+    }
+    if let Some(n) = model.main_gpu {
+        args.push("--main-gpu".into());
+        args.push(n.to_string());
+    }
+    if let Some(ref ts) = model.tensor_split {
+        args.push("--tensor-split".into());
+        args.push(ts.clone());
+    }
     args
 }
 
@@ -146,21 +168,86 @@ fn replace_or_push(args: &mut Vec<String>, flag: &str, value: String) {
 }
 
 fn run_fit_tool(fit_binary: &Path, args: &[String]) -> Result<String, LlamaFitError> {
-    let output = Command::new(fit_binary)
+    let timeout = fit_timeout();
+    let mut command = Command::new(fit_binary);
+    command
         .args(args)
-        .output()
-        .map_err(|source| LlamaFitError::Io {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|source| LlamaFitError::Io {
+        binary: fit_binary.to_path_buf(),
+        source,
+    })?;
+
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(|source| LlamaFitError::Io {
             binary: fit_binary.to_path_buf(),
             source,
-        })?;
-    if !output.status.success() {
+        })? {
+            Some(status) => break status,
+            None if started.elapsed() >= timeout => {
+                kill_child_tree(&mut child);
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(LlamaFitError::Timeout {
+                    binary: fit_binary.to_path_buf(),
+                    timeout,
+                });
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
         return Err(LlamaFitError::Failed {
             binary: fit_binary.to_path_buf(),
-            status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            status: status.to_string(),
+            stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+fn fit_timeout() -> Duration {
+    std::env::var("INFERENCE_ROUTER_LLAMA_FIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_FIT_TIMEOUT)
+}
+
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        return;
+    }
+    let _ = child.kill();
 }
 
 fn parse_fitted_args(stdout: &str) -> Result<LlamaFittedArgs, LlamaFitError> {
@@ -287,11 +374,12 @@ pub fn apply_sizing_to_model(model: &mut ModelConfig, sizing: &LlamaFitSizing) {
         .fitted
         .n_gpu_layers
         .map(|ngl| if ngl < 0 { 999 } else { ngl as u32 });
-    model.tensor_split = sizing.fitted.tensor_split.clone();
+    if model.tensor_split.is_none() {
+        model.tensor_split = sizing.fitted.tensor_split.clone();
+    }
     model.override_tensor = sizing.fitted.override_tensor.clone();
     model.n_cpu_moe = None;
     model.fit_target = None;
-    model.split_mode = None;
     model.estimated_vram = sizing.device_vram;
 }
 

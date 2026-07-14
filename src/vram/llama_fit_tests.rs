@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::CacheType;
+use crate::config::{CacheType, SplitMode};
 
 #[test]
 fn parses_fitted_args_with_quoted_override_tensor() {
@@ -18,6 +18,9 @@ fn base_args_include_only_fit_tool_supported_memory_options() {
     let model = ModelConfig {
         model_path: "/models/target.gguf".into(),
         context: 8192,
+        split_mode: Some(SplitMode::Tensor),
+        main_gpu: Some(1),
+        tensor_split: Some("1,1".into()),
         mmproj_path: Some("/models/mmproj.gguf".into()),
         draft_model_id: Some("draft".into()),
         draft_max: Some(16),
@@ -39,6 +42,9 @@ fn base_args_include_only_fit_tool_supported_memory_options() {
     assert!(args.contains("-m /models/target.gguf"), "{args}");
     assert!(args.contains("-c 8192"), "{args}");
     assert!(args.contains("--device Vulkan0,Vulkan1"), "{args}");
+    assert!(args.contains("--split-mode tensor"), "{args}");
+    assert!(args.contains("--main-gpu 1"), "{args}");
+    assert!(args.contains("--tensor-split 1,1"), "{args}");
     assert!(!args.contains("--mmproj"), "{args}");
     assert!(!args.contains("-md"), "{args}");
     assert!(!args.contains("-ngld"), "{args}");
@@ -48,6 +54,17 @@ fn base_args_include_only_fit_tool_supported_memory_options() {
     assert!(!args.contains("--spec-draft-n-max"), "{args}");
     assert!(!args.contains("--ctx-checkpoints"), "{args}");
     assert!(!args.contains("--checkpoint-every-n-tokens"), "{args}");
+
+    assert!(!needs_server_owned_fit(&model, Some(&draft)));
+}
+
+#[test]
+fn non_tensor_draft_still_uses_server_owned_fit() {
+    let model = ModelConfig::default();
+    let draft = ModelConfig {
+        model_path: "/models/draft.gguf".into(),
+        ..ModelConfig::default()
+    };
 
     assert!(needs_server_owned_fit(&model, Some(&draft)));
 }
@@ -64,6 +81,8 @@ fn parses_fit_print_device_rows_and_ignores_host() {
 fn applies_negative_ngl_as_all_layers_convention() {
     let mut model = ModelConfig {
         cache_type_k: Some(CacheType::Q8_0),
+        split_mode: Some(SplitMode::Tensor),
+        main_gpu: Some(1),
         ..ModelConfig::default()
     };
     apply_sizing_to_model(
@@ -82,4 +101,29 @@ fn applies_negative_ngl_as_all_layers_convention() {
     assert_eq!(model.n_gpu_layers, Some(999));
     assert_eq!(model.estimated_vram, 123);
     assert_eq!(model.cache_type_k, Some(CacheType::Q8_0));
+    assert_eq!(model.split_mode, Some(SplitMode::Tensor));
+    assert_eq!(model.main_gpu, Some(1));
+}
+
+#[test]
+fn apply_sizing_preserves_manual_tensor_split() {
+    let mut model = ModelConfig {
+        tensor_split: Some("9,1".into()),
+        ..ModelConfig::default()
+    };
+    apply_sizing_to_model(
+        &mut model,
+        &LlamaFitSizing {
+            fitted: LlamaFittedArgs {
+                context: None,
+                n_gpu_layers: Some(12),
+                tensor_split: Some("1,1".into()),
+                override_tensor: None,
+            },
+            device_vram: 123,
+        },
+    );
+    assert_eq!(model.tensor_split.as_deref(), Some("9,1"));
+    assert_eq!(model.n_gpu_layers, Some(12));
+    assert_eq!(model.estimated_vram, 123);
 }

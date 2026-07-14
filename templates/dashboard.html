@@ -1715,7 +1715,7 @@ function loadModelSort() {
             return { key, dir: raw.dir };
         }
     } catch (e) {}
-    return { key: 'name', dir: 'asc' };
+    return { key: 'file-size', dir: 'desc' };
 }
 function saveModelSort() {
     try { localStorage.setItem(MODEL_SORT_KEY, JSON.stringify(modelTableSort)); } catch (e) {}
@@ -2173,6 +2173,27 @@ function renderAliasRow(a) {
 // "— Unassigned —" (empty value). Aliases are listed first (an alias can point
 // at another alias — e.g. several aliases sharing one `default`), then models.
 // The alias being edited is excluded so it can't target itself.
+function modelFileSizeBytes(m) {
+    const size = Number(m.file_size_bytes || (m.gguf_meta && m.gguf_meta.file_size) || 0);
+    return Number.isFinite(size) && size > 0 ? size : 0;
+}
+
+function compareModelsByFileSizeDesc(a, b) {
+    const av = modelFileSizeBytes(a);
+    const bv = modelFileSizeBytes(b);
+    if (av !== bv) {
+        if (av === 0) return 1;
+        if (bv === 0) return -1;
+        return bv - av;
+    }
+    return (a.name || a.id).localeCompare(b.name || b.id) || a.id.localeCompare(b.id);
+}
+
+function formatModelFileSizeSuffix(m) {
+    const size = modelFileSizeBytes(m);
+    return size > 0 ? ` — ${(size / 1024**3).toFixed(1)} GiB` : '';
+}
+
 async function refreshAliasTargetSelect(selected) {
     const sel = document.getElementById('alias-target');
     if (!sel) return;
@@ -2205,11 +2226,12 @@ async function refreshAliasTargetSelect(selected) {
         modelGroup.label = 'Models';
         models
             .slice()
-            .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
+            .sort(compareModelsByFileSizeDesc)
             .forEach(m => {
                 const opt = document.createElement('option');
                 opt.value = m.id;
-                opt.textContent = m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id;
+                const label = m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id;
+                opt.textContent = `${label}${formatModelFileSizeSuffix(m)}`;
                 modelGroup.appendChild(opt);
             });
         sel.appendChild(modelGroup);
@@ -2243,29 +2265,10 @@ async function saveAlias() {
         return;
     }
 
-    // Renaming an existing alias: the name is the storage key, so create the
-    // new entry first (validates uniqueness/charset), then drop the old one.
-    const renaming = _aliasEditorMode === 'edit'
-        && _aliasEditingOriginal && _aliasEditingOriginal !== alias;
-    if (renaming) {
-        const cr = await fetch('/api/aliases', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ alias, target }),
-        });
-        if (!cr.ok) {
-            const j = await cr.json().catch(() => ({}));
-            alert('Rename failed: ' + (j.error || cr.statusText));
-            return;
-        }
-        await fetch(`/api/aliases/${encodeURIComponent(_aliasEditingOriginal)}`, { method: 'DELETE' });
-        closeAliasEditor();
-        await refreshAliasList();
-        return;
-    }
-
     const body = JSON.stringify({ alias, target });
-    const url = _aliasEditorMode === 'add' ? '/api/aliases' : `/api/aliases/${encodeURIComponent(alias)}`;
+    const url = _aliasEditorMode === 'add'
+        ? '/api/aliases'
+        : `/api/aliases/${encodeURIComponent(_aliasEditingOriginal || alias)}`;
     const method = _aliasEditorMode === 'add' ? 'POST' : 'PUT';
     const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body });
     if (!r.ok) {

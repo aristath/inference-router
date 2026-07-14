@@ -32,7 +32,7 @@ fn sample() -> ModelConfig {
 }
 
 #[test]
-fn serde_roundtrip_preserves_public_fields_and_drops_internal_placement() {
+fn serde_roundtrip_preserves_public_fields_and_drops_runtime_placement() {
     let original = sample();
     let json = serde_json::to_string(&original).unwrap();
     let parsed: ModelConfig = serde_json::from_str(&json).unwrap();
@@ -41,9 +41,6 @@ fn serde_roundtrip_preserves_public_fields_and_drops_internal_placement() {
     expected.n_cpu_moe = None;
     expected.override_tensor = None;
     expected.fit_target = None;
-    expected.split_mode = None;
-    expected.main_gpu = None;
-    expected.tensor_split = None;
     expected.device = None;
     assert_eq!(expected, parsed);
 }
@@ -54,6 +51,11 @@ fn weights_format_serializes_lowercase() {
     let safe = serde_json::to_string(&WeightsFormat::Safetensors).unwrap();
     assert_eq!(gguf, "\"gguf\"");
     assert_eq!(safe, "\"safetensors\"");
+}
+
+#[test]
+fn safetensors_size_sum_saturates_on_overflow() {
+    assert_eq!(saturating_sum_bytes([u64::MAX - 4, 10]), u64::MAX,);
 }
 
 #[test]
@@ -108,7 +110,7 @@ fn runtime_fields_default_when_absent() {
 }
 
 #[test]
-fn manual_placement_fields_are_ignored_from_config() {
+fn manual_split_fields_roundtrip_but_runtime_placement_is_ignored_from_config() {
     let json = r#"{
             "id": "m", "name": "M",
             "weights_format": "gguf",
@@ -128,9 +130,9 @@ fn manual_placement_fields_are_ignored_from_config() {
     assert_eq!(parsed.n_cpu_moe, None);
     assert_eq!(parsed.override_tensor, None);
     assert_eq!(parsed.fit_target, None);
-    assert_eq!(parsed.split_mode, None);
-    assert_eq!(parsed.main_gpu, None);
-    assert_eq!(parsed.tensor_split, None);
+    assert_eq!(parsed.split_mode, Some(SplitMode::Row));
+    assert_eq!(parsed.main_gpu, Some(1));
+    assert_eq!(parsed.tensor_split.as_deref(), Some("1,1"));
     assert_eq!(parsed.device, None);
 }
 
@@ -365,6 +367,10 @@ fn split_mode_serializes_lowercase() {
         "\"layer\""
     );
     assert_eq!(serde_json::to_string(&SplitMode::Row).unwrap(), "\"row\"");
+    assert_eq!(
+        serde_json::to_string(&SplitMode::Tensor).unwrap(),
+        "\"tensor\""
+    );
 }
 
 #[test]

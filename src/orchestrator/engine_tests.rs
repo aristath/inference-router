@@ -322,6 +322,24 @@ async fn add_model_duplicate_id_errors() {
 }
 
 #[tokio::test]
+async fn add_model_rejects_empty_id_and_alias_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let o = orch(&tmp);
+    let mut empty = model("");
+    empty.id = "   ".into();
+    let err = o.add_model(empty).await.unwrap_err();
+    assert!(matches!(
+        err,
+        MutationError::InvalidConfig(ConfigError::EmptyModelId)
+    ));
+
+    o.add_model(model("qwen")).await.unwrap();
+    o.add_alias(alias("planner", "qwen")).await.unwrap();
+    let err = o.add_model(model("planner")).await.unwrap_err();
+    assert!(matches!(err, MutationError::ModelShadowsAlias(_)));
+}
+
+#[tokio::test]
 async fn mark_used_updates_last_used_and_marks_dirty() {
     let tmp = tempfile::tempdir().unwrap();
     let o = orch(&tmp);
@@ -875,7 +893,9 @@ async fn alias_can_target_another_alias_and_follows_repoints() {
 
     // Repointing `default` propagates to every alias that references it,
     // without touching those aliases.
-    o.update_alias(alias("default", "llama")).await.unwrap();
+    o.update_alias("default", alias("default", "llama"))
+        .await
+        .unwrap();
     assert_eq!(o.resolve_model_id("coder").await, "llama");
     assert_eq!(o.resolve_model_id("planner").await, "llama");
     // The referencing aliases still store the reference, not the model.
@@ -886,6 +906,29 @@ async fn alias_can_target_another_alias_and_follows_repoints() {
         .find(|a| a.alias == "coder")
         .unwrap();
     assert_eq!(coder.target, "default");
+}
+
+#[tokio::test]
+async fn alias_rename_preserves_dependent_aliases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let o = orch(&tmp);
+    o.add_model(model("qwen")).await.unwrap();
+    o.add_alias(alias("default", "qwen")).await.unwrap();
+    o.add_alias(alias("coder", "default")).await.unwrap();
+
+    o.update_alias("default", alias("primary", "qwen"))
+        .await
+        .unwrap();
+
+    assert_eq!(o.resolve_model_id("coder").await, "qwen");
+    let coder = o
+        .list_aliases()
+        .await
+        .into_iter()
+        .find(|a| a.alias == "coder")
+        .unwrap();
+    assert_eq!(coder.target, "primary");
+    assert!(o.list_aliases().await.iter().all(|a| a.alias != "default"));
 }
 
 #[tokio::test]
@@ -905,7 +948,7 @@ async fn alias_cycles_are_rejected() {
     o.add_alias(alias("a", "qwen")).await.unwrap();
     o.add_alias(alias("b", "a")).await.unwrap();
     // a → b would close the loop a → b → a.
-    let err = o.update_alias(alias("a", "b")).await.unwrap_err();
+    let err = o.update_alias("a", alias("a", "b")).await.unwrap_err();
     assert!(matches!(err, MutationError::AliasCycle { .. }));
     // Resolution is unaffected (the cyclic update was rejected).
     assert_eq!(o.resolve_model_id("b").await, "qwen");
@@ -941,11 +984,16 @@ async fn alias_can_be_created_unassigned_then_pointed_at_a_model() {
     assert_eq!(o.resolve_model_id("planner").await, "");
 
     o.add_model(model("qwen")).await.unwrap();
-    o.update_alias(alias("planner", "qwen")).await.unwrap();
+    o.update_alias("planner", alias("planner", "qwen"))
+        .await
+        .unwrap();
     assert_eq!(o.resolve_model_id("planner").await, "qwen");
 
     // Reassigning to a non-existent model is still rejected.
-    let err = o.update_alias(alias("planner", "ghost")).await.unwrap_err();
+    let err = o
+        .update_alias("planner", alias("planner", "ghost"))
+        .await
+        .unwrap_err();
     assert!(matches!(err, MutationError::AliasTargetMissing { .. }));
 }
 

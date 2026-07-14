@@ -13,8 +13,56 @@ use crate::config::{
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
 use crate::vram::estimator::GgufMeta;
 
+struct ModelResponse {
+    model: ModelConfig,
+    file_size_bytes: u64,
+}
+
+impl Serialize for ModelResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut value = serde_json::to_value(&self.model).map_err(serde::ser::Error::custom)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("ModelConfig did not serialize to object"))?;
+        object
+            .entry("file_size_bytes")
+            .or_insert_with(|| serde_json::Value::from(self.file_size_bytes));
+        value.serialize(serializer)
+    }
+}
+
+impl From<ModelConfig> for ModelResponse {
+    fn from(model: ModelConfig) -> Self {
+        let file_size_bytes = model.file_size_bytes();
+        Self {
+            model,
+            file_size_bytes,
+        }
+    }
+}
+
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.list_models().await)
+    let models = state.list_models().await;
+    match tokio::task::spawn_blocking(move || {
+        models
+            .into_iter()
+            .map(ModelResponse::from)
+            .collect::<Vec<_>>()
+    })
+    .await
+    {
+        Ok(models) => Json(models).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("failed to build model response: {e}")
+            })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -112,6 +160,13 @@ fn mutation_response(e: MutationError) -> axum::response::Response {
             Json(serde_json::json!({"error": format!("'{id}' already exists")})),
         )
             .into_response(),
+        MutationError::ModelShadowsAlias(id) => (
+            StatusCode::CONFLICT,
+            Json(
+                serde_json::json!({"error": format!("model id '{id}' already exists as an alias")}),
+            ),
+        )
+            .into_response(),
         MutationError::InvalidConfig(err) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": err.to_string()})),
@@ -144,6 +199,11 @@ fn mutation_response(e: MutationError) -> axum::response::Response {
         | MutationError::AliasInvalid(_)) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        MutationError::Persistence(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": msg})),
         )
             .into_response(),
     }
@@ -392,14 +452,7 @@ pub async fn update_alias(
     Path(alias_name): Path<String>,
     Json(alias): Json<ModelAlias>,
 ) -> impl IntoResponse {
-    if alias.alias != alias_name {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "alias in URL and body must match"})),
-        )
-            .into_response();
-    }
-    match state.update_alias(alias).await {
+    match state.update_alias(&alias_name, alias).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => mutation_response(e),
     }
@@ -470,11 +523,16 @@ pub struct GgufInfoQuery {
 /// the context slider's upper bound and the live VRAM preview.
 pub async fn gguf_info(Query(q): Query<GgufInfoQuery>) -> impl IntoResponse {
     let expanded = shellexpand::tilde(&q.path).to_string();
-    match GgufMeta::read(StdPath::new(&expanded)) {
-        Ok(info) => (StatusCode::OK, Json(info)).into_response(),
-        Err(e) => (
+    match tokio::task::spawn_blocking(move || GgufMeta::read(StdPath::new(&expanded))).await {
+        Ok(Ok(info)) => (StatusCode::OK, Json(info)).into_response(),
+        Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("GGUF metadata task failed: {e}")})),
         )
             .into_response(),
     }
@@ -487,13 +545,27 @@ pub struct FileBrowserQuery {
 
 pub async fn list_files(Query(req): Query<FileBrowserQuery>) -> impl IntoResponse {
     let expanded = shellexpand::tilde(&req.path).to_string();
-    let path = StdPath::new(&expanded);
-    if !path.is_dir() {
-        return (
-            StatusCode::NOT_FOUND,
+    match tokio::task::spawn_blocking(move || read_directory_entries(expanded)).await {
+        Ok(Ok(entries)) => Json(entries).into_response(),
+        Ok(Err(status)) => (
+            status,
             Json(serde_json::json!({"error": "not a directory"})),
         )
-            .into_response();
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("file listing task failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+fn read_directory_entries(
+    expanded: String,
+) -> Result<Vec<serde_json::Value>, axum::http::StatusCode> {
+    let path = StdPath::new(&expanded);
+    if !path.is_dir() {
+        return Err(StatusCode::NOT_FOUND);
     }
 
     let mut entries = Vec::new();
@@ -521,5 +593,5 @@ pub async fn list_files(Query(req): Query<FileBrowserQuery>) -> impl IntoRespons
                 .cmp(b["name"].as_str().unwrap_or("")),
         }
     });
-    Json(entries).into_response()
+    Ok(entries)
 }

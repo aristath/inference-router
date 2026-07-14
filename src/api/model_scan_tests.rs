@@ -33,12 +33,13 @@ fn finds_gguf_files_recursively_and_follows_symlinked_dirs_once() {
 }
 
 fn gguf_model(id: &str, path: &str, preset: Option<&str>) -> ModelConfig {
-    let mut m = ModelConfig::default();
-    m.id = id.to_string();
-    m.weights_format = WeightsFormat::Gguf;
-    m.model_path = PathBuf::from(path);
-    m.binary_preset = preset.map(str::to_string);
-    m
+    ModelConfig {
+        id: id.to_string(),
+        weights_format: WeightsFormat::Gguf,
+        model_path: PathBuf::from(path),
+        binary_preset: preset.map(str::to_string),
+        ..ModelConfig::default()
+    }
 }
 
 #[test]

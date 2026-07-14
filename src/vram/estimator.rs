@@ -4,6 +4,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+const MAX_GGUF_METADATA_KVS: u64 = 1_000_000;
+const MAX_GGUF_ARRAY_VALUES: u64 = 1_000_000;
+const MAX_GGUF_STRING_ARRAY_VALUES: u64 = 16_384;
+const MAX_GGUF_SHARDS: u32 = 10_000;
+
 /// Maps `general.file_type` integer to its canonical quant label string.
 pub fn file_type_label(ft: u32) -> &'static str {
     match ft {
@@ -138,7 +143,7 @@ impl GgufMeta {
             full_attention_interval,
         );
         let kv_heads_total = full_kv_heads + swa_kv_heads;
-        let n_head_kv_max = kv_heads_per_layer.iter().copied().max().unwrap_or(0) as u32;
+        let n_head_kv_max = kv_heads_per_layer.iter().copied().max().unwrap_or(0);
 
         // --- Identity ---
         let name = meta_read_str(&map, "general.name");
@@ -310,16 +315,17 @@ fn meta_read_str_array(map: &MetaMap, key: &str) -> Vec<String> {
         // 8 = STRING in GGUF spec
         return Vec::new();
     }
-    let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap_or([0; 8])) as usize;
+    let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap_or([0; 8]))
+        .min(MAX_GGUF_STRING_ARRAY_VALUES) as usize;
     let mut pos = 12usize;
     let mut result = Vec::with_capacity(count.min(64));
     for _ in 0..count {
-        if pos + 8 > bytes.len() {
+        if pos.checked_add(8).is_none_or(|end| end > bytes.len()) {
             break;
         }
         let str_len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap_or([0; 8])) as usize;
         pos += 8;
-        if pos + str_len > bytes.len() {
+        if pos.checked_add(str_len).is_none_or(|end| end > bytes.len()) {
             break;
         }
         if let Ok(s) = std::str::from_utf8(&bytes[pos..pos + str_len]) {
@@ -378,8 +384,10 @@ fn read_bool_array_field(map: &MetaMap, key: &str) -> Result<Vec<bool>, Estimate
     if elem_ty != Ty::Bool {
         return Ok(Vec::new());
     }
-    let mut out = Vec::with_capacity(len.min(usize::MAX as u64) as usize);
-    for _ in 0..len {
+    let max_len = len.min(bytes.len().saturating_sub(pos) as u64);
+    let capped_len = max_len.min(MAX_GGUF_ARRAY_VALUES);
+    let mut out = Vec::with_capacity(capped_len.min(4096) as usize);
+    for _ in 0..capped_len {
         let Some(value) = bytes.get(pos).copied() else {
             break;
         };
@@ -500,9 +508,11 @@ fn read_int_array(bytes: &[u8]) -> Result<(Vec<u64>, u64), EstimateError> {
 
     macro_rules! collect_as {
         ($size:literal, $read:expr) => {{
-            let mut values = Vec::with_capacity(len.min(usize::MAX as u64) as usize);
-            for _ in 0..len {
-                if pos + $size > bytes.len() {
+            let available = bytes.len().saturating_sub(pos) / $size;
+            let capped_len = len.min(available as u64).min(MAX_GGUF_ARRAY_VALUES);
+            let mut values = Vec::with_capacity(capped_len.min(4096) as usize);
+            for _ in 0..capped_len {
+                if pos.checked_add($size).is_none_or(|end| end > bytes.len()) {
                     break;
                 }
                 values.push($read(&bytes[pos..pos + $size]));
@@ -541,7 +551,7 @@ fn sharded_total_size(path: &Path) -> Option<u64> {
     let rest = fname.strip_suffix(".gguf")?;
     let (stem_and_idx, total_str) = rest.rsplit_once("-of-")?;
     let total: u32 = total_str.parse().ok()?;
-    if total == 0 {
+    if total == 0 || total > MAX_GGUF_SHARDS {
         return None;
     }
     let (stem, idx_str) = stem_and_idx.rsplit_once('-')?;
@@ -579,7 +589,7 @@ fn shard_paths(path: &Path) -> Vec<PathBuf> {
     let Some((stem, idx_str)) = stem_and_idx.rsplit_once('-') else {
         return single();
     };
-    if total == 0 || idx_str.parse::<u32>().is_err() {
+    if total == 0 || total > MAX_GGUF_SHARDS || idx_str.parse::<u32>().is_err() {
         return single();
     }
     let width = idx_str.len();
@@ -665,7 +675,13 @@ fn read_metadata_kvs(data: &[u8]) -> Result<HashMap<String, (Ty, Vec<u8>)>, Esti
         ));
     }
 
-    let mut map = HashMap::with_capacity(header.metadata_kv_count as usize);
+    if header.metadata_kv_count > MAX_GGUF_METADATA_KVS {
+        return Err(EstimateError::Gguf(format!(
+            "metadata kv count {} exceeds limit {}",
+            header.metadata_kv_count, MAX_GGUF_METADATA_KVS
+        )));
+    }
+    let mut map = HashMap::with_capacity(header.metadata_kv_count.min(16_384) as usize);
     for _ in 0..header.metadata_kv_count {
         let kv = reader.read_meta_kv().map_err(read_err)?;
         map.insert(kv.key, (kv.ty, kv.value));
@@ -872,7 +888,8 @@ impl<'a> GGufReader<'a> {
 
     fn read_string(&mut self) -> Result<String, GgufReadError> {
         let len = self.read_u64()?;
-        let bytes = self.read_bytes(len as usize)?;
+        let len = usize::try_from(len).map_err(|_| GgufReadError::Invalid)?;
+        let bytes = self.read_bytes(len)?;
         std::str::from_utf8(bytes)
             .map(str::to_owned)
             .map_err(|_| GgufReadError::Utf8)
@@ -886,13 +903,18 @@ impl<'a> GGufReader<'a> {
             Ty::U64 | Ty::I64 | Ty::F64 => self.skip(8),
             Ty::String => {
                 let len = self.read_u64()?;
-                self.skip(len as usize)
+                let len = usize::try_from(len).map_err(|_| GgufReadError::Invalid)?;
+                self.skip(len)
             }
             Ty::Array => {
                 let elem_ty = Ty::try_from(self.read_u32()?)?;
                 let len = self.read_u64()?;
                 if let Some(size) = fixed_value_size(elem_ty) {
-                    return self.skip(size.saturating_mul(len as usize));
+                    let len = usize::try_from(len).map_err(|_| GgufReadError::Invalid)?;
+                    return self.skip(size.checked_mul(len).ok_or(GgufReadError::Invalid)?);
+                }
+                if len > MAX_GGUF_ARRAY_VALUES {
+                    return Err(GgufReadError::Invalid);
                 }
                 for _ in 0..len {
                     self.skip_value(elem_ty)?;

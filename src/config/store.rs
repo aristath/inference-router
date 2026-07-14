@@ -2,7 +2,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
+
+static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A generic file-backed JSON store.
 ///
@@ -14,29 +17,37 @@ use tracing::debug;
 pub struct JsonStore<T: Clone + DeserializeOwned + Serialize + Send + Sync> {
     path: PathBuf,
     data: std::sync::Mutex<T>,
+    save_lock: std::sync::Mutex<()>,
 }
 
 impl<T: Clone + DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
     /// Creates a new store at the given path, loading existing data if present.
+    #[allow(dead_code)]
     pub fn new(path: PathBuf) -> Self {
+        Self::try_new(path).expect("failed to initialize JSON store")
+    }
+
+    /// Creates a new store, returning load errors for existing-but-invalid files.
+    pub fn try_new(path: PathBuf) -> Result<Self, StoreError> {
         let data = match Self::load_file(&path) {
             Ok(data) => {
                 debug!("Loaded config from {}", path.display());
                 data
             }
-            Err(e) => {
+            Err(StoreError::NotFound(_)) => {
                 debug!(
-                    "No existing config at {}, will create on first save: {}",
+                    "No existing config at {}, will create on first save",
                     path.display(),
-                    e,
                 );
                 Self::empty_data()
             }
+            Err(e) => return Err(e),
         };
-        Self {
+        Ok(Self {
             path,
             data: std::sync::Mutex::new(data),
-        }
+            save_lock: std::sync::Mutex::new(()),
+        })
     }
 
     /// Returns a cloned snapshot of the current data. Never holds the
@@ -64,6 +75,7 @@ impl<T: Clone + DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
 
     /// Saves the current data to disk atomically.
     pub fn save(&self) -> Result<(), StoreError> {
+        let _save = self.save_lock.lock().expect("JsonStore save lock poisoned");
         let snapshot = self.snapshot();
         let json = serde_json::to_string_pretty(&snapshot).map_err(StoreError::Serialization)?;
 
@@ -71,17 +83,37 @@ impl<T: Clone + DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
             fs::create_dir_all(parent).map_err(StoreError::Io)?;
         }
 
-        // Write to temp file, then rename for atomicity.
-        let temp_path = self.path.with_extension("json.tmp");
-        {
-            let mut file = fs::File::create(&temp_path).map_err(StoreError::Io)?;
+        let temp_path = self.temp_path();
+        let write_result = (|| {
+            let mut file = fs::File::create(&temp_path)?;
             file.write_all(json.as_bytes()).map_err(StoreError::Io)?;
             file.sync_all().map_err(StoreError::Io)?;
+            Ok::<(), StoreError>(())
+        })();
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(e);
         }
-        fs::rename(&temp_path, &self.path).map_err(StoreError::Io)?;
+        if let Err(e) = fs::rename(&temp_path, &self.path).map_err(StoreError::Io) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(e);
+        }
+        sync_parent_dir(&self.path)?;
 
         debug!("Saved config to {}", self.path.display());
         Ok(())
+    }
+
+    fn temp_path(&self) -> PathBuf {
+        let seq = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("store.json");
+        self.path
+            .with_file_name(format!("{file_name}.{pid}.{seq}.tmp"))
     }
 
     /// Loads a single file from disk.
@@ -103,6 +135,21 @@ impl<T: Clone + DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
                 .expect("Failed to create empty data")
         })
     }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(StoreError::Io)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), StoreError> {
+    Ok(())
 }
 
 /// Errors that can occur during store operations.

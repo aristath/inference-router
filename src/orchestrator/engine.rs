@@ -4,7 +4,9 @@ use crate::config::{
 };
 use crate::orchestrator::allocation::plan_fit_placement;
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
-use crate::process::manager::{ModelRuntime, ProcessManager, RequestGuard, SpawnError};
+use crate::process::manager::{
+    ModelRuntime, PendingChild, ProcessManager, RequestGuard, SpawnError,
+};
 use crate::system::stats::{SystemStats, SystemTracker};
 use crate::vram::estimator::GgufMeta;
 use crate::vram::llama_fit::{
@@ -21,6 +23,7 @@ use tracing::{error, info, warn};
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_INSTANCES_PER_MODEL: usize = usize::MAX;
 pub const DEFAULT_VRAM_WAIT_MS: u64 = 300_000;
+const MODEL_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const MAX_EVENTS: usize = 200;
 
 /// Shared runtime data — single source of truth for models + gpus + presets.
@@ -256,8 +259,13 @@ impl Orchestrator {
     pub async fn list_gpus(&self) -> Vec<GpuInfo> {
         // Refresh on each call so polling clients see live numbers
         // (VRAM + GPU busy %) at whatever cadence they're polling at.
-        // sysfs reads are a few small text files — cheap enough for 1s.
-        let fresh = self.vram_tracker.refresh();
+        let tracker = self.vram_tracker.clone();
+        let fresh = tokio::task::spawn_blocking(move || tracker.refresh())
+            .await
+            .unwrap_or_else(|e| {
+                error!(error = %e, "GPU refresh task failed");
+                Vec::new()
+            });
         let mut data = self.data.lock().await;
         data.gpus = fresh.clone();
         fresh
@@ -338,11 +346,18 @@ impl Orchestrator {
                 tags,
             });
         });
-        let _ = store.save();
+        let store_for_save = store.clone();
+        tokio::task::spawn_blocking(move || store_for_save.save())
+            .await
+            .map_err(|e| MutationError::Persistence(format!("gpus.json save task failed: {e}")))?
+            .map_err(|e| MutationError::Persistence(format!("failed to save gpus.json: {e}")))?;
         self.vram_tracker
             .set_tag_overrides(tag_overrides_by_pci(&store.snapshot()));
         // Refresh so data.gpus reflects the new tags right away.
-        let gpus = self.vram_tracker.refresh();
+        let tracker = self.vram_tracker.clone();
+        let gpus = tokio::task::spawn_blocking(move || tracker.refresh())
+            .await
+            .map_err(|e| MutationError::Persistence(format!("GPU refresh task failed: {e}")))?;
         self.data.lock().await.gpus = gpus;
         self.record_event("info", format!("updated GPU tags for {pci_bus_id}"))
             .await;
@@ -390,13 +405,29 @@ impl Orchestrator {
         Ok(())
     }
 
-    pub async fn update_alias(&self, alias: ModelAlias) -> Result<(), MutationError> {
+    pub async fn update_alias(
+        &self,
+        current_name: &str,
+        alias: ModelAlias,
+    ) -> Result<(), MutationError> {
         let mut data = self.data.lock().await;
-        if !data.aliases.contains_key(&alias.alias) {
-            return Err(MutationError::AliasNotFound(alias.alias));
+        if !data.aliases.contains_key(current_name) {
+            return Err(MutationError::AliasNotFound(current_name.into()));
         }
-        validate_alias(&data, &alias)?;
-        data.aliases.insert(alias.alias.clone(), alias);
+        if current_name != alias.alias && data.aliases.contains_key(&alias.alias) {
+            return Err(MutationError::AliasConflict(alias.alias));
+        }
+
+        let mut aliases = data.aliases.clone();
+        aliases.remove(current_name);
+        aliases.insert(alias.alias.clone(), alias.clone());
+        for other in aliases.values_mut() {
+            if other.target == current_name {
+                other.target = alias.alias.clone();
+            }
+        }
+        validate_alias_with_maps(&data.models, &aliases, &alias)?;
+        data.aliases = aliases;
         self.aliases_dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -484,6 +515,7 @@ impl Orchestrator {
 
     pub async fn add_model(&self, model: ModelConfig) -> Result<(), MutationError> {
         let mut data = self.data.lock().await;
+        validate_model_identity(&data, &model)?;
         if data.models.contains_key(&model.id) {
             return Err(MutationError::Conflict(model.id));
         }
@@ -501,6 +533,7 @@ impl Orchestrator {
         let id = new.id.clone();
         {
             let mut data = self.data.lock().await;
+            validate_model_identity(&data, &new)?;
             if let Some(ref did) = new.draft_model_id {
                 validate_draft_reference(&data.models, &new.id, did)?;
             }
@@ -529,7 +562,10 @@ impl Orchestrator {
             let kv_invalidated = existing.model_path != updated.model_path
                 || existing.context != updated.context
                 || existing.cache_type_k != updated.cache_type_k
-                || existing.cache_type_v != updated.cache_type_v;
+                || existing.cache_type_v != updated.cache_type_v
+                || existing.split_mode != updated.split_mode
+                || existing.main_gpu != updated.main_gpu
+                || existing.tensor_split != updated.tensor_split;
             if kv_invalidated {
                 updated.estimated_vram = 0;
             } else {
@@ -703,6 +739,15 @@ impl Orchestrator {
                             return Err(e);
                         }
                     }
+                    Err(e) if is_cancelled_load(&e) => {
+                        let mut data = me.data.lock().await;
+                        if let Some(m) = data.models.get_mut(&id_owned) {
+                            m.state = ModelState::Idle;
+                            m.pid = None;
+                        }
+                        me.dirty.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
                     Err(e) => {
                         let mut data = me.data.lock().await;
                         if let Some(m) = data.models.get_mut(&id_owned) {
@@ -778,7 +823,7 @@ impl Orchestrator {
     /// The admission lock serializes VRAM accounting + eviction + fork/exec
     /// — the steps where two concurrent loads could step on each other's
     /// VRAM budget. We drop admission before waiting for health; that way
-    /// a 180-second health poll can't block a second model from starting
+    /// a 10-minute health poll can't block a second model from starting
     /// on a different GPU.
     async fn do_load(&self, id: &str) -> Result<RequestGuard, LoadError> {
         // Per-GPU VRAM safety caps become the fit margins handed to llama.cpp's
@@ -791,7 +836,10 @@ impl Orchestrator {
             let _admit = self.admission.lock().await;
 
             // Refresh VRAM into AppData.
-            let gpus = self.vram_tracker.refresh();
+            let tracker = self.vram_tracker.clone();
+            let gpus = tokio::task::spawn_blocking(move || tracker.refresh())
+                .await
+                .map_err(|e| LoadError::FitProbeFailed(format!("GPU refresh task failed: {e}")))?;
             {
                 let mut data = self.data.lock().await;
                 data.gpus = gpus.clone();
@@ -844,16 +892,18 @@ impl Orchestrator {
             // placement oracle.
             let already_reserved = self.reserved_vram.load(std::sync::atomic::Ordering::SeqCst);
             let caps = (gpu_cap_pct, display_cap_pct);
-            match place_model(
-                &mut model,
-                draft.as_ref(),
-                &target_backends,
-                &gpus,
+            let (placed_model, outcome) = place_model_blocking(
+                model,
+                draft.clone(),
+                target_backends.clone(),
+                gpus.clone(),
                 already_reserved,
                 caps,
             )
-            .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?
-            {
+            .await
+            .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?;
+            model = placed_model;
+            match outcome {
                 PlaceOutcome::Placed {
                     backend,
                     gpus_used,
@@ -877,19 +927,26 @@ impl Orchestrator {
                                 warn!(model = victim, error = %e, "eviction stop failed");
                             }
                         }
-                        let gpus_after = self.vram_tracker.refresh();
+                        let tracker = self.vram_tracker.clone();
+                        let gpus_after = tokio::task::spawn_blocking(move || tracker.refresh())
+                            .await
+                            .map_err(|e| {
+                                LoadError::FitProbeFailed(format!("GPU refresh task failed: {e}"))
+                            })?;
                         self.data.lock().await.gpus = gpus_after.clone();
                         // Re-plan against the freed GPUs so the probe sees the
                         // extra room.
-                        place_model(
-                            &mut model,
-                            draft.as_ref(),
-                            &target_backends,
-                            &gpus_after,
+                        let (placed_model, _) = place_model_blocking(
+                            model,
+                            draft.clone(),
+                            target_backends.clone(),
+                            gpus_after,
                             already_reserved,
                             caps,
                         )
+                        .await
                         .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?;
+                        model = placed_model;
                     }
                     info!(
                         model = id,
@@ -917,18 +974,25 @@ impl Orchestrator {
                         }
                     }
                     // Re-read VRAM after eviction so placement sees freed space.
-                    let gpus_after = self.vram_tracker.refresh();
+                    let tracker = self.vram_tracker.clone();
+                    let gpus_after = tokio::task::spawn_blocking(move || tracker.refresh())
+                        .await
+                        .map_err(|e| {
+                            LoadError::FitProbeFailed(format!("GPU refresh task failed: {e}"))
+                        })?;
                     self.data.lock().await.gpus = gpus_after.clone();
-                    match place_model(
-                        &mut model,
-                        draft.as_ref(),
-                        &target_backends,
-                        &gpus_after,
+                    let (placed_model, outcome) = place_model_blocking(
+                        model,
+                        draft.clone(),
+                        target_backends.clone(),
+                        gpus_after,
                         already_reserved,
                         caps,
                     )
-                    .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?
-                    {
+                    .await
+                    .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?;
+                    model = placed_model;
+                    match outcome {
                         PlaceOutcome::Placed { .. } | PlaceOutcome::Fits => {}
                         PlaceOutcome::DoesNotFit { free } => {
                             return Err(LoadError::InsufficientVram {
@@ -969,12 +1033,9 @@ impl Orchestrator {
         };
         // Admission and process_manager mutexes are dropped here; other
         // loads can proceed even while we're still waiting for `pending`
-        // to report healthy (up to 180 seconds).
+        // to report healthy (up to 10 minutes).
 
-        match pending
-            .wait_for_health(std::time::Duration::from_secs(180))
-            .await
-        {
+        match pending.wait_for_health(MODEL_STARTUP_TIMEOUT).await {
             Ok(_kv_bytes) => {
                 // Weights are now in VRAM and sysfs reflects reality — release reservation.
                 if vram_reservation > 0 {
@@ -982,16 +1043,17 @@ impl Orchestrator {
                         .fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
                 }
                 // register() returns the guard for this request (active starts at 1).
-                let guard = self.process_manager.lock().await.register(pending);
-                // pm lock dropped before acquiring data lock.
-                {
-                    let mut data = self.data.lock().await;
-                    if let Some(m) = data.models.get_mut(id) {
-                        m.state = ModelState::Running;
-                        m.pid = Some(pid);
-                        m.last_used = Some(unix_now());
+                let guard = match self.register_ready_child(pending, id, pid).await {
+                    Ok(guard) => guard,
+                    Err(mut pending) => {
+                        pending.terminate().await;
+                        return Err(LoadError::SpawnFailed(
+                            crate::process::manager::SpawnError::HealthCheckFailed(
+                                crate::process::manager::HealthCheckError::Cancelled,
+                            ),
+                        ));
                     }
-                }
+                };
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "inference server ready");
                 self.record_event("info", format!("{id} ready on port {port}"))
@@ -1039,7 +1101,10 @@ impl Orchestrator {
                 return Ok(None);
             }
 
-            let gpus = self.vram_tracker.refresh();
+            let tracker = self.vram_tracker.clone();
+            let gpus = tokio::task::spawn_blocking(move || tracker.refresh())
+                .await
+                .map_err(|e| LoadError::FitProbeFailed(format!("GPU refresh task failed: {e}")))?;
             {
                 self.data.lock().await.gpus = gpus.clone();
             }
@@ -1089,16 +1154,18 @@ impl Orchestrator {
                 let s = self.settings.lock().await;
                 (s.gpu_vram_cap_pct, s.display_gpu_vram_cap_pct)
             };
-            match place_model(
-                &mut model,
-                draft.as_ref(),
-                &target_backends,
-                &gpus,
+            let (placed_model, outcome) = place_model_blocking(
+                model,
+                draft.clone(),
+                target_backends.clone(),
+                gpus.clone(),
                 already_reserved,
                 caps,
             )
-            .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?
-            {
+            .await
+            .map_err(|e| LoadError::FitProbeFailed(e.to_string()))?;
+            model = placed_model;
+            match outcome {
                 PlaceOutcome::Placed {
                     backend,
                     gpus_used,
@@ -1156,24 +1223,23 @@ impl Orchestrator {
         };
         // Admission lock dropped; health check runs without blocking other spawns.
 
-        match pending
-            .wait_for_health(std::time::Duration::from_secs(180))
-            .await
-        {
+        match pending.wait_for_health(MODEL_STARTUP_TIMEOUT).await {
             Ok(_) => {
                 if vram_reservation > 0 {
                     self.reserved_vram
                         .fetch_sub(vram_reservation, std::sync::atomic::Ordering::SeqCst);
                 }
-                let guard = self.process_manager.lock().await.register(pending);
-                {
-                    let mut data = self.data.lock().await;
-                    if let Some(m) = data.models.get_mut(id) {
-                        m.state = ModelState::Running;
-                        m.pid = Some(pid);
-                        m.last_used = Some(unix_now());
+                let guard = match self.register_ready_child(pending, id, pid).await {
+                    Ok(guard) => guard,
+                    Err(mut pending) => {
+                        pending.terminate().await;
+                        return Err(LoadError::SpawnFailed(
+                            crate::process::manager::SpawnError::HealthCheckFailed(
+                                crate::process::manager::HealthCheckError::Cancelled,
+                            ),
+                        ));
                     }
-                }
+                };
                 self.dirty.store(true, Ordering::Relaxed);
                 info!(pid, port, model = id, "extra instance ready");
                 self.record_event("info", format!("extra {id} instance ready on port {port}"))
@@ -1197,6 +1263,23 @@ impl Orchestrator {
                 ))
             }
         }
+    }
+
+    async fn register_ready_child(
+        &self,
+        pending: PendingChild,
+        id: &str,
+        pid: i32,
+    ) -> Result<RequestGuard, Box<PendingChild>> {
+        let mut pm = self.process_manager.lock().await;
+        let guard = pm.register(pending)?;
+        let mut data = self.data.lock().await;
+        if let Some(m) = data.models.get_mut(id) {
+            m.state = ModelState::Running;
+            m.pid = Some(pid);
+            m.last_used = Some(unix_now());
+        }
+        Ok(guard)
     }
 
     async fn should_wait_for_vram(&self, started: std::time::Instant) -> bool {
@@ -1234,7 +1317,7 @@ impl Orchestrator {
                 .get(id)
                 .ok_or_else(|| StopError::ModelNotFound(id.into()))?;
         }
-        let pids = self.process_manager.lock().await.pids_for_model(id);
+        let pids = self.process_manager.lock().await.pids_for_model_runtime(id);
         for pid in &pids {
             self.process_manager.lock().await.stop(*pid).await;
         }
@@ -1335,27 +1418,32 @@ impl Orchestrator {
     /// and recycle GPU-backed instances when one fires. Spawned once by
     /// `lifecycle::run`. Runs until the process exits.
     pub async fn run_engine_reset_watchdog(self: Arc<Self>) {
-        let (enabled, poll, drm_root, capture_dir) = {
-            let s = self.settings.lock().await;
-            (
-                s.watchdog.enabled && s.watchdog.engine_reset_watch,
-                s.watchdog.engine_reset_poll_secs.max(1),
-                s.watchdog.drm_root.clone(),
-                s.watchdog.devcoredump_capture_dir.clone(),
-            )
-        };
-        if !enabled {
-            info!("engine-reset watchdog disabled by settings");
-            return;
-        }
-        let mut watcher = crate::system::gpu_watchdog::CoredumpWatcher::new(&drm_root);
-        info!(drm_root = %drm_root, poll_secs = poll, "engine-reset watchdog armed");
-
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(poll));
+        let mut watcher_root = String::new();
+        let mut watcher = crate::system::gpu_watchdog::CoredumpWatcher::new(&watcher_root);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             ticker.tick().await;
+            let (enabled, poll, drm_root, capture_dir) = {
+                let s = self.settings.lock().await;
+                (
+                    s.watchdog.enabled && s.watchdog.engine_reset_watch,
+                    s.watchdog.engine_reset_poll_secs.max(1),
+                    s.watchdog.drm_root.clone(),
+                    s.watchdog.devcoredump_capture_dir.clone(),
+                )
+            };
+            if !enabled {
+                tokio::time::sleep(std::time::Duration::from_secs(poll)).await;
+                continue;
+            }
+            if watcher_root != drm_root {
+                watcher_root = drm_root.clone();
+                watcher = crate::system::gpu_watchdog::CoredumpWatcher::new(&watcher_root);
+                info!(drm_root = %watcher_root, poll_secs = poll, "engine-reset watchdog armed");
+            }
             let fresh = watcher.poll_new();
             if fresh.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_secs(poll)).await;
                 continue;
             }
             for sig in &fresh {
@@ -1378,6 +1466,7 @@ impl Orchestrator {
                 format!("GPU engine reset detected; recycled {n} GPU instance(s)"),
             )
             .await;
+            tokio::time::sleep(std::time::Duration::from_secs(poll)).await;
         }
     }
 
@@ -1385,30 +1474,29 @@ impl Orchestrator {
     /// to answer (`/slots`) and recycle it after repeated timeouts. Catches
     /// wedges that never produced a devcoredump. Spawned once by `lifecycle::run`.
     pub async fn run_liveness_probe(self: Arc<Self>) {
-        let (enabled, interval, timeout, path, max_fail) = {
-            let s = self.settings.lock().await;
-            (
-                s.watchdog.enabled && s.watchdog.liveness_enabled,
-                s.watchdog.liveness_interval_secs.max(1),
-                s.watchdog.liveness_timeout_secs.max(1),
-                s.watchdog.liveness_probe_path.clone(),
-                s.watchdog.liveness_failures_to_recycle.max(1),
-            )
-        };
-        if !enabled {
-            info!("liveness probe disabled by settings");
-            return;
-        }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        info!(path = %path, interval_secs = interval, "liveness probe armed");
-
         let mut fails: HashMap<i32, u32> = HashMap::new();
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             ticker.tick().await;
+            let (enabled, interval, timeout, path, max_fail) = {
+                let s = self.settings.lock().await;
+                (
+                    s.watchdog.enabled && s.watchdog.liveness_enabled,
+                    s.watchdog.liveness_interval_secs.max(1),
+                    s.watchdog.liveness_timeout_secs.max(1),
+                    s.watchdog.liveness_probe_path.clone(),
+                    s.watchdog.liveness_failures_to_recycle.max(1),
+                )
+            };
+            if !enabled {
+                fails.clear();
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                continue;
+            }
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
             let instances = { self.process_manager.lock().await.idle_instances() };
             let live_pids: HashSet<i32> = instances.iter().map(|(_, pid, _)| *pid).collect();
             fails.retain(|pid, _| live_pids.contains(pid));
@@ -1416,20 +1504,18 @@ impl Orchestrator {
             for (model_id, pid, port) in instances {
                 let url = format!("http://127.0.0.1:{}{}", port, path);
                 // Any HTTP reply (even 404/501) proves the server loop is alive.
-                // Only a *timeout* signals a wedge; connection errors mean the
-                // process is gone, which the reconcile reaper handles.
-                let timed_out = match client.get(&url).send().await {
-                    Ok(_) => false,
-                    Err(e) => e.is_timeout(),
-                };
-                if timed_out {
+                // Timeouts and connection failures both count: a dead process will
+                // be reaped by reconcile, while a stale listener or wedged socket
+                // should not be treated as healthy forever.
+                let failed = client.get(&url).send().await.is_err();
+                if failed {
                     let c = fails.entry(pid).or_insert(0);
                     *c += 1;
-                    warn!(model = %model_id, pid, port, path = %path, count = *c, "liveness probe timed out");
+                    warn!(model = %model_id, pid, port, path = %path, count = *c, "liveness probe failed");
                     if *c >= max_fail {
                         self.recycle_instance(
                             pid,
-                            &format!("liveness probe timed out {c}x on {path}"),
+                            &format!("liveness probe failed {c}x on {path}"),
                         )
                         .await;
                         fails.remove(&pid);
@@ -1438,6 +1524,7 @@ impl Orchestrator {
                     fails.remove(&pid);
                 }
             }
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         }
     }
 
@@ -1446,7 +1533,13 @@ impl Orchestrator {
     /// Refresh VRAM from sysfs, detect dead processes, persist if dirty.
     /// Called on a 5s timer by `lifecycle::run`.
     pub async fn reconcile(&self) {
-        let gpus = self.vram_tracker.refresh();
+        let tracker = self.vram_tracker.clone();
+        let gpus = tokio::task::spawn_blocking(move || tracker.refresh())
+            .await
+            .unwrap_or_else(|e| {
+                error!(error = %e, "GPU refresh task failed during reconcile");
+                Vec::new()
+            });
         {
             self.data.lock().await.gpus = gpus;
         }
@@ -1455,8 +1548,8 @@ impl Orchestrator {
         let dead = self.process_manager.lock().await.dead_instances();
 
         if !dead.is_empty() {
-            let mut data = self.data.lock().await;
             let mut pm = self.process_manager.lock().await;
+            let mut data = self.data.lock().await;
             for (model_id, pid) in &dead {
                 warn!(model = model_id, pid, "process died");
                 pm.forget(*pid);
@@ -1618,6 +1711,9 @@ pub enum MutationError {
     #[error("model '{0}' already exists")]
     Conflict(String),
 
+    #[error("model id '{0}' collides with an existing alias")]
+    ModelShadowsAlias(String),
+
     #[error("invalid config: {0}")]
     InvalidConfig(#[from] ConfigError),
 
@@ -1641,6 +1737,9 @@ pub enum MutationError {
 
     #[error("invalid alias: {0}")]
     AliasInvalid(String),
+
+    #[error("persistence error: {0}")]
+    Persistence(String),
 }
 
 /// A canonical alias name: 1–64 chars of lowercase ASCII letters, digits, and
@@ -1713,29 +1812,47 @@ fn target_creates_cycle(
 /// - if a target is given, it names an existing model **or** an existing alias
 /// - the target does not create a resolution cycle
 fn validate_alias(data: &AppData, alias: &ModelAlias) -> Result<(), MutationError> {
+    validate_alias_with_maps(&data.models, &data.aliases, alias)
+}
+
+fn validate_alias_with_maps(
+    models: &HashMap<String, ModelConfig>,
+    aliases: &HashMap<String, ModelAlias>,
+    alias: &ModelAlias,
+) -> Result<(), MutationError> {
     if !is_valid_alias_name(&alias.alias) {
         return Err(MutationError::AliasInvalid(
             "alias must be 1–64 characters of lowercase letters, digits, '.', '_' or '-'".into(),
         ));
     }
-    if data.models.contains_key(&alias.alias) {
+    if models.contains_key(&alias.alias) {
         return Err(MutationError::AliasShadowsModel(alias.alias.clone()));
     }
     if !alias.target.is_empty() {
-        let is_model = data.models.contains_key(&alias.target);
-        let is_alias = data.aliases.contains_key(&alias.target);
+        let is_model = models.contains_key(&alias.target);
+        let is_alias = aliases.contains_key(&alias.target);
         if !is_model && !is_alias {
             return Err(MutationError::AliasTargetMissing {
                 alias: alias.alias.clone(),
                 target: alias.target.clone(),
             });
         }
-        if is_alias && target_creates_cycle(&data.aliases, &alias.alias, &alias.target) {
+        if is_alias && target_creates_cycle(aliases, &alias.alias, &alias.target) {
             return Err(MutationError::AliasCycle {
                 alias: alias.alias.clone(),
                 target: alias.target.clone(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_model_identity(data: &AppData, model: &ModelConfig) -> Result<(), MutationError> {
+    if model.id.trim().is_empty() {
+        return Err(MutationError::InvalidConfig(ConfigError::EmptyModelId));
+    }
+    if data.aliases.contains_key(&model.id) {
+        return Err(MutationError::ModelShadowsAlias(model.id.clone()));
     }
     Ok(())
 }
@@ -1782,6 +1899,9 @@ fn spawn_config_changed(old: &ModelConfig, new: &ModelConfig) -> bool {
         || old.parallel_slots != new.parallel_slots
         || old.cache_type_k != new.cache_type_k
         || old.cache_type_v != new.cache_type_v
+        || old.split_mode != new.split_mode
+        || old.main_gpu != new.main_gpu
+        || old.tensor_split != new.tensor_split
         || old.threads != new.threads
         || old.cache_ram_mib != new.cache_ram_mib
         || old.reasoning_format != new.reasoning_format
@@ -1846,6 +1966,22 @@ enum PlaceOutcome {
     /// No eligible GPU has any free VRAM (auto GGUF), or a pinned/non-GGUF model
     /// exceeds free VRAM. `free` is the best-case free seen (for the message).
     DoesNotFit { free: u64 },
+}
+
+async fn place_model_blocking(
+    mut model: ModelConfig,
+    draft: Option<ModelConfig>,
+    targets: Vec<Backend>,
+    gpus: Vec<GpuInfo>,
+    reserved: u64,
+    caps: (f64, f64),
+) -> Result<(ModelConfig, PlaceOutcome), crate::vram::llama_fit::LlamaFitError> {
+    tokio::task::spawn_blocking(move || {
+        let outcome = place_model(&mut model, draft.as_ref(), &targets, &gpus, reserved, caps)?;
+        Ok((model, outcome))
+    })
+    .await
+    .map_err(|e| crate::vram::llama_fit::LlamaFitError::Parse(format!("fit task failed: {e}")))?
 }
 
 fn place_model(
@@ -2054,7 +2190,7 @@ fn scale_out_accepts_placement(fully_on_gpu: bool) -> bool {
 }
 
 fn keep_best_spill_candidate(best: &mut Option<FitCandidate>, candidate: FitCandidate) {
-    let should_replace = best.as_ref().map_or(true, |current| {
+    let should_replace = best.as_ref().is_none_or(|current| {
         candidate.gpus_used > current.gpus_used
             || (candidate.gpus_used == current.gpus_used
                 && candidate.sizing.device_vram > current.sizing.device_vram)
@@ -2386,6 +2522,15 @@ fn is_configuration_load_error(e: &LoadError) -> bool {
             | LoadError::PresetNotFound(_)
             | LoadError::NoBinary(_)
             | LoadError::DraftNotFound { .. }
+    )
+}
+
+fn is_cancelled_load(e: &LoadError) -> bool {
+    matches!(
+        e,
+        LoadError::SpawnFailed(crate::process::manager::SpawnError::HealthCheckFailed(
+            crate::process::manager::HealthCheckError::Cancelled,
+        ))
     )
 }
 

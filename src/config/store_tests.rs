@@ -1,5 +1,6 @@
 use super::*;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -63,6 +64,18 @@ fn test_store_empty_on_missing_file() {
 }
 
 #[test]
+fn try_new_errors_on_invalid_existing_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("items.json");
+    fs::write(&path, "{not json").unwrap();
+
+    match JsonStore::<Vec<TestItem>>::try_new(path) {
+        Err(StoreError::Deserialization(_)) => {}
+        other => panic!("expected deserialization error, got {:?}", other.err()),
+    }
+}
+
+#[test]
 fn test_store_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("items.json");
@@ -104,7 +117,47 @@ fn test_store_atomic_write() {
     let items = store2.snapshot();
     assert_eq!(items[0].value, 100);
 
-    assert!(!dir.path().join("items.json.tmp").exists());
+    assert!(fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .all(|entry| entry.path().extension().and_then(|ext| ext.to_str()) != Some("tmp")));
+}
+
+#[test]
+fn concurrent_saves_serialize_without_temp_file_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("items.json");
+    let store: Arc<JsonStore<Vec<TestItem>>> = Arc::new(JsonStore::new(path.clone()));
+    let writers = 8;
+    let barrier = Arc::new(Barrier::new(writers));
+    let handles = (0..writers)
+        .map(|idx| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                store.with_mut(|items| {
+                    items.push(TestItem {
+                        id: format!("item-{idx}"),
+                        value: idx as i32,
+                    });
+                });
+                barrier.wait();
+                store.save().unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let store2: JsonStore<Vec<TestItem>> = JsonStore::new(path);
+    let items = store2.snapshot();
+    assert_eq!(items.len(), writers);
+    assert!(fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .all(|entry| entry.path().extension().and_then(|ext| ext.to_str()) != Some("tmp")));
 }
 
 #[test]

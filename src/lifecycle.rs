@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,21 +58,21 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config_dir)?;
 
     let models_store: Arc<JsonStore<Vec<ModelConfig>>> =
-        Arc::new(JsonStore::new(config_dir.join("models.json")));
+        Arc::new(JsonStore::try_new(config_dir.join("models.json"))?);
     let presets_store: Arc<JsonStore<Vec<BinaryPreset>>> =
-        Arc::new(JsonStore::new(config_dir.join("presets.json")));
+        Arc::new(JsonStore::try_new(config_dir.join("presets.json"))?);
     let aliases_store: Arc<JsonStore<Vec<ModelAlias>>> =
-        Arc::new(JsonStore::new(config_dir.join("aliases.json")));
+        Arc::new(JsonStore::try_new(config_dir.join("aliases.json"))?);
     let settings_path = config_dir.join("settings.json");
     let settings_exists = settings_path.exists();
-    let settings_store: Arc<JsonStore<AppSettings>> = Arc::new(JsonStore::new(settings_path));
+    let settings_store: Arc<JsonStore<AppSettings>> = Arc::new(JsonStore::try_new(settings_path)?);
     if !settings_exists {
         settings_store.replace(AppSettings::from_env());
     }
     let gpu_tags_store: Arc<JsonStore<Vec<GpuTagOverride>>> =
-        Arc::new(JsonStore::new(config_dir.join("gpus.json")));
+        Arc::new(JsonStore::try_new(config_dir.join("gpus.json"))?);
     let perf_store: Arc<JsonStore<HashMap<String, ModelPerf>>> =
-        Arc::new(JsonStore::new(config_dir.join("model_perf.json")));
+        Arc::new(JsonStore::try_new(config_dir.join("model_perf.json"))?);
 
     let orchestrator = Arc::new(Orchestrator::new_with_settings_store(
         models_store.clone(),
@@ -105,7 +105,11 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
     let router = build_router(app_state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let bind_ip = std::env::var("INFERENCE_ROUTER_BIND")
+        .ok()
+        .and_then(|raw| raw.parse::<IpAddr>().ok())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let addr = SocketAddr::from((bind_ip, config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "inference-router listening");
 
@@ -238,17 +242,24 @@ async fn collect_live_data(state: &AppState, sort: &str, dir: &str, query: &str)
         (s.gpu_vram_cap_pct, s.display_gpu_vram_cap_pct)
     };
 
-    let perf = state.perf_snapshot();
     let has_any_models = !models.is_empty();
-    let displays: Vec<ModelDisplay> = models
-        .iter()
-        .map(|m| {
-            let rt = runtimes.get(&m.id).copied().unwrap_or_default();
-            ModelDisplay::from_model(m)
-                .with_runtime(rt.instances, rt.active, rt.pending)
-                .with_perf(perf.get(&m.id))
-        })
-        .collect();
+    let perf = state.perf_snapshot();
+    let displays = tokio::task::spawn_blocking(move || {
+        models
+            .iter()
+            .map(|m| {
+                let rt = runtimes.get(&m.id).copied().unwrap_or_default();
+                ModelDisplay::from_model(m)
+                    .with_runtime(rt.instances, rt.active, rt.pending)
+                    .with_perf(perf.get(&m.id))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        error!(error = %e, "failed to build dashboard model display rows");
+        Vec::new()
+    });
 
     let model_sort = ModelSort::new(sort, dir);
     let models = sort_and_filter(displays, model_sort, query);
@@ -275,7 +286,7 @@ async fn collect_live_data(state: &AppState, sort: &str, dir: &str, query: &str)
 async fn index_page(State(state): State<AppState>) -> impl IntoResponse {
     // First paint uses the default ordering; the browser then polls
     // /fragment/dashboard with its own sort/filter choices.
-    let live = collect_live_data(&state, "name", "asc", "").await;
+    let live = collect_live_data(&state, "file-size", "desc", "").await;
     let tpl = DashboardTemplate {
         title: "Dashboard".into(),
         system: live.system,
@@ -299,8 +310,8 @@ async fn dashboard_fragment(
     State(state): State<AppState>,
     Query(query): Query<DashboardQuery>,
 ) -> impl IntoResponse {
-    let sort = query.sort.as_deref().unwrap_or("name");
-    let dir = query.dir.as_deref().unwrap_or("asc");
+    let sort = query.sort.as_deref().unwrap_or("file-size");
+    let dir = query.dir.as_deref().unwrap_or("desc");
     let q = query.q.as_deref().unwrap_or("");
     let live = collect_live_data(&state, sort, dir, q).await;
     let tpl = DashboardFragmentTemplate {

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tracing::{debug, info, warn};
 
 /// A live inference-server process owned by the orchestrator.
@@ -66,6 +66,8 @@ pub struct ProcessManager {
     reserved_ports: HashSet<u16>,
     /// model_id → spawned-but-not-yet-healthy process count.
     pending_instances: HashMap<String, usize>,
+    /// pid → cancellable spawned-but-not-yet-healthy process metadata.
+    pending: HashMap<i32, PendingInfo>,
     request_done: Arc<Notify>,
     backend_port_range: Option<(u16, u16)>,
 }
@@ -77,10 +79,17 @@ impl Default for ProcessManager {
             instances: HashMap::new(),
             reserved_ports: HashSet::new(),
             pending_instances: HashMap::new(),
+            pending: HashMap::new(),
             request_done: Arc::new(Notify::new()),
             backend_port_range: parse_port_range_env("INFERENCE_ROUTER_BACKEND_PORT_RANGE"),
         }
     }
+}
+
+struct PendingInfo {
+    port: u16,
+    model_id: String,
+    cancel: watch::Sender<bool>,
 }
 
 /// A freshly spawned but not-yet-healthy child.
@@ -91,6 +100,7 @@ pub struct PendingChild {
     uses_gpu: bool,
     child: tokio::process::Child,
     kv_bytes_rx: tokio::sync::oneshot::Receiver<u64>,
+    cancel_rx: watch::Receiver<bool>,
 }
 
 impl ProcessManager {
@@ -129,6 +139,16 @@ impl ProcessManager {
 
         let pid = child.id().expect("spawned child has no PID") as i32;
 
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        self.pending.insert(
+            pid,
+            PendingInfo {
+                port,
+                model_id: model.id.clone(),
+                cancel: cancel_tx,
+            },
+        );
+
         let stderr = child.stderr.take().expect("stderr was piped");
         let (kv_tx, kv_rx) = tokio::sync::oneshot::channel::<u64>();
         tokio::spawn(async move {
@@ -151,16 +171,28 @@ impl ProcessManager {
             uses_gpu,
             child,
             kv_bytes_rx: kv_rx,
+            cancel_rx,
         })
     }
 
     /// Install a healthy child into the running table. Returns a `RequestGuard`
     /// for the caller's in-flight request (active starts at 1).
-    pub fn register(&mut self, pending: PendingChild) -> RequestGuard {
+    pub fn register(&mut self, pending: PendingChild) -> Result<RequestGuard, Box<PendingChild>> {
+        if !self.pending.contains_key(&pending.pid) {
+            warn!(
+                pid = pending.pid,
+                port = pending.port,
+                model = pending.model_id,
+                "refusing to register cancelled pending inference server"
+            );
+            return Err(Box::new(pending));
+        }
+
         let active = Arc::new(AtomicUsize::new(1));
         let port = pending.port;
         let pid = pending.pid;
         self.release_pending(&pending.model_id, pending.port);
+        self.pending.remove(&pending.pid);
         self.instances
             .entry(pending.model_id.clone())
             .or_default()
@@ -178,18 +210,19 @@ impl ProcessManager {
                 child: pending.child,
             },
         );
-        RequestGuard {
+        Ok(RequestGuard {
             port,
             pid,
             active,
             request_done: self.request_done.clone(),
-        }
+        })
     }
 
     /// Drop tracking for a pending child that failed health checks. Consuming
     /// the PendingChild lets its `kill_on_drop` child handle clean up too.
     pub fn discard_pending(&mut self, pending: PendingChild) {
         self.release_pending(&pending.model_id, pending.port);
+        self.pending.remove(&pending.pid);
         drop(pending);
     }
 
@@ -342,7 +375,32 @@ impl ProcessManager {
             .unwrap_or_default()
     }
 
+    /// Returns all live and pending pids for a model. Stop/update/delete operate
+    /// at model granularity, so health-checking children must be cancelled too.
+    pub fn pids_for_model_runtime(&self, model_id: &str) -> Vec<i32> {
+        let mut pids = self.pids_for_model(model_id);
+        pids.extend(
+            self.pending
+                .iter()
+                .filter(|(_, pending)| pending.model_id == model_id)
+                .map(|(pid, _)| *pid),
+        );
+        pids
+    }
+
     pub async fn stop(&mut self, pid: i32) {
+        if let Some(pending) = self.pending.remove(&pid) {
+            self.release_pending(&pending.model_id, pending.port);
+            let _ = pending.cancel.send(true);
+            info!(
+                pid,
+                port = pending.port,
+                model = pending.model_id,
+                "pending inference server cancellation requested"
+            );
+            return;
+        }
+
         let Some(rc) = self.running.remove(&pid) else {
             warn!(
                 pid,
@@ -423,13 +481,17 @@ impl ProcessManager {
 
 impl PendingChild {
     pub async fn wait_for_health(&mut self, timeout: Duration) -> Result<u64, HealthCheckError> {
-        wait_for_health_or_exit(&mut self.child, self.port, timeout).await?;
+        wait_for_health_or_exit(&mut self.child, self.port, timeout, &mut self.cancel_rx).await?;
         let kv_bytes = tokio::time::timeout(Duration::from_millis(200), &mut self.kv_bytes_rx)
             .await
             .ok()
             .and_then(|r| r.ok())
             .unwrap_or(0);
         Ok(kv_bytes)
+    }
+
+    pub async fn terminate(&mut self) {
+        terminate_child(&mut self.child).await;
     }
 }
 
@@ -493,6 +555,14 @@ pub fn build_command_args(
             if let Some(v) = model.cache_type_v {
                 args.push("--cache-type-v".into());
                 args.push(v.as_arg().into());
+            }
+            if let Some(mode) = model.split_mode {
+                args.push("--split-mode".into());
+                args.push(mode.as_arg().into());
+            }
+            if let Some(n) = model.main_gpu {
+                args.push("--main-gpu".into());
+                args.push(n.to_string());
             }
             if let Some(ref ts) = model.tensor_split {
                 args.push("--tensor-split".into());
@@ -686,6 +756,7 @@ async fn wait_for_health_or_exit(
     child: &mut tokio::process::Child,
     port: u16,
     timeout: Duration,
+    cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), HealthCheckError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -695,6 +766,11 @@ async fn wait_for_health_or_exit(
     let start = std::time::Instant::now();
 
     loop {
+        if *cancel_rx.borrow() {
+            terminate_child(child).await;
+            return Err(HealthCheckError::Cancelled);
+        }
+
         match child.try_wait() {
             Ok(Some(status)) => {
                 return Err(HealthCheckError::ChildExited(
@@ -715,23 +791,57 @@ async fn wait_for_health_or_exit(
             return Err(HealthCheckError::Timeout(timeout));
         }
 
-        match client.get(&url).send().await {
-            Ok(response) if response.status().is_success() => {
-                debug!(port, "health check passed");
-                return Ok(());
+        let health = async {
+            match client.get(&url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    debug!(port, "health check passed");
+                    return true;
+                }
+                Ok(response) => {
+                    debug!(
+                        port,
+                        status = response.status().as_u16(),
+                        "health non-2xx, retrying"
+                    );
+                }
+                Err(e) => {
+                    debug!(port, error = %e, "health connect failed, retrying");
+                }
             }
-            Ok(response) => {
-                debug!(
-                    port,
-                    status = response.status().as_u16(),
-                    "health non-2xx, retrying"
-                );
+            false
+        };
+
+        tokio::select! {
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    terminate_child(child).await;
+                    return Err(HealthCheckError::Cancelled);
+                }
             }
-            Err(e) => {
-                debug!(port, error = %e, "health connect failed, retrying");
+            result = health => {
+                if result {
+                    if *cancel_rx.borrow() {
+                        terminate_child(child).await;
+                        return Err(HealthCheckError::Cancelled);
+                    }
+                    return Ok(());
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn terminate_child(child: &mut tokio::process::Child) {
+    let pid = child.id().map(|p| p as i32);
+    if let Some(pid) = pid {
+        let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGTERM);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if is_process_alive(pid) {
+            let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+    } else {
+        let _ = child.kill().await;
     }
 }
 
@@ -779,7 +889,19 @@ fn parse_kv_size_mib(line: &str) -> Option<f64> {
 }
 
 fn is_process_alive(pid: i32) -> bool {
+    if process_state(pid) == Some('Z') {
+        return false;
+    }
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+fn process_state(pid: i32) -> Option<char> {
+    parse_proc_stat_state(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+fn parse_proc_stat_state(stat: &str) -> Option<char> {
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.chars().next()
 }
 
 fn kill_process_group(pid: i32, sig: nix::sys::signal::Signal) -> nix::Result<()> {
@@ -808,6 +930,9 @@ pub enum HealthCheckError {
 
     #[error("inference server exited before becoming ready (exit code {:?}): {}", .0, .1)]
     ChildExited(Option<i32>, String),
+
+    #[error("load cancelled")]
+    Cancelled,
 }
 
 #[cfg(test)]

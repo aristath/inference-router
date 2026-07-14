@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::{CacheType, ReasoningFormat};
+use tokio::sync::{oneshot, watch};
 
 impl ProcessManager {
     fn reserve_test_pending(&mut self, model_id: &str, port: u16) {
@@ -20,6 +21,18 @@ fn parses_recurrent_state_line() {
     let line = "llama_memory_recurrent_init: size =   56.25 MiB (  8192 cells, 28 layers, 2 seqs), R (f16):   28.12 MiB, S (f16):   28.12 MiB";
     let mib = parse_kv_size_mib(line).unwrap();
     assert!((mib - 56.25).abs() < 0.01, "got {mib}");
+}
+
+#[test]
+fn parses_proc_stat_state_after_command_name() {
+    assert_eq!(
+        parse_proc_stat_state("641841 (llama-server) Z 618741 641841 641841 0 -1 4228100"),
+        Some('Z')
+    );
+    assert_eq!(
+        parse_proc_stat_state("123 (name with spaces) S 1 2 3"),
+        Some('S')
+    );
 }
 
 #[test]
@@ -245,15 +258,15 @@ fn gguf_argv_reasoning_format_kebab_for_deepseek_legacy() {
 }
 
 #[test]
-fn gguf_argv_emits_fitted_tensor_split_but_not_manual_split_knobs() {
+fn gguf_argv_emits_manual_split_knobs() {
     let mut m = gguf_model();
-    m.split_mode = Some(crate::config::SplitMode::Row);
+    m.split_mode = Some(crate::config::SplitMode::Tensor);
     m.main_gpu = Some(2);
     m.tensor_split = Some("0.5,0.5,0".into());
     let args = build_command_args(&m, None, 9001);
     let j = args.join(" ");
-    assert!(!j.contains("--split-mode"), "{j}");
-    assert!(!j.contains("--main-gpu"), "{j}");
+    assert!(j.contains("--split-mode tensor"), "{j}");
+    assert!(j.contains("--main-gpu 2"), "{j}");
     assert!(j.contains("--tensor-split 0.5,0.5,0"), "{j}");
 }
 
@@ -512,6 +525,72 @@ fn pending_instances_count_toward_total() {
 
     assert_eq!(pm.instance_count("m"), 1);
     assert_eq!(pm.total_instance_count("m"), 2);
+}
+
+#[test]
+fn pending_pids_are_included_in_model_runtime_pid_lookup() {
+    let mut pm = ProcessManager::default();
+    let (cancel, _rx) = tokio::sync::watch::channel(false);
+    pm.pending.insert(
+        456,
+        PendingInfo {
+            port: 9002,
+            model_id: "m".into(),
+            cancel,
+        },
+    );
+    pm.reserve_test_pending("m", 9002);
+    pm.register_existing_instance("m", 123, 9001);
+
+    let mut pids = pm.pids_for_model_runtime("m");
+    pids.sort_unstable();
+    assert_eq!(pids, vec![123, 456]);
+}
+
+#[tokio::test]
+async fn cancelled_pending_child_cannot_register_as_running() {
+    let mut pm = ProcessManager::default();
+    let mut command = tokio::process::Command::new("sleep");
+    command.arg("60").kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn().unwrap();
+    let pid = child.id().unwrap() as i32;
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (_kv_tx, kv_bytes_rx) = oneshot::channel();
+    let port = 19_001;
+
+    pm.reserved_ports.insert(port);
+    *pm.pending_instances.entry("m".into()).or_insert(0) += 1;
+    pm.pending.insert(
+        pid,
+        PendingInfo {
+            port,
+            model_id: "m".into(),
+            cancel: cancel_tx,
+        },
+    );
+    let pending = PendingChild {
+        pid,
+        port,
+        model_id: "m".into(),
+        uses_gpu: true,
+        child,
+        kv_bytes_rx,
+        cancel_rx,
+    };
+
+    pm.stop(pid).await;
+    assert_eq!(pm.total_instance_count("m"), 0);
+
+    let mut pending = match pm.register(pending) {
+        Ok(_) => panic!("cancelled pending child must not become a running instance"),
+        Err(pending) => pending,
+    };
+    pending.terminate().await;
+
+    assert_eq!(pm.instance_count("m"), 0);
+    assert!(!pm.reserved_ports.contains(&port));
 }
 
 #[test]

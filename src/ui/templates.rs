@@ -1,6 +1,6 @@
 use askama::Template;
 
-use crate::config::{ModelConfig, ModelState, WeightsFormat};
+use crate::config::{ModelConfig, ModelState};
 use crate::system::stats::SystemStats;
 use crate::vram::tracker::GpuInfo;
 
@@ -250,7 +250,7 @@ impl ModelDisplay {
             ModelState::Idle | ModelState::Error(_) => "load",
             ModelState::Loading => "edit",
         };
-        let (file_size_bytes, required_vram_bytes) = compute_sizes(m);
+        let file_size_bytes = m.file_size_bytes();
 
         Self {
             id: m.id.clone(),
@@ -259,8 +259,8 @@ impl ModelDisplay {
             context_str: format_context(m.context),
             file_size_bytes,
             file_size_gib_str: gib_or_dash(file_size_bytes),
-            required_vram_bytes,
-            required_vram_gib_str: gib_or_dash(required_vram_bytes),
+            required_vram_bytes: m.estimated_vram,
+            required_vram_gib_str: gib_or_dash(m.estimated_vram),
             state_display,
             state_class,
             state_sort_key,
@@ -450,56 +450,6 @@ fn gib_or_dash(bytes: u64) -> String {
     } else {
         format!("{:.1}", bytes as f64 / 1_073_741_824.0)
     }
-}
-
-/// Compute on-disk weights size plus the last llama.cpp-backed required VRAM.
-/// The router no longer calculates placement size from GGUF headers; runtime
-/// sizing is populated by the `llama-fit-params` probe when a model loads.
-///
-/// GGUF metadata still supplies total sharded file size for display.
-fn compute_sizes(m: &ModelConfig) -> (u64, u64) {
-    match m.weights_format {
-        WeightsFormat::Gguf => {
-            let file_size = m
-                .gguf_meta
-                .as_ref()
-                .map(|meta| meta.file_size)
-                .or_else(|| {
-                    crate::vram::estimator::GgufMeta::read(&m.model_path)
-                        .ok()
-                        .map(|meta| meta.file_size)
-                })
-                .unwrap_or(0);
-            (file_size, m.estimated_vram)
-        }
-        // Safetensors: sum the directory's regular files for size, and
-        // leave required VRAM blank — estimating vLLM's memory without
-        // instantiating the model is too tangled for a quick stat.
-        WeightsFormat::Safetensors => (safetensors_dir_size(&m.model_path), 0),
-    }
-}
-
-/// Sum of regular files inside a safetensors model directory. Returns 0
-/// for missing or non-directory paths so the UI shows a dash.
-fn safetensors_dir_size(path: &std::path::Path) -> u64 {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return 0;
-    };
-    if !meta.is_dir() {
-        return 0;
-    }
-    let Ok(rd) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    let mut total = 0u64;
-    for entry in rd.flatten() {
-        if let Ok(em) = entry.metadata() {
-            if em.is_file() {
-                total = total.saturating_add(em.len());
-            }
-        }
-    }
-    total
 }
 
 /// One pre-formatted orchestrator event for the dashboard's event log.
