@@ -1,4 +1,7 @@
 use super::*;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -37,6 +40,8 @@ fn default_instance_cap_is_vram_limited() {
 }
 
 fn gpu(id: &str, pci: &str, vulkan_index: usize) -> GpuInfo {
+    let mut tags = std::collections::BTreeSet::new();
+    tags.insert(Backend::Vulkan);
     GpuInfo {
         id: id.into(),
         pci_bus_id: Some(pci.into()),
@@ -46,7 +51,7 @@ fn gpu(id: &str, pci: &str, vulkan_index: usize) -> GpuInfo {
         cuda_index: None,
         rocm_index: None,
         sycl_index: None,
-        tags: Default::default(),
+        tags,
         integrated: false,
         total_vram: 32 * 1024 * 1024 * 1024,
         used_vram: 0,
@@ -108,6 +113,47 @@ fn fit_sizing(
     }
 }
 
+fn gguf_meta(n_layers: u32) -> GgufMeta {
+    GgufMeta {
+        max_context: 131072,
+        n_layers,
+        n_embd: 5120,
+        n_head: 24,
+        n_head_kv: 4,
+        key_length: 256,
+        key_length_swa: 0,
+        full_kv_heads: 64,
+        swa_kv_heads: 0,
+        kv_heads_total: 64,
+        sliding_window: 0,
+        file_size: 1,
+        expert_weight_bytes: 0,
+        architecture: None,
+        name: None,
+        basename: None,
+        size_label: None,
+        file_type: None,
+        quant_label: None,
+        quantized_by: None,
+        license: None,
+        tags: Vec::new(),
+        base_model_name: None,
+        base_model_org: None,
+        base_model_repo: None,
+        feed_forward_length: None,
+        expert_count: None,
+        expert_used_count: None,
+        rope_freq_base: None,
+        ssm_inner_size: None,
+        full_attention_interval: None,
+        chat_template: None,
+        bos_token_id: None,
+        eos_token_id: None,
+        suggested_id: String::new(),
+        suggested_name: String::new(),
+    }
+}
+
 fn spill_candidate(gpus_used: usize, device_vram: u64) -> FitCandidate {
     FitCandidate {
         backend: Backend::Vulkan,
@@ -163,6 +209,118 @@ fn server_owned_fit_keeps_device_and_target_without_fixed_placement() {
     assert_eq!(m.estimated_vram, 123);
     assert_eq!(m.n_gpu_layers, None);
     assert_eq!(m.tensor_split, None);
+    assert_eq!(m.override_tensor, None);
+}
+
+#[test]
+fn server_owned_fit_does_not_imply_cpu_spill() {
+    let sizing = fit_sizing(Some(-1), None, 123);
+    let mut m = model("a");
+    m.mtp_tokens = Some(3);
+
+    apply_fit_selection(&mut m, "Vulkan0,Vulkan1", "1024,2048", &sizing, true);
+
+    assert!(fitted_fully_on_gpu(&sizing, 64));
+    assert!(scale_out_accepts_placement(fitted_fully_on_gpu(
+        &sizing, 64
+    )));
+    assert_eq!(m.device.as_deref(), Some("Vulkan0,Vulkan1"));
+    assert_eq!(m.fit_target.as_deref(), Some("1024,2048"));
+    assert_eq!(m.n_gpu_layers, None);
+    assert_eq!(m.override_tensor, None);
+}
+
+#[test]
+fn scale_out_safe_server_owned_fit_is_limited_to_embedded_mtp() {
+    let sizing = fit_sizing(Some(-1), None, 123);
+    let mut plain = model("plain");
+    assert!(fitted_scale_out_safe(&sizing, 64, &plain, None));
+
+    let mut mtp = model("mtp");
+    mtp.mtp_tokens = Some(3);
+    assert!(fitted_scale_out_safe(&sizing, 64, &mtp, None));
+
+    let draft = model("draft");
+    let mut external_draft = model("external-draft");
+    external_draft.draft_model_id = Some("draft".into());
+    assert!(!fitted_scale_out_safe(
+        &sizing,
+        64,
+        &external_draft,
+        Some(&draft)
+    ));
+
+    let mut mmproj = model("mmproj");
+    mmproj.mmproj_path = Some("/models/mmproj.gguf".into());
+    assert!(!fitted_scale_out_safe(&sizing, 64, &mmproj, None));
+
+    plain.mmproj_path = Some("/models/mmproj.gguf".into());
+    plain.mtp_tokens = Some(3);
+    assert!(!fitted_scale_out_safe(&sizing, 64, &plain, None));
+}
+
+#[cfg(unix)]
+#[test]
+fn mtp_server_owned_fit_reports_full_gpu_for_scale_out() {
+    let tmp = TempDir::new().unwrap();
+    let server = tmp.path().join("llama-server");
+    let fit = tmp.path().join("llama-fit-params");
+    fs::write(&server, "").unwrap();
+    fs::write(
+        &fit,
+        r#"#!/usr/bin/env bash
+device=""
+fit_print=0
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--device" ]; then
+    device="$arg"
+  fi
+  if [ "$arg" = "--fit-print" ]; then
+    fit_print=1
+  fi
+  prev="$arg"
+done
+if [ "$fit_print" = "1" ]; then
+  printf 'Vulkan0 17000 500 500\nVulkan1 16000 400 400\nHost 100 0 0\n'
+elif [[ "$device" == *,* ]]; then
+  printf '%s\n' '-c 131072 -ngl -1'
+else
+  printf '%s\n' '-c 131072 -ngl 12 -ot "blk\.(12|13)\.ffn_.*_exps=CPU"'
+fi
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&fit).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fit, perms).unwrap();
+
+    let mut m = model("mtp");
+    m.binary = server;
+    m.model_path = tmp.path().join("model.gguf");
+    m.mtp_tokens = Some(3);
+    m.split_mode = Some(crate::config::SplitMode::Layer);
+    m.gguf_meta = Some(gguf_meta(64));
+
+    let gpus = vec![gpu("1", "0000:03:00.0", 0), gpu("2", "0000:07:00.0", 1)];
+    let outcome =
+        place_gguf_with_llama_fit(&mut m, None, &[Backend::Vulkan], &gpus, 0, (95.0, 93.0))
+            .unwrap();
+
+    match outcome {
+        PlaceOutcome::Placed {
+            gpus_used,
+            fully_on_gpu,
+            ..
+        } => {
+            assert_eq!(gpus_used, 2);
+            assert!(fully_on_gpu);
+        }
+        _ => panic!("expected placed outcome"),
+    }
+    assert_eq!(m.device.as_deref(), Some("Vulkan0,Vulkan1"));
+    assert_eq!(m.fit_target.as_deref(), Some("1639,1639"));
+    assert_eq!(m.n_gpu_layers, None);
     assert_eq!(m.override_tensor, None);
 }
 

@@ -490,9 +490,14 @@ fn spec_decode_argv_skips_draft_device_flag_when_unset() {
 fn mtp_argv_emits_spec_type_and_token_count() {
     let mut t = gguf_model();
     t.mtp_tokens = Some(4);
+    t.device = Some("Vulkan0,Vulkan1".into());
+    t.fit_target = Some("1024,2048".into());
     let args = build_command_args(&t, None, 9001);
+    assert_eq!(find_flag(&args, "--device"), Some("Vulkan0,Vulkan1"));
+    assert_eq!(find_flag(&args, "--fit-target"), Some("1024,2048"));
     assert_eq!(find_flag(&args, "--spec-type"), Some("draft-mtp"));
     assert_eq!(find_flag(&args, "--spec-draft-n-max"), Some("4"));
+    assert_eq!(find_flag(&args, "--fit"), None);
 }
 
 #[test]

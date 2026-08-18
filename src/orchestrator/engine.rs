@@ -2039,7 +2039,7 @@ fn place_gguf_with_llama_fit(
             .collect::<Vec<_>>()
             .join(",");
         let sizing = run_llama_fit_sizing(&fit_binary, model, draft, &device, &fit_target)?;
-        let fully_on_gpu = fitted_fully_on_gpu(&sizing, n_layers);
+        let fully_on_gpu = fitted_scale_out_safe(&sizing, n_layers, model, draft);
         apply_fit_selection(
             model,
             &device,
@@ -2051,7 +2051,7 @@ fn place_gguf_with_llama_fit(
             backend: targets.first().copied().unwrap_or(Backend::Vulkan),
             gpus_used: eligible.len(),
             free,
-            fully_on_gpu: fully_on_gpu && !needs_server_owned_fit(model, draft),
+            fully_on_gpu,
         });
     }
 
@@ -2099,6 +2099,7 @@ fn place_gguf_with_llama_fit(
 
             match run_llama_fit_sizing(&fit_binary, model, draft, &device, &fit_target) {
                 Ok(sizing) => {
+                    let fully_on_gpu = fitted_scale_out_safe(&sizing, n_layers, model, draft);
                     let candidate = FitCandidate {
                         backend,
                         device,
@@ -2107,7 +2108,7 @@ fn place_gguf_with_llama_fit(
                         gpus_used: chosen.len(),
                         sizing,
                     };
-                    if fitted_fully_on_gpu(&candidate.sizing, n_layers) {
+                    if fully_on_gpu {
                         apply_fit_candidate(
                             model,
                             &candidate,
@@ -2118,7 +2119,7 @@ fn place_gguf_with_llama_fit(
                             backend: candidate.backend,
                             gpus_used: candidate.gpus_used,
                             free: candidate.free,
-                            fully_on_gpu: !needs_server_owned_fit(model, draft),
+                            fully_on_gpu,
                         });
                     }
                     keep_best_spill_candidate(&mut spill, candidate);
@@ -2187,6 +2188,25 @@ fn apply_fit_selection(
 
 fn scale_out_accepts_placement(fully_on_gpu: bool) -> bool {
     fully_on_gpu
+}
+
+fn fitted_scale_out_safe(
+    sizing: &crate::vram::llama_fit::LlamaFitSizing,
+    n_layers: u32,
+    model: &ModelConfig,
+    draft: Option<&ModelConfig>,
+) -> bool {
+    if !fitted_fully_on_gpu(sizing, n_layers) {
+        return false;
+    }
+    !needs_server_owned_fit(model, draft) || server_owned_fit_scale_out_safe(model, draft)
+}
+
+fn server_owned_fit_scale_out_safe(model: &ModelConfig, draft: Option<&ModelConfig>) -> bool {
+    draft.is_none()
+        && model.draft_model_id.is_none()
+        && model.mmproj_path.is_none()
+        && model.mtp_tokens.filter(|n| *n > 0).is_some()
 }
 
 fn keep_best_spill_candidate(best: &mut Option<FitCandidate>, candidate: FitCandidate) {
