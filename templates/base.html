@@ -289,37 +289,29 @@
             .progress-bar-fill.muted {
                 background: #64748b;
             }
-            /* Merged VRAM + activity bar: fill width/color = VRAM usage; a
-           diagonal stripe overlay sweeping across the fill = GPU activity
-           (sweep speed set inline from animation-duration). Declared AFTER
-           the colour classes so the gradient wins over `background: <color>`
-           (which resets background-image). */
-            .progress-bar-fill.stripes {
-                background-image: repeating-linear-gradient(
-                    45deg,
-                    rgba(255, 255, 255, 0.22) 0px,
-                    rgba(255, 255, 255, 0.22) 6px,
-                    transparent 6px,
-                    transparent 12px
-                );
-                animation: bar-stripes 3s linear infinite;
+            .metric-combo-bar {
+                background: #1e293b;
+                display: grid;
+                gap: 1px;
+                grid-template-rows: 1fr 1fr;
+                height: 12px;
             }
-            .progress-bar-fill.stripes.bar-idle {
-                animation-play-state: paused;
+            .metric-lane {
+                background: #334155;
+                min-width: 0;
+                overflow: hidden;
             }
-            @keyframes bar-stripes {
-                /* 12px · √2 = one full period of the 45° stripes → seamless loop */
-                from {
-                    background-position: 0 0;
-                }
-                to {
-                    background-position: 16.97px 0;
-                }
+            .metric-combo-bar .progress-bar-fill {
+                width: 0;
             }
-            @media (prefers-reduced-motion: reduce) {
-                .progress-bar-fill.stripes {
-                    animation: none;
-                }
+            .vram-lane .progress-bar-fill.green {
+                background: #38bdf8;
+            }
+            .vram-lane .progress-bar-fill.yellow {
+                background: #f59e0b;
+            }
+            .vram-lane .progress-bar-fill.red {
+                background: #f87171;
             }
             .chip-temp {
                 display: inline-flex;

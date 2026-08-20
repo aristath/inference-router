@@ -181,9 +181,7 @@ fn gpu_totals_sum_vram_and_average_activity() {
     assert_eq!(t.vram_pct_str, "50"); // 32 / 64
                                       // Activity is the mean utilization, not a sum.
     assert_eq!(t.busy_pct_str, "50"); // (40 + 60) / 2
-                                      // 50% activity lands in the 25–74% stripe band ("3.5s" sweep), not idle.
-    assert_eq!(t.stripes_class, "stripes");
-    assert_eq!(t.busy_speed_str, "3.5s");
+    assert_eq!(t.busy_class, "green");
 }
 
 #[test]
@@ -192,27 +190,7 @@ fn gpu_totals_with_no_devices_is_zeroed() {
     assert_eq!(t.count, 0);
     assert_eq!(t.vram_pct_str, "0");
     assert_eq!(t.busy_pct_str, "0");
-    // No activity → the stripe sweep is paused.
-    assert_eq!(t.stripes_class, "stripes bar-idle");
-    assert_eq!(t.busy_speed_str, "0s");
-}
-
-#[test]
-fn stripe_speed_buckets_activity_into_quantized_durations() {
-    // Idle (<1%) pauses the animation entirely.
-    assert_eq!(stripe_speed(0.0), ("stripes bar-idle".into(), "0s".into()));
-    assert_eq!(stripe_speed(0.4), ("stripes bar-idle".into(), "0s".into()));
-    // Busier GPUs sweep faster. Each band is stable across the small
-    // fluctuations a poll-to-poll busy% sees, so the CSS animation does not
-    // restart (and jump) on every morph.
-    assert_eq!(stripe_speed(1.0), ("stripes".into(), "12s".into()));
-    assert_eq!(stripe_speed(9.0), ("stripes".into(), "12s".into()));
-    assert_eq!(stripe_speed(10.0), ("stripes".into(), "8s".into()));
-    assert_eq!(stripe_speed(24.0), ("stripes".into(), "8s".into()));
-    assert_eq!(stripe_speed(25.0), ("stripes".into(), "5s".into()));
-    assert_eq!(stripe_speed(50.0), ("stripes".into(), "3.5s".into()));
-    assert_eq!(stripe_speed(75.0), ("stripes".into(), "2.2s".into()));
-    assert_eq!(stripe_speed(100.0), ("stripes".into(), "1.6s".into()));
+    assert_eq!(t.busy_class, "green");
 }
 
 #[test]

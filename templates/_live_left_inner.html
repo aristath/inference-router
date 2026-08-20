@@ -71,27 +71,33 @@ an out-of-band morph. #}
     {% if gpus.is_empty() %}
     <p style="color: #94a3b8">No AMD GPUs found via sysfs.</p>
     {% else %}
-    <!-- Aggregate totals across all GPUs: one bar for VRAM + activity —
-         fill = VRAM used, stripe sweep speed = mean activity. -->
+    <!-- Aggregate totals across all GPUs: top lane = activity, bottom lane = VRAM used. -->
     <div class="gpu-metric">
         <div class="gpu-metric-head">
             <span class="gpu-metric-label">Total</span>
             <span class="gpu-metric-value">
-                {{ gpu_totals.vram_used_gib_str }} / {{
-                gpu_totals.vram_total_gib_str }} GiB &middot; {{
-                gpu_totals.vram_free_gib_str }} GiB free &middot;
                 <span class="gpu-busy-pct">{{ gpu_totals.busy_pct_str }}</span>%
-                active
+                active &middot; {{ gpu_totals.vram_used_gib_str }} / {{
+                gpu_totals.vram_total_gib_str }} GiB VRAM &middot; {{
+                gpu_totals.vram_free_gib_str }} GiB free
             </span>
         </div>
         <div
-            class="progress-bar"
-            title="{{ gpu_totals.busy_pct_str }}% average GPU activity"
+            class="progress-bar metric-combo-bar"
+            title="{{ gpu_totals.busy_pct_str }}% average GPU activity; {{ gpu_totals.vram_pct_str }}% VRAM used"
         >
-            <div
-                class="progress-bar-fill {{ gpu_totals.stripes_class }} {{ gpu_totals.vram_class }}"
-                style="width: {{ gpu_totals.vram_pct_str }}%; animation-duration: {{ gpu_totals.busy_speed_str }}"
-            ></div>
+            <div class="metric-lane activity-lane">
+                <div
+                    class="progress-bar-fill {{ gpu_totals.busy_class }}"
+                    style="width: {{ gpu_totals.busy_pct_str }}%"
+                ></div>
+            </div>
+            <div class="metric-lane vram-lane">
+                <div
+                    class="progress-bar-fill {{ gpu_totals.vram_class }}"
+                    style="width: {{ gpu_totals.vram_pct_str }}%"
+                ></div>
+            </div>
         </div>
     </div>
 
@@ -141,15 +147,13 @@ an out-of-band morph. #}
                 </button>
                 {% endif %}
             </div>
-            <!-- One bar for VRAM + activity: fill = VRAM used, stripe sweep
-                 speed = this GPU's activity. -->
+            <!-- One bar for VRAM + activity: top lane = activity, bottom lane = VRAM used. -->
             <div
                 class="gpu-metric"
                 id="gpu-vram-{{ gpu.id }}"
                 style="margin-top: 0.5rem"
             >
                 <div class="gpu-metric-head">
-                    <span class="gpu-metric-label">VRAM</span>
                     <span class="gpu-metric-value">
                         <span class="gpu-vram-used"
                             >{{ gpu.used_gib_str }}</span
@@ -158,19 +162,25 @@ an out-of-band morph. #}
                         <span class="gpu-vram-free"
                             >{{ gpu.free_gib_str }}</span
                         >
-                        GiB free &middot;
-                        <span class="gpu-busy-pct">{{ gpu.busy_pct_str }}</span
-                        >% active
+                        GiB free
                     </span>
                 </div>
                 <div
-                    class="progress-bar"
-                    title="{{ gpu.busy_pct_str }}% GPU activity"
+                    class="progress-bar metric-combo-bar"
+                    title="{{ gpu.busy_pct_str }}% GPU activity; {{ gpu.usage_pct_str }}% VRAM used"
                 >
-                    <div
-                        class="progress-bar-fill {{ gpu.stripes_class }} {{ gpu.usage_class }}"
-                        style="width: {{ gpu.usage_pct_str }}%; animation-duration: {{ gpu.busy_speed_str }}"
-                    ></div>
+                    <div class="metric-lane activity-lane">
+                        <div
+                            class="progress-bar-fill {{ gpu.busy_class }}"
+                            style="width: {{ gpu.busy_pct_str }}%"
+                        ></div>
+                    </div>
+                    <div class="metric-lane vram-lane">
+                        <div
+                            class="progress-bar-fill {{ gpu.usage_class }}"
+                            style="width: {{ gpu.usage_pct_str }}%"
+                        ></div>
+                    </div>
                 </div>
             </div>
         </div>

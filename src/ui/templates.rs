@@ -26,11 +26,7 @@ pub struct GpuDisplay {
     pub usage_pct_str: String,
     pub usage_class: String,
     pub busy_pct_str: String,
-    /// Stripe classes for the merged VRAM + activity bar ("stripes", plus
-    /// ` bar-idle` when activity is ~0 and the sweep should pause).
-    pub stripes_class: String,
-    /// CSS `animation-duration` for the stripe sweep, e.g. `"3.5s"`.
-    pub busy_speed_str: String,
+    pub busy_class: String,
     pub temp_c_str: String, // "43" or "—"
     pub temp_class: String, // "green" | "yellow" | "red" | "muted"
 }
@@ -45,7 +41,6 @@ impl GpuDisplay {
         } else {
             0.0
         };
-        let (stripes_class, busy_speed_str) = stripe_speed(gpu.busy_pct as f64);
         let (temp_c_str, temp_class) = match gpu.temp_c {
             Some(t) => (format!("{:.0}", t), temp_class(t)),
             None => ("—".into(), "muted".into()),
@@ -75,8 +70,7 @@ impl GpuDisplay {
             usage_pct_str: format!("{:.0}", vram_pct),
             usage_class: bar_class(vram_pct),
             busy_pct_str: gpu.busy_pct.to_string(),
-            stripes_class,
-            busy_speed_str,
+            busy_class: bar_class(gpu.busy_pct as f64),
             temp_c_str,
             temp_class,
         }
@@ -104,10 +98,7 @@ pub struct GpuTotals {
     pub vram_pct_str: String,
     pub vram_class: String,
     pub busy_pct_str: String,
-    /// Stripe classes for the merged VRAM + activity bar (see `GpuDisplay`).
-    pub stripes_class: String,
-    /// CSS `animation-duration` for the stripe sweep, e.g. `"3.5s"`.
-    pub busy_speed_str: String,
+    pub busy_class: String,
 }
 
 impl GpuTotals {
@@ -126,7 +117,6 @@ impl GpuTotals {
         } else {
             0.0
         };
-        let (stripes_class, busy_speed_str) = stripe_speed(busy_avg);
         Self {
             count,
             vram_used_gib_str: format!("{:.1}", used as f64 / 1_073_741_824.0),
@@ -135,8 +125,7 @@ impl GpuTotals {
             vram_pct_str: format!("{:.0}", vram_pct),
             vram_class: bar_class(vram_pct),
             busy_pct_str: format!("{:.0}", busy_avg),
-            stripes_class,
-            busy_speed_str,
+            busy_class: bar_class(busy_avg),
         }
     }
 }
@@ -189,26 +178,6 @@ fn bar_class(pct: f64) -> String {
         "green"
     }
     .into()
-}
-
-/// Stripe animation for the merged VRAM + activity bar. The sweep speed is
-/// quantized into bands so `animation-duration` only changes when activity
-/// crosses a band — the page re-morphs on every poll, and changing the
-/// duration mid-flight would make the stripes jump. Below 1% the GPU is idle:
-/// the animation pauses and the stripes sit still.
-fn stripe_speed(busy_pct: f64) -> (String, String) {
-    if busy_pct < 1.0 {
-        return ("stripes bar-idle".into(), "0s".into());
-    }
-    let speed = match busy_pct {
-        ..=9.0 => "12s",
-        ..=24.0 => "8s",
-        ..=49.0 => "5s",
-        ..=74.0 => "3.5s",
-        ..=99.0 => "2.2s",
-        _ => "1.6s",
-    };
-    ("stripes".into(), speed.into())
 }
 
 /// Rough green/yellow/red temperature bands for CPU and GPU junction temps.
