@@ -59,8 +59,18 @@ fn unresponsive_response(model_id: &str) -> Response {
         .into_response()
 }
 
+fn rewrite_model_field(body: &[u8], model_id: &str) -> Result<Vec<u8>, serde_json::Error> {
+    let mut doc: serde_json::Value = serde_json::from_slice(body)?;
+    if let Some(model) = doc.get_mut("model") {
+        *model = serde_json::Value::String(model_id.to_owned());
+    }
+    serde_json::to_vec(&doc)
+}
+
 /// Byte-level passthrough handler for `/v1/*`. Peeks `model` from the JSON
-/// body, calls `ensure_loaded`, then proxies request/response unchanged.
+/// body, calls `ensure_loaded`, then proxies request/response. Alias requests
+/// are forwarded with the resolved model id because upstream OpenAI-compatible
+/// servers validate the `model` field themselves.
 pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST {
         return (
@@ -100,8 +110,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     };
 
     // Resolve aliases to their target model. Non-alias names pass through
-    // unchanged. The upstream backend ignores the body's `model` field, so we
-    // route on the resolved id without rewriting the request.
+    // unchanged.
     let model_id = state.resolve_model_id(&requested_model).await;
 
     // A defined-but-unassigned alias resolves to an empty target. Real model
@@ -165,9 +174,24 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
 
+    let routed_body = if requested_model == model_id {
+        body_bytes.to_vec()
+    } else {
+        match rewrite_model_field(&body_bytes, &model_id) {
+            Ok(body) => body,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("request body could not be rewritten with resolved model id: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
     let outbound_body =
-        loop_guard::guard_request(parts.uri.path(), &body_bytes, &settings.loop_guards.tool)
-            .unwrap_or_else(|| body_bytes.to_vec());
+        loop_guard::guard_request(parts.uri.path(), &routed_body, &settings.loop_guards.tool)
+            .unwrap_or(routed_body);
 
     if let Some(session) = StreamSession::new(
         client.clone(),

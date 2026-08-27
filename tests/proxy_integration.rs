@@ -602,7 +602,7 @@ async fn v1_models_synthesizes_list_without_upstream() {
 
 #[tokio::test]
 async fn proxy_routes_alias_to_target_model() {
-    let upstream = spawn_fake_llama().await;
+    let (upstream, seen_body) = spawn_capturing_fake_llama().await;
     let orchestrator = build_proxy_orchestrator(upstream).await;
     orchestrator
         .add_alias(ModelAlias {
@@ -628,11 +628,13 @@ async fn proxy_routes_alias_to_target_model() {
     // The alias resolved to the running "fake" model and served its response.
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.text().await.unwrap(), JSON_RESPONSE);
+    let upstream_body = seen_body.lock().await.clone().unwrap();
+    assert_eq!(upstream_body["model"], "fake");
 }
 
 #[tokio::test]
 async fn proxy_routes_alias_chain_to_target_model() {
-    let upstream = spawn_fake_llama().await;
+    let (upstream, seen_body) = spawn_capturing_fake_llama().await;
     let orchestrator = build_proxy_orchestrator(upstream).await;
     // coder -> default -> fake (a real, running model).
     orchestrator
@@ -664,6 +666,8 @@ async fn proxy_routes_alias_chain_to_target_model() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.text().await.unwrap(), JSON_RESPONSE);
+    let upstream_body = seen_body.lock().await.clone().unwrap();
+    assert_eq!(upstream_body["model"], "fake");
 }
 
 #[tokio::test]
