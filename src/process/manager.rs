@@ -49,6 +49,20 @@ pub struct RequestGuard {
     request_done: Arc<Notify>,
 }
 
+impl RequestGuard {
+    /// Keep this exact backend instance active for bounded background work that
+    /// must finish immediately after the client-facing request completes.
+    pub(crate) fn retain(&self) -> Self {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Self {
+            port: self.port,
+            pid: self.pid,
+            active: self.active.clone(),
+            request_done: self.request_done.clone(),
+        }
+    }
+}
+
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::Relaxed);

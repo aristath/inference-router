@@ -634,6 +634,21 @@ fn idle_instances_excludes_active_requests() {
 }
 
 #[test]
+fn retained_request_guard_keeps_exact_instance_active() {
+    let mut pm = ProcessManager::default();
+    pm.register_existing_instance("m", 123, 9001);
+
+    let request = pm.acquire_idle_instance("m").unwrap();
+    let background = request.retain();
+    drop(request);
+
+    assert!(pm.idle_instances().is_empty());
+    assert_eq!(pm.model_runtimes()["m"].active, 1);
+    drop(background);
+    assert_eq!(pm.model_runtimes()["m"].active, 0);
+}
+
+#[test]
 fn parses_backend_port_range() {
     assert_eq!(parse_port_range("9100-9200"), Some((9100, 9200)));
     assert_eq!(parse_port_range("9200-9100"), None);

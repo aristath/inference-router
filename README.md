@@ -9,8 +9,8 @@ Built for a single-user, localhost, multi-GPU AMD workstation (3x Radeon AI PRO 
 - **One endpoint, many models.** Clients (Claude Code, aider, continue.dev, raw curl) POST to `http://localhost:8080/v1/chat/completions` with `"model": "<id>"`. The router spawns the backend on demand and proxies the request byte-for-byte — so the full OpenAI surface works, including streaming, tools, and anything llama.cpp adds tomorrow.
 - **VRAM-aware admission.** Before spawning, the orchestrator reads GGUF metadata, estimates VRAM, checks free VRAM across all GPUs, and evicts idle models if needed. Eviction prefers long-idle and small models.
 - **Smart GPU allocation.** Picks the minimum GPU subset that fits and passes `--tensor-split` explicitly. Never occupies a GPU it doesn't need.
-- **Browser dashboard.** Single-page UI at `/` for CRUD on models + binary presets, manual load/stop, and live GPU / CPU / RAM stats. Askama HTML templates, vanilla JS, 500 ms poll.
-- **Persistence.** Model and preset definitions live in `~/.config/inference-router/{models.json,presets.json}`. Writes are dirty-flag gated and flushed by the reconcile loop (5 s cadence).
+- **Browser dashboard.** Single-page UI at `/` for CRUD on models + binary presets, manual load/stop, live GPU / CPU / RAM stats, and persisted decode/prefill throughput for llama.cpp and vLLM models. Askama HTML templates, vanilla JS, 500 ms poll.
+- **Persistence.** Model and preset definitions live in `~/.config/inference-router/{models.json,presets.json}`; throughput history lives in `model_perf.json`. Writes are dirty-flag gated and flushed by the reconcile loop (5 s cadence).
 
 ## HTTP surface
 

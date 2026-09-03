@@ -32,6 +32,28 @@ const HOP_BY_HOP: &[&str] = &[
 struct GuardedStream<S> {
     inner: S,
     _guard: RequestGuard,
+    vllm_perf: Option<VllmPerfCollection>,
+}
+
+struct VllmPerfCollection {
+    state: AppState,
+    model_id: String,
+    pid: i32,
+    port: u16,
+    generation: u64,
+}
+
+impl VllmPerfCollection {
+    fn spawn(self, guard: RequestGuard) {
+        crate::api::perf::spawn_vllm_perf_collection(
+            self.state,
+            self.model_id,
+            self.pid,
+            self.port,
+            self.generation,
+            guard,
+        );
+    }
 }
 
 impl<S: Stream + Unpin> Stream for GuardedStream<S> {
@@ -40,7 +62,13 @@ impl<S: Stream + Unpin> Stream for GuardedStream<S> {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<<S as Stream>::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        let result = Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(result, Poll::Ready(None)) {
+            if let Some(collection) = self.vllm_perf.take() {
+                collection.spawn(self._guard.retain());
+            }
+        }
+        result
     }
 }
 
@@ -140,6 +168,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     };
 
     let port = guard.port;
+    let pid = guard.pid;
+    let vllm_perf_generation = state.vllm_perf_generation(&model_id).await;
 
     state.mark_used(&model_id).await;
 
@@ -203,6 +233,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         &settings.loop_guards.streaming,
         state.clone(),
         model_id.clone(),
+        vllm_perf_generation,
     ) {
         return session.into_response(guard).await;
     }
@@ -302,8 +333,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
                 }
             }
         }
-        // The whole response is materialized, so the request is complete here —
-        // the guard can drop.
+        if let Some(generation) = vllm_perf_generation {
+            VllmPerfCollection {
+                state: state.clone(),
+                model_id: model_id.clone(),
+                pid,
+                port,
+                generation,
+            }
+            .spawn(guard.retain());
+        }
+        // The whole response is materialized, so the request is complete here.
         drop(guard);
         return match resp_builder.body(Body::from(body_bytes)) {
             Ok(r) => r,
@@ -323,6 +363,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     let stream = GuardedStream {
         inner: upstream.bytes_stream(),
         _guard: guard,
+        vllm_perf: vllm_perf_generation.map(|generation| VllmPerfCollection {
+            state: state.clone(),
+            model_id: model_id.clone(),
+            pid,
+            port,
+            generation,
+        }),
     };
     match resp_builder.body(Body::from_stream(stream)) {
         Ok(r) => r,

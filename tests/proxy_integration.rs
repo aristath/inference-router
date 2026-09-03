@@ -16,7 +16,10 @@ use axum::routing::{any, get, post};
 use axum::Json;
 use futures_util::{stream, Stream};
 use inference_router::api::proxy;
-use inference_router::config::{JsonStore, ModelAlias, ModelConfig, ModelExposure, ModelState};
+use inference_router::config::{
+    AppSettings, BinaryPreset, GpuTagOverride, JsonStore, ModelAlias, ModelConfig, ModelExposure,
+    ModelPerf, ModelState, WeightsFormat,
+};
 use inference_router::orchestrator::{AppState, Orchestrator};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -95,6 +98,33 @@ async fn spawn_fake_llama() -> u16 {
         axum::serve(listener, app).await.unwrap();
     });
     // Give the server a moment to actually accept connections.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    port
+}
+
+const VLLM_METRICS: &str = r#"
+process_start_time_seconds 100
+vllm:request_generation_tokens_sum{engine="0",model_name="fake"} 200
+vllm:request_decode_time_seconds_sum{engine="0",model_name="fake"} 4
+vllm:request_decode_time_seconds_count{engine="0",model_name="fake"} 2
+vllm:request_prefill_kv_computed_tokens_sum{engine="0",model_name="fake"} 1000
+vllm:request_prefill_time_seconds_sum{engine="0",model_name="fake"} 0.5
+vllm:request_prefill_time_seconds_count{engine="0",model_name="fake"} 2
+"#;
+
+async fn spawn_fake_vllm() -> u16 {
+    let app = axum::Router::new()
+        .route("/health", get(fake_health))
+        .route("/metrics", get(|| async { VLLM_METRICS }))
+        .route("/v1/chat/completions", post(fake_chat_completions));
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     tokio::time::sleep(Duration::from_millis(50)).await;
     port
 }
@@ -322,6 +352,72 @@ async fn build_proxy_orchestrator(upstream_port: u16) -> Arc<Orchestrator> {
     orchestrator
 }
 
+/// Full-store variant used to verify asynchronous vLLM metric persistence.
+async fn build_vllm_proxy_orchestrator(
+    upstream_port: u16,
+) -> (Arc<Orchestrator>, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let perf_path = tmp.path().join("model_perf.json");
+    let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(
+        tmp.path().join("models.json"),
+    ));
+    let presets = Arc::new(JsonStore::<Vec<BinaryPreset>>::new(
+        tmp.path().join("presets.json"),
+    ));
+    let aliases = Arc::new(JsonStore::<Vec<ModelAlias>>::new(
+        tmp.path().join("aliases.json"),
+    ));
+    let settings = Arc::new(JsonStore::<AppSettings>::new(
+        tmp.path().join("settings.json"),
+    ));
+    let gpu_tags = Arc::new(JsonStore::<Vec<GpuTagOverride>>::new(
+        tmp.path().join("gpus.json"),
+    ));
+    let perf =
+        Arc::new(JsonStore::<std::collections::HashMap<String, ModelPerf>>::new(perf_path.clone()));
+    std::mem::forget(tmp);
+
+    let orchestrator = Arc::new(Orchestrator::new_with_settings_store(
+        store, presets, aliases, settings, gpu_tags, perf, 0,
+    ));
+    orchestrator
+        .add_model(ModelConfig {
+            id: "fake".into(),
+            name: "fake".into(),
+            weights_format: WeightsFormat::Safetensors,
+            binary: std::path::PathBuf::from("/bin/true"),
+            model_path: std::path::PathBuf::from("/dev/null"),
+            ..ModelConfig::default()
+        })
+        .await
+        .unwrap();
+    {
+        let mut data = orchestrator.data.lock().await;
+        let model = data.models.get_mut("fake").unwrap();
+        model.state = ModelState::Running;
+        model.pid = Some(1);
+    }
+    orchestrator
+        .process_manager
+        .lock()
+        .await
+        .register_existing_port("fake", upstream_port);
+    (orchestrator, perf_path)
+}
+
+async fn wait_for_vllm_perf(orchestrator: &Orchestrator) -> ModelPerf {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(perf) = orchestrator.perf_snapshot().remove("fake") {
+                return perf;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("vLLM metrics should be collected")
+}
+
 async fn start_proxy_server(app: axum::Router) -> u16 {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -388,6 +484,65 @@ async fn proxy_forwards_sse_bytes_identically() {
     // Must be byte-identical — comment `:` lines, multi-line events, `[DONE]`
     // terminator, all untouched.
     assert_eq!(&body[..], SSE_BODY);
+}
+
+#[tokio::test]
+async fn proxy_collects_vllm_metrics_after_non_streaming_response() {
+    let upstream = spawn_fake_vllm().await;
+    let (orchestrator, perf_path) = build_vllm_proxy_orchestrator(upstream).await;
+    let app = router_for(orchestrator.clone());
+    let proxy_port = start_proxy_server(app).await;
+
+    let body = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "fake", "messages": []}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body, JSON_RESPONSE);
+
+    let perf = wait_for_vllm_perf(&orchestrator).await;
+    assert_eq!(perf.decode, 50.0);
+    assert_eq!(perf.prefill, 2_000.0);
+    assert_eq!(perf.samples, 2);
+
+    assert!(
+        orchestrator
+            .perf_dirty
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "collector must schedule model_perf.json persistence"
+    );
+    orchestrator.perf_store.as_ref().unwrap().save().unwrap();
+    let saved: std::collections::HashMap<String, ModelPerf> =
+        serde_json::from_str(&std::fs::read_to_string(perf_path).unwrap()).unwrap();
+    assert_eq!(saved.get("fake"), Some(&perf));
+}
+
+#[tokio::test]
+async fn proxy_collects_vllm_metrics_after_streaming_response() {
+    let upstream = spawn_fake_vllm().await;
+    let (orchestrator, _) = build_vllm_proxy_orchestrator(upstream).await;
+    let app = router_for(orchestrator.clone());
+    let proxy_port = start_proxy_server(app).await;
+
+    let body = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "fake", "stream": true, "messages": []}))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&body[..], SSE_BODY);
+
+    let perf = wait_for_vllm_perf(&orchestrator).await;
+    assert_eq!(perf.decode, 50.0);
+    assert_eq!(perf.prefill, 2_000.0);
+    assert_eq!(perf.samples, 2);
 }
 
 #[tokio::test]

@@ -117,6 +117,9 @@ pub(super) struct StreamSession {
     /// For folding the response `timings` into the model's throughput average.
     state: AppState,
     model_id: String,
+    /// Captured when the request acquired its backend. `None` for llama.cpp;
+    /// the generation rejects a late vLLM scrape after a config reset.
+    vllm_perf_generation: Option<u64>,
     /// PID of the instance serving this request, so a mid-stream stall (idle
     /// timeout) can recycle exactly that process. Set in `into_response` from
     /// the request guard.
@@ -137,6 +140,7 @@ impl StreamSession {
         cfg: &StreamingLoopSettings,
         state: AppState,
         model_id: String,
+        vllm_perf_generation: Option<u64>,
     ) -> Option<Self> {
         let cfg = Config::from_settings(cfg);
         if !cfg.enabled {
@@ -162,6 +166,7 @@ impl StreamSession {
             choices: HashMap::new(),
             state,
             model_id,
+            vllm_perf_generation,
             pid: 0,
             perf_recorded: false,
         })
@@ -230,8 +235,20 @@ impl StreamSession {
         }
 
         tokio::spawn(async move {
-            let _guard = guard;
+            let port = guard.port;
+            let pid = guard.pid;
             self.run(first, tx).await;
+            if let Some(generation) = self.vllm_perf_generation {
+                crate::api::perf::spawn_vllm_perf_collection(
+                    self.state.clone(),
+                    self.model_id.clone(),
+                    pid,
+                    port,
+                    generation,
+                    guard.retain(),
+                );
+            }
+            drop(guard);
         });
         response
     }

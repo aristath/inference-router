@@ -1,6 +1,7 @@
 use crate::config::{
     tag_overrides_by_pci, AppSettings, Backend, BinaryPreset, ConfigError, GpuTagOverride,
-    JsonStore, ModelAlias, ModelConfig, ModelPerf, ModelState, WeightsFormat,
+    JsonStore, ModelAlias, ModelConfig, ModelPerf, ModelState, VllmPerfSnapshot, VllmPerfTracker,
+    WeightsFormat,
 };
 use crate::orchestrator::allocation::plan_fit_placement;
 use crate::orchestrator::eviction::{decide_eviction, EvictionAction};
@@ -72,9 +73,12 @@ pub struct Orchestrator {
     pub gpu_tags_store: Option<Arc<JsonStore<Vec<GpuTagOverride>>>>,
     pub settings_store: Option<Arc<JsonStore<AppSettings>>>,
     /// Per-model throughput averages (`model_perf.json`). `None` in minimal
-    /// constructors. Updated per request from the upstream response `timings`;
+    /// constructors. Updated from llama.cpp response timings or vLLM metrics;
     /// persisted by reconcile when `perf_dirty`.
     pub perf_store: Option<Arc<JsonStore<HashMap<String, ModelPerf>>>>,
+    /// Per-process vLLM counter baselines. This is deliberately runtime-only;
+    /// persisted weighted totals live in `perf_store`.
+    vllm_perf_tracker: Arc<std::sync::Mutex<VllmPerfTracker>>,
     pub dirty: Arc<AtomicBool>,
     /// Set when presets change so reconcile persists presets.json.
     pub presets_dirty: Arc<AtomicBool>,
@@ -217,6 +221,7 @@ impl Orchestrator {
             gpu_tags_store,
             settings_store,
             perf_store,
+            vllm_perf_tracker: Arc::new(std::sync::Mutex::new(VllmPerfTracker::default())),
             dirty: Arc::new(AtomicBool::new(migrated_any)),
             presets_dirty: Arc::new(AtomicBool::new(false)),
             aliases_dirty: Arc::new(AtomicBool::new(false)),
@@ -290,9 +295,68 @@ impl Orchestrator {
         self.perf_dirty.store(true, Ordering::Relaxed);
     }
 
+    /// Return the model's current vLLM metrics generation when it is a
+    /// safetensors backend. Requests retain this token so a late scrape cannot
+    /// repopulate performance data after a configuration reset.
+    pub(crate) async fn vllm_perf_generation(&self, model_id: &str) -> Option<u64> {
+        self.perf_store.as_ref()?;
+        let is_vllm = self
+            .data
+            .lock()
+            .await
+            .models
+            .get(model_id)
+            .map(|model| model.weights_format == WeightsFormat::Safetensors)
+            .unwrap_or(false);
+        is_vllm.then(|| {
+            self.vllm_perf_tracker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation(model_id)
+        })
+    }
+
+    /// Convert one process's cumulative vLLM metrics into a deduplicated delta
+    /// and fold it into the model's persisted weighted throughput.
+    pub(crate) fn record_vllm_perf_snapshot(
+        &self,
+        model_id: &str,
+        pid: i32,
+        generation: u64,
+        snapshot: VllmPerfSnapshot,
+    ) {
+        let delta = self
+            .vllm_perf_tracker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe(model_id, pid, generation, snapshot);
+        let (Some(store), Some(delta)) = (&self.perf_store, delta) else {
+            return;
+        };
+        let recorded = store.with_mut(|map| {
+            if let Some(perf) = map.get_mut(model_id) {
+                perf.record_vllm(&delta)
+            } else {
+                let mut perf = ModelPerf::default();
+                let recorded = perf.record_vllm(&delta);
+                if recorded {
+                    map.insert(model_id.to_string(), perf);
+                }
+                recorded
+            }
+        });
+        if recorded {
+            self.perf_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Drop a model's accumulated averages — called when its config changes, so
     /// stale timings don't blend with the new setup.
     pub fn reset_perf(&self, model_id: &str) {
+        self.vllm_perf_tracker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reset_model(model_id);
         let Some(store) = &self.perf_store else {
             return;
         };
@@ -649,6 +713,7 @@ impl Orchestrator {
         // Drop the per-model load guard so the HashMap doesn't slowly grow
         // as configs come and go.
         self.load_guards.lock().await.remove(id);
+        self.reset_perf(id);
         self.dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
