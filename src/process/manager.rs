@@ -774,8 +774,11 @@ async fn wait_for_health_or_exit(
 ) -> Result<(), HealthCheckError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
-        .build()
-        .expect("reqwest client");
+        // This client only polls a loopback HTTP endpoint. Loading platform TLS
+        // roots is unnecessary and can fail in minimal/toolbox containers,
+        // which must not prevent an inference backend from starting.
+        .tls_certs_only(std::iter::empty::<reqwest::tls::Certificate>())
+        .build()?;
     let url = format!("http://127.0.0.1:{}/health", port);
     let start = std::time::Instant::now();
 
