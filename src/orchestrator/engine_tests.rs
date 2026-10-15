@@ -1256,6 +1256,7 @@ async fn backend_release_refuses_active_requests_without_partial_eviction() {
 fn cpu_only_gguf_bypasses_fit_and_gpu_admission() {
     let mut m = model("cpu");
     m.cpu_only = true;
+    assert!(resolve_targets(&m, &HashMap::new()).is_empty());
     m.context = 262144;
     m.estimated_vram = 20 * 1024 * 1024 * 1024;
     m.device = Some("SYCL0".into());

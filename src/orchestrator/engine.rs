@@ -2051,6 +2051,9 @@ fn subtract_reserved_from_gpus(mut gpus: Vec<GpuInfo>, mut reserved: u64) -> Vec
 /// (or a single backend inferred from a legacy preset). Falls back to Vulkan —
 /// the historical implicit backend — for models with no preset at all.
 fn resolve_targets(model: &ModelConfig, presets: &HashMap<String, BinaryPreset>) -> Vec<Backend> {
+    if model.cpu_only && model.weights_format == WeightsFormat::Gguf {
+        return Vec::new();
+    }
     model
         .binary_preset
         .as_deref()
