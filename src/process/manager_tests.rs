@@ -550,6 +550,7 @@ fn pending_pids_are_included_in_model_runtime_pid_lookup() {
     let mut pids = pm.pids_for_model_runtime("m");
     pids.sort_unstable();
     assert_eq!(pids, vec![123, 456]);
+    pm.pending.clear(); // Metadata-only fixture: 456 is not a process we own.
 }
 
 #[tokio::test]
@@ -683,4 +684,79 @@ fn cpu_only_argv_disables_target_and_draft_offload() {
         Some("0")
     );
     assert!(!instance_uses_gpu(&m, &args));
+}
+
+#[tokio::test]
+async fn dropping_manager_kills_running_and_pending_worker_descendants() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for register in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("backend");
+        let worker_pid_file = tmp.path().join("worker.pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/python3\nimport pathlib, subprocess, time\nworker = subprocess.Popen(['/bin/sleep', '300'])\npathlib.Path({:?}).write_text(str(worker.pid))\ntime.sleep(300)\n",
+                worker_pid_file.to_string_lossy()
+            ),
+        ).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut model = gguf_model();
+        model.binary = script;
+        let mut manager = ProcessManager::default();
+        let pending = manager.spawn_child(&model, None).unwrap();
+        let leader = pending.pid;
+        for _ in 0..100 {
+            if worker_pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let worker: i32 = std::fs::read_to_string(&worker_pid_file)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(is_process_alive(leader) && is_process_alive(worker));
+        let mut pending = Some(pending);
+        if register {
+            drop(
+                manager
+                    .register(pending.take().unwrap())
+                    .unwrap_or_else(|_| panic!("register failed")),
+            );
+        }
+        drop(manager);
+        drop(pending);
+        for _ in 0..100 {
+            if !is_process_alive(leader) && !is_process_alive(worker) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !is_process_alive(leader),
+            "backend leader survived manager shutdown"
+        );
+        assert!(
+            !is_process_alive(worker),
+            "GPU worker descendant survived manager shutdown"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dropping_manager_does_not_kill_external_backends() {
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap() as i32;
+    let mut manager = ProcessManager::default();
+    manager.register_existing_instance("external", pid, 9001);
+    drop(manager);
+    assert!(is_process_alive(pid));
+    child.kill().await.unwrap();
 }

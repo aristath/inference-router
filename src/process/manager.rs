@@ -86,6 +86,17 @@ pub struct ProcessManager {
     backend_port_range: Option<(u16, u16)>,
 }
 
+impl Drop for ProcessManager {
+    fn drop(&mut self) {
+        // kill_on_drop only kills the API-server leader. Backends such as vLLM
+        // also own GPU worker descendants in that leader's process group.
+        // Signal only groups we spawned, never externally registered backends.
+        for pid in self.running.keys().chain(self.pending.keys()) {
+            let _ = kill_process_group(*pid, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
 impl Default for ProcessManager {
     fn default() -> Self {
         Self {

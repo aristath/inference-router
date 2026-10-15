@@ -129,8 +129,8 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
     info!("orchestrator shutting down; killing any running inference servers");
     // `drop(orchestrator)` fires as we fall out of scope: Arc refcount → 0,
-    // ProcessManager drops, each RunningChild drops, kill_on_drop(true) on the
-    // tokio::process::Child issues SIGKILL synchronously.
+    // ProcessManager drops and kills each owned backend's entire process group,
+    // including worker descendants; the child handles then reap their leaders.
 
     if let Err(e) = server_result {
         error!(error = %e, "server exited with error");
