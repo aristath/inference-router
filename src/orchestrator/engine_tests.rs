@@ -1168,3 +1168,86 @@ async fn reconcile_persists_aliases_when_dirty() {
         serde_json::from_str(&std::fs::read_to_string(&aliases_path).unwrap()).unwrap();
     assert_eq!(saved, vec![alias("fast", "qwen")]);
 }
+
+#[tokio::test]
+async fn backend_release_preserves_other_backends_and_loading_models() {
+    let tmp = TempDir::new().unwrap();
+    let o = orch(&tmp);
+    for (id, backend) in [("sycl", Backend::Sycl), ("cuda", Backend::Cuda)] {
+        o.data.lock().await.presets.insert(
+            id.into(),
+            BinaryPreset {
+                id: id.into(),
+                name: id.into(),
+                binary: format!("/tmp/llama-{id}").into(),
+                targets: vec![backend],
+            },
+        );
+    }
+    let mut sycl = model("sycl");
+    sycl.binary_preset = Some("sycl".into());
+    sycl.state = ModelState::Running;
+    let mut cuda = model("cuda");
+    cuda.binary_preset = Some("cuda".into());
+    cuda.state = ModelState::Running;
+    let mut loading = sycl.clone();
+    loading.id = "loading".into();
+    loading.state = ModelState::Loading;
+    {
+        let mut data = o.data.lock().await;
+        for m in [sycl, cuda, loading] {
+            data.models.insert(m.id.clone(), m);
+        }
+    }
+    assert_eq!(
+        o.release_idle_backend(Backend::Sycl).await.unwrap(),
+        vec!["sycl"]
+    );
+    assert_eq!(o.get_model("sycl").await.unwrap().state, ModelState::Idle);
+    assert_eq!(
+        o.get_model("cuda").await.unwrap().state,
+        ModelState::Running
+    );
+    assert_eq!(
+        o.get_model("loading").await.unwrap().state,
+        ModelState::Loading
+    );
+}
+
+#[tokio::test]
+async fn backend_release_refuses_active_requests_without_partial_eviction() {
+    let tmp = TempDir::new().unwrap();
+    let o = orch(&tmp);
+    for (id, backend) in [("sycl", Backend::Sycl), ("cuda", Backend::Cuda)] {
+        o.data.lock().await.presets.insert(
+            id.into(),
+            BinaryPreset {
+                id: id.into(),
+                name: id.into(),
+                binary: format!("/tmp/llama-{id}").into(),
+                targets: vec![backend],
+            },
+        );
+    }
+    for id in ["active", "idle"] {
+        let mut m = model(id);
+        m.binary_preset = Some("sycl".into());
+        m.state = ModelState::Running;
+        o.data.lock().await.models.insert(id.into(), m);
+    }
+    let guard = {
+        let mut manager = o.process_manager.lock().await;
+        manager.register_existing_instance("active", i32::MAX, 12345);
+        manager.acquire_idle_instance("active").unwrap()
+    };
+    assert_eq!(
+        o.release_idle_backend(Backend::Sycl).await.unwrap_err(),
+        vec!["active"]
+    );
+    assert_eq!(
+        o.get_model("idle").await.unwrap().state,
+        ModelState::Running
+    );
+    assert_eq!(o.process_manager.lock().await.instance_count("active"), 1);
+    drop(guard);
+}

@@ -276,6 +276,10 @@ pub struct ModelConfig {
         skip_serializing_if = "is_default_temperature"
     )]
     pub temperature: f32,
+    /// Per-model upstream idle timeout. None inherits the watchdog setting;
+    /// Some(0) permits arbitrarily long prefill/non-streaming completions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_idle_timeout_secs: Option<u64>,
     #[serde(default = "default_top_p", skip_serializing_if = "is_default_top_p")]
     pub top_p: f32,
     #[serde(default = "default_top_k", skip_serializing_if = "is_default_top_k")]
@@ -437,6 +441,7 @@ impl Default for ModelConfig {
             extra_args: Vec::new(),
             context: 4096,
             temperature: default_temperature(),
+            request_idle_timeout_secs: None,
             top_p: default_top_p(),
             top_k: default_top_k(),
             min_p: default_min_p(),

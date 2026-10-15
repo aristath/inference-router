@@ -1369,6 +1369,50 @@ impl Orchestrator {
             .is_ok()
     }
 
+    /// Cooperatively yield a compute backend to other host services. Running
+    /// requests are never interrupted. The manager mutex protects the active
+    /// check and stops against concurrent request-guard acquisition.
+    pub async fn release_idle_backend(&self, backend: Backend) -> Result<Vec<String>, Vec<String>> {
+        let candidates: Vec<_> = {
+            let data = self.data.lock().await;
+            data.models
+                .values()
+                .filter(|model| {
+                    model.state == ModelState::Running
+                        && resolve_targets(model, &data.presets).contains(&backend)
+                })
+                .map(|model| (model.id.clone(), model.pid))
+                .collect()
+        };
+        let mut manager = self.process_manager.lock().await;
+        let busy: Vec<_> = candidates
+            .iter()
+            .filter(|(id, _)| manager.model_has_active_requests(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !busy.is_empty() {
+            return Err(busy);
+        }
+        for (id, _) in &candidates {
+            for pid in manager.pids_for_model(id) {
+                manager.stop(pid).await;
+            }
+        }
+        drop(manager);
+        let mut data = self.data.lock().await;
+        for (id, pid) in &candidates {
+            if let Some(model) = data.models.get_mut(id) {
+                // A new load may already have started while metadata was unlocked.
+                if model.state == ModelState::Running && model.pid == *pid {
+                    model.state = ModelState::Idle;
+                    model.pid = None;
+                }
+            }
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        Ok(candidates.into_iter().map(|(id, _)| id).collect())
+    }
+
     pub async fn stop_model(&self, id: &str) -> Result<(), StopError> {
         self.stop_model_inner(id).await
     }

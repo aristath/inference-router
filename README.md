@@ -307,3 +307,31 @@ Reads and returns GGUF metadata from a model file.
 #### `GET /healthz`
 Liveness check (returns "ok").
 - **Not a goal:** multi-host, multi-user, auth, quotas, CUDA.
+
+### Shared SYCL GPU admission
+
+`POST /api/backends/{backend}/release-idle` stops idle running models whose binary
+preset targets that compute backend. It returns `{"released":["model-id"]}`.
+An active request returns HTTP 409 without partial eviction. Other backends and
+loading models are preserved. Request guards and the active check share the
+process-manager mutex, so a running inference cannot be stopped by a stale idle
+observation. Host GPU locks remain the final admission boundary during loads.
+
+For Clara's B60, install the `scripts/llama-sycl-b60` launcher behind the existing
+SYCL server and fit-tool wrappers. Set `INFERENCE_LLAMA_SERVER` to the native
+`llama-server` or `llama-fit-params` executable in each wrapper. The launcher
+sources oneAPI, releases idle SYCL peers, acquires the media workers' two B60
+locks, and execs the native program with inherited reservations and parent-death
+protection. Introspection commands do not evict models. All model parameters
+remain normal router model configuration.
+
+The optional model field `request_idle_timeout_secs` overrides the upstream
+watchdog idle timeout for that model. Omit it to inherit the global setting, or
+set it to `0` to allow long non-streaming prefills/completions. Engine-reset
+watching and idle-instance liveness checks retain their normal policy.
+
+Clara calls the `slm` alias using `/v1/chat/completions`. Reassign that alias in
+the dashboard or with `PUT /api/aliases/slm` to change the model without changing
+Clara. Its initial `qwen3.5-2b-mtp` target uses the B60/SYCL preset, native 262144
+context, one slot, F16 KV, `mtp_tokens: 3`, `threads: 4`, flash attention,
+`request_idle_timeout_secs: 0`, and default `enable_thinking: false`.

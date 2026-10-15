@@ -489,6 +489,26 @@ pub async fn delete_alias(
     }
 }
 
+pub async fn release_idle_backend(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(backend) = Backend::ALL
+        .into_iter()
+        .find(|backend| backend.as_str() == name)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "unknown compute backend"})),
+        )
+            .into_response();
+    };
+    match state.release_idle_backend(backend).await {
+        Ok(released) => (StatusCode::OK, Json(serde_json::json!({"released": released}))).into_response(),
+        Err(busy) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": "inference is active; no models were interrupted", "busy": busy}))).into_response(),
+    }
+}
+
 pub async fn stop_model(
     State(state): State<AppState>,
     Path(id): Path<String>,

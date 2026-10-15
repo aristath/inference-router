@@ -187,12 +187,18 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     // signature of a wedged instance. Long by design; the watchdog and liveness
     // probe catch the common cases far sooner. The same client is cloned into the
     // streaming path, so both non-streaming and SSE inherit the backstop.
-    let idle_timeout = settings
-        .watchdog
-        .enabled
-        .then_some(settings.watchdog.idle_timeout_secs)
-        .filter(|s| *s > 0)
-        .map(std::time::Duration::from_secs);
+    let model_timeout = state
+        .data
+        .lock()
+        .await
+        .models
+        .get(&model_id)
+        .and_then(|model| model.request_idle_timeout_secs);
+    let idle_timeout = proxy_idle_timeout(
+        settings.watchdog.enabled,
+        settings.watchdog.idle_timeout_secs,
+        model_timeout,
+    );
     let client = {
         let mut b = reqwest::Client::builder();
         if let Some(d) = idle_timeout {
@@ -420,4 +426,34 @@ pub async fn list_v1_models(State(state): State<AppState>) -> impl IntoResponse 
 
 pub async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+fn proxy_idle_timeout(
+    enabled: bool,
+    global: u64,
+    model: Option<u64>,
+) -> Option<std::time::Duration> {
+    enabled
+        .then_some(model.unwrap_or(global))
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs)
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::proxy_idle_timeout;
+    use std::time::Duration;
+    #[test]
+    fn model_timeout_override_preserves_other_models_and_watchdogs() {
+        assert_eq!(
+            proxy_idle_timeout(true, 900, None),
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(proxy_idle_timeout(true, 900, Some(0)), None);
+        assert_eq!(
+            proxy_idle_timeout(true, 900, Some(2400)),
+            Some(Duration::from_secs(2400))
+        );
+        assert_eq!(proxy_idle_timeout(false, 900, Some(2400)), None);
+    }
 }

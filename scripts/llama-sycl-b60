@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -eo pipefail
+source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+export CUDA_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 ROCR_VISIBLE_DEVICES=-1
+ulimit -c 0
+exec python3 "$(dirname "$(readlink -f "$0")")/llama-sycl-b60-worker.py" "$@"

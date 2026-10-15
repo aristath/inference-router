@@ -381,6 +381,15 @@ impl ProcessManager {
             .map(|(id, _)| id.clone())
     }
 
+    /// Called with the manager mutex held so release cannot race a new guard.
+    pub fn model_has_active_requests(&self, model_id: &str) -> bool {
+        self.instances.get(model_id).is_some_and(|instances| {
+            instances
+                .iter()
+                .any(|instance| instance.active.load(Ordering::Relaxed) > 0)
+        })
+    }
+
     /// Returns all pids for instances of `model_id` (used by stop_model_inner).
     pub fn pids_for_model(&self, model_id: &str) -> Vec<i32> {
         self.instances

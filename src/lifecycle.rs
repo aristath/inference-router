@@ -182,6 +182,10 @@ pub fn build_router(app_state: AppState) -> axum::Router {
         .route("/api/models/{id}", put(update_model).delete(delete_model))
         .route("/api/models/{id}/load", post(load_model))
         .route("/api/models/{id}/stop", post(stop_model))
+        .route(
+            "/api/backends/{backend}/release-idle",
+            post(release_idle_backend),
+        )
         .route("/api/service/restart", post(restart_service))
         .route("/api/files", get(list_files))
         .route("/api/gguf-info", get(gguf_info))
