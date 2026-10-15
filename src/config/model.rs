@@ -301,6 +301,9 @@ pub struct ModelConfig {
     // llama-fit-params chooses layer/split/expert placement at load time.
     #[serde(default, skip_serializing_if = "is_false")]
     pub flash_attn: bool,
+    /// Run GGUF target, draft and projector on CPU without GPU admission or fit.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cpu_only: bool,
     #[serde(skip)]
     pub n_gpu_layers: Option<u32>,
     /// Legacy/internal only. Manual MoE expert placement is not accepted from
@@ -448,6 +451,7 @@ impl Default for ModelConfig {
             presence_penalty: default_presence_penalty(),
             repeat_penalty: default_repeat_penalty(),
             flash_attn: false,
+            cpu_only: false,
             n_gpu_layers: None,
             n_cpu_moe: None,
             override_tensor: None,

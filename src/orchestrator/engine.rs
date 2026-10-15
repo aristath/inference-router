@@ -623,7 +623,8 @@ impl Orchestrator {
             let mut updated = new;
             // Drop the estimate whenever anything that affects KV cache size or
             // weight layout changes — it'll be remeasured on next load.
-            let kv_invalidated = existing.model_path != updated.model_path
+            let kv_invalidated = existing.cpu_only != updated.cpu_only
+                || existing.model_path != updated.model_path
                 || existing.context != updated.context
                 || existing.cache_type_k != updated.cache_type_k
                 || existing.cache_type_v != updated.cache_type_v
@@ -2003,6 +2004,7 @@ fn spawn_config_changed(old: &ModelConfig, new: &ModelConfig) -> bool {
         || old.presence_penalty != new.presence_penalty
         || old.repeat_penalty != new.repeat_penalty
         || old.flash_attn != new.flash_attn
+        || old.cpu_only != new.cpu_only
         || old.mlock != new.mlock
         || old.no_mmap != new.no_mmap
         || old.parallel_slots != new.parallel_slots
@@ -2101,6 +2103,17 @@ fn place_model(
     reserved: u64,
     caps: (f64, f64),
 ) -> Result<PlaceOutcome, crate::vram::llama_fit::LlamaFitError> {
+    if model.cpu_only && model.weights_format == WeightsFormat::Gguf {
+        model.device = Some("none".into());
+        model.n_gpu_layers = Some(0);
+        model.n_cpu_moe = None;
+        model.override_tensor = None;
+        model.fit_target = None;
+        model.tensor_split = None;
+        model.main_gpu = None;
+        model.estimated_vram = 0;
+        return Ok(PlaceOutcome::Fits);
+    }
     if model.weights_format == WeightsFormat::Gguf {
         return place_gguf_with_llama_fit(model, draft, targets, gpus, reserved, caps);
     }

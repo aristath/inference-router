@@ -1251,3 +1251,24 @@ async fn backend_release_refuses_active_requests_without_partial_eviction() {
     assert_eq!(o.process_manager.lock().await.instance_count("active"), 1);
     drop(guard);
 }
+
+#[test]
+fn cpu_only_gguf_bypasses_fit_and_gpu_admission() {
+    let mut m = model("cpu");
+    m.cpu_only = true;
+    m.context = 262144;
+    m.estimated_vram = 20 * 1024 * 1024 * 1024;
+    m.device = Some("SYCL0".into());
+    m.tensor_split = Some("1,1".into());
+    let result = place_model(&mut m, None, &[Backend::Sycl], &[], u64::MAX, (0.0, 0.0)).unwrap();
+    assert!(matches!(result, PlaceOutcome::Fits));
+    assert_eq!(m.estimated_vram, 0);
+    assert_eq!(m.device.as_deref(), Some("none"));
+    assert_eq!(m.n_gpu_layers, Some(0));
+    assert_eq!(m.context, 262144);
+    assert!(m.tensor_split.is_none());
+    let stored = serde_json::to_value(&m).unwrap();
+    assert_eq!(stored["cpu_only"], true);
+    let restored: ModelConfig = serde_json::from_value(stored).unwrap();
+    assert!(restored.cpu_only);
+}

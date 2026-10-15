@@ -654,3 +654,33 @@ fn parses_backend_port_range() {
     assert_eq!(parse_port_range("9200-9100"), None);
     assert_eq!(parse_port_range("nope"), None);
 }
+
+#[test]
+fn cpu_only_argv_disables_target_and_draft_offload() {
+    let mut m = ModelConfig::default();
+    m.cpu_only = true;
+    m.extra_args = vec![
+        "--device".into(),
+        "SYCL0".into(),
+        "--gpu-layers".into(),
+        "999".into(),
+    ];
+    let args = build_command_args(&m, None, 9001);
+    assert_eq!(
+        last_flag_value(&args, &["--device"]).as_deref(),
+        Some("none")
+    );
+    assert_eq!(
+        last_flag_value(&args, &["--gpu-layers"]).as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        last_flag_value(&args, &["--spec-draft-device"]).as_deref(),
+        Some("none")
+    );
+    assert_eq!(
+        last_flag_value(&args, &["--spec-draft-ngl"]).as_deref(),
+        Some("0")
+    );
+    assert!(!instance_uses_gpu(&m, &args));
+}

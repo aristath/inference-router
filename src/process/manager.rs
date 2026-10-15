@@ -688,6 +688,29 @@ pub fn build_command_args(
         }
     }
     args.extend(model.extra_args.iter().cloned());
+    if model.cpu_only && model.weights_format == WeightsFormat::Gguf {
+        // Placement policy wins over legacy raw GPU flags, including draft/MTP.
+        args.extend(
+            [
+                "--device",
+                "none",
+                "--gpu-layers",
+                "0",
+                "--fit",
+                "off",
+                "--no-op-offload",
+                "--spec-draft-device",
+                "none",
+                "--spec-draft-ngl",
+                "0",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        if model.mmproj_path.is_some() {
+            args.push("--no-mmproj-offload".into());
+        }
+    }
     args
 }
 
