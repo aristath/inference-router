@@ -50,6 +50,8 @@ pub type AppState = Arc<Orchestrator>;
 /// Long-lived app controller. Built once in `lifecycle::run`, cloned into
 /// handlers, and held by the reconcile task.
 pub struct Orchestrator {
+    pub gpu_gate: Arc<super::gpu_gate::GpuGate>,
+    pub media: Arc<super::media::MediaController>,
     pub data: Arc<Mutex<AppData>>,
     pub process_manager: Arc<Mutex<ProcessManager>>,
     pub vram_tracker: Arc<VRAMTracker>,
@@ -203,6 +205,8 @@ impl Orchestrator {
         }
 
         Self {
+            gpu_gate: Arc::new(super::gpu_gate::GpuGate::default()),
+            media: Arc::new(super::media::MediaController::default()),
             data: Arc::new(Mutex::new(AppData {
                 models,
                 gpus: Vec::new(),
@@ -378,7 +382,7 @@ impl Orchestrator {
         self.events.lock().await.iter().cloned().collect()
     }
 
-    async fn record_event(&self, level: &'static str, message: impl Into<String>) {
+    pub(crate) async fn record_event(&self, level: &'static str, message: impl Into<String>) {
         let mut events = self.events.lock().await;
         events.push_front(AppEvent {
             ts: unix_now(),
@@ -732,6 +736,30 @@ impl Orchestrator {
     /// caller cancellation (client disconnect) can't leave the model stuck
     /// in Loading forever.
     pub async fn ensure_loaded(self: Arc<Self>, id: &str) -> Result<RequestGuard, LoadError> {
+        let permit = Some(
+            self.gpu_gate
+                .inference()
+                .await
+                .map_err(LoadError::MediaRecoveryFailed)?,
+        );
+        self.ensure_loaded_admitted(id, permit).await
+    }
+
+    pub(crate) async fn ensure_loaded_admitted(
+        self: Arc<Self>,
+        id: &str,
+        permit: Option<super::gpu_gate::InferencePermit>,
+    ) -> Result<RequestGuard, LoadError> {
+        let mut guard = self.clone().load_admitted(id, permit.clone()).await?;
+        guard.gpu_permit = permit;
+        Ok(guard)
+    }
+
+    async fn load_admitted(
+        self: Arc<Self>,
+        id: &str,
+        permit: Option<super::gpu_gate::InferencePermit>,
+    ) -> Result<RequestGuard, LoadError> {
         // Fast path: idle instance available — no serialization needed.
         if let Some(guard) = self.process_manager.lock().await.acquire_idle_instance(id) {
             return Ok(guard);
@@ -758,6 +786,8 @@ impl Orchestrator {
         let id_owned = id.to_string();
         let me = self.clone();
         let handle = tokio::spawn(async move {
+            // A cancelled caller must not let media overlap its detached load.
+            let _gpu_permit = permit;
             let _lock = load_guard.lock().await;
 
             // Re-check after acquiring the lock — another task may have spawned already.
@@ -1777,6 +1807,8 @@ fn unix_now() -> f64 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
+    #[error("GPU recovery failed: {0}")]
+    MediaRecoveryFailed(String),
     #[error("model '{0}' not found")]
     ModelNotFound(String),
 

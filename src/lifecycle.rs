@@ -84,6 +84,35 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         config.port,
     ));
 
+    let media_config: crate::orchestrator::media::MediaConfig =
+        if config_dir.join("media.json").exists() {
+            serde_json::from_slice(&std::fs::read(config_dir.join("media.json"))?)?
+        } else {
+            Default::default()
+        };
+    orchestrator
+        .media
+        .configure(media_config, config_dir.join("media-runtime"))
+        .map_err(anyhow::Error::msg)?;
+    if orchestrator
+        .media
+        .marker()
+        .map_err(anyhow::Error::msg)?
+        .exists()
+    {
+        // Take ownership before binding HTTP. New inference queues behind recovery.
+        let exclusive = orchestrator.gpu_gate.media().await;
+        let state = orchestrator.clone();
+        tokio::spawn(async move {
+            let _exclusive = exclusive;
+            if let Err(error) = state.media.recover_locked(state.clone()).await {
+                state.gpu_gate.set_error(Some(error.clone()));
+                state.gpu_gate.set_phase("recovery_failed", None);
+                error!(%error, "interrupted media recovery failed; inference remains blocked");
+            }
+        });
+    }
+
     // Kick off reconcile loop.
     let reconcile_orch = orchestrator.clone();
     let reconcile_handle = tokio::spawn(async move {
@@ -113,8 +142,12 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "inference-router listening");
 
+    let shutdown_media = orchestrator.media.clone();
     let server_result = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_media.shutdown.cancel();
+        })
         .await;
 
     // Stop reconcile AND wait for its task to actually finish so it drops its
@@ -165,6 +198,7 @@ async fn shutdown_signal() {
 /// mount every route against a pre-configured orchestrator without binding a
 /// socket or starting the reconcile loop.
 pub fn build_router(app_state: AppState) -> axum::Router {
+    let max_body_bytes = app_state.max_body_bytes;
     axum::Router::new()
         // Single-page UI
         .route("/", get(index_page))
@@ -174,6 +208,9 @@ pub fn build_router(app_state: AppState) -> axum::Router {
         .route("/assets/{file}", get(crate::ui::assets::serve_asset))
         // REST API
         .route("/api/status", get(get_app_state))
+        .route("/api/gpu", get(crate::api::media::status))
+        .route("/api/gpu/run/{worker}", post(crate::api::media::run))
+        .route("/api/gpu/recover", post(crate::api::media::recover))
         .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/models", get(list_models).post(create_model))
         .route("/api/models/scan", post(scan_models_folder))
@@ -205,6 +242,7 @@ pub fn build_router(app_state: AppState) -> axum::Router {
         .route("/v1/{*rest}", any(proxy::proxy_handler))
         // Liveness
         .route("/healthz", get(proxy::healthz))
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .with_state(app_state)
 }
 

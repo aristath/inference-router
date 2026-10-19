@@ -108,6 +108,18 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
+    // Queue before buffering large prompts. Hyper applies socket backpressure
+    // while media owns the GPU instead of retaining every queued body in RAM.
+    let permit = match state.gpu_gate.inference().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("GPU recovery failed: {error}")})),
+            )
+                .into_response()
+        }
+    };
     let (parts, body) = req.into_parts();
 
     let body_bytes = match axum::body::to_bytes(body, state.max_body_bytes).await {
@@ -155,7 +167,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
-    let guard = match state.clone().ensure_loaded(&model_id).await {
+    let guard = match state
+        .clone()
+        .ensure_loaded_admitted(&model_id, Some(permit))
+        .await
+    {
         Ok(g) => g,
         Err(e) => {
             warn!(model = model_id, error = %e, "ensure_loaded failed");

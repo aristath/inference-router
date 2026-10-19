@@ -16,5 +16,8 @@
 pub mod allocation;
 pub mod engine;
 pub mod eviction;
+pub mod gpu_gate;
 
 pub use engine::{AppState, LoadError, MutationError, Orchestrator, StopError};
+
+pub mod media;

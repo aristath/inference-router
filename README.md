@@ -103,6 +103,91 @@ client ──POST /v1/chat/completions──▶  inference-router
 - **Eviction = kill.** No idle timeout; models stay resident until VRAM pressure forces eviction.
 - **Graceful shutdown.** The router installs SIGINT and SIGTERM handlers; `tokio::process::Child::kill_on_drop(true)` SIGKILLs every backend as the orchestrator drops. A `systemctl --user stop` or plain `kill` cleans up children too.
 
+## Exclusive media work on a shared GPU
+
+For a host where inference and media share one GPU, register trusted worker
+commands in `~/.config/inference-router/media.json`:
+
+```json
+{
+  "resident_model": "default",
+  "workers": {
+    "image": {
+      "command": ["/absolute/path/to/python", "/absolute/path/to/image-worker.py"],
+      "timeout_secs": 1800
+    },
+    "video": {
+      "command": ["/absolute/path/to/python", "/absolute/path/to/video-worker.py"],
+      "timeout_secs": 7200
+    }
+  }
+}
+```
+
+These are operator-controlled examples, not installed backends. Restart the
+router after editing the file. Worker commands are literal executable/argument
+arrays, never shell commands supplied by HTTP clients. Each worker reads one
+JSON document from stdin, writes its result as JSON to stdout, sends diagnostics
+to stderr, and exits. It must keep GPU work in its owned process group: no
+independently daemonized servers or detached containers. A long-lived backend
+that launches separate GPU processes must be adapted before it can be registered.
+
+`POST /api/gpu/run/image` (or another registered worker name) accepts that JSON
+input and returns the worker's JSON result only after cleanup and resident-model
+restoration. Existing media job controllers can call this endpoint from their
+normal durable job; they should retain their own request IDs and cancellation
+policy. This endpoint is synchronous and does not claim durable HTTP delivery or
+automatic replay after a router restart.
+
+The router uses fair shared/exclusive admission:
+
+1. A media request joins the admission queue. Later inference cannot jump ahead
+   of it, so continued requests from other applications cannot starve media.
+2. Already admitted inference and model loads drain, including complete SSE
+   responses and their immediate performance-accounting work.
+3. GPU-backed inference processes are unloaded. Explicitly CPU-only resident
+   processes need not be evicted, but their new requests use the same queue.
+4. The router starts the worker in its own process group under an exclusive
+   permit. New inference remains queued, regardless of alias or client.
+5. The worker and any remaining group members are terminated and checked before
+   the configured resident model is loaded and passes its normal readiness check.
+6. Queued inference is admitted in FIFO lock order, retaining normal inference
+   concurrency. Waiting inference gets its turn before later queued media work;
+   response completion order can differ when inference runs concurrently.
+
+This covers ordinary `/v1/*` requests and explicit model-load requests. Inference
+queues before reading large prompt bodies, allowing HTTP socket backpressure
+instead of buffering every pending prompt in memory. Unregistered workers are
+rejected. Requests that disconnect while queued are cancelled. The backend idle
+timeout starts after dispatch, not while waiting for media. External clients may
+still impose their own timeouts; the router cannot deliver to a closed connection.
+A media worker must not call this router's inference endpoints while holding the
+exclusive permit, because that request would wait for the worker itself.
+
+Worker failure, timeout, or client cancellation triggers group cleanup and
+restoration. Losing a client does not abandon the cleanup task. If cleanup or
+restoration fails, queued inference receives an explicit recovery error; it is
+never allowed to overlap uncertain GPU ownership. `POST /api/gpu/recover` retries
+verified cleanup and resident-model restoration after the underlying fault is fixed.
+
+`GET /api/gpu` and `gpu_admission` in `/api/status` expose the phase, current media
+job, queued inference/media counts, and recovery error. Handoffs also appear in
+router events. The admission domain is the router's entire GPU pool; this feature
+is intended for exclusive media ownership on a shared GPU, not simultaneous media
+and inference on separate GPUs.
+
+The worker saves its boot/PID/start-time identity in
+`media-runtime/active-worker.json` **before** executing the configured command.
+After restart the router closes admission and cleans up a verified leftover
+worker before restoring inference. A potentially reused PID or unverified orphan
+group fails closed for operator inspection, rather than killing an unrelated
+process or assuming the GPU is free. Router shutdown cancels media and cleans up
+its group. The checkpoint contains process identity, not the request body.
+
+The executable normally supervises its own workers using its internal
+`--gpu-worker` mode. A library embedding the router can provide the matching
+helper binary with `INFERENCE_ROUTER_WORKER_EXECUTABLE`.
+
 ## Development
 
 ```bash

@@ -760,3 +760,45 @@ async fn dropping_manager_does_not_kill_external_backends() {
     assert!(is_process_alive(pid));
     child.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn stop_kills_gpu_descendant_even_after_leader_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let child_path = dir.path().join("child");
+    let mut command = tokio::process::Command::new("python3");
+    command.args(["-c", "import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c','import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(300)']);open(sys.argv[1],'w').write(str(p.pid));time.sleep(300)"])
+        .arg(&child_path).process_group(0).kill_on_drop(true);
+    let child = command.spawn().unwrap();
+    let pid = child.id().unwrap() as i32;
+    for _ in 0..100 {
+        if child_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let descendant: i32 = std::fs::read_to_string(&child_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut pm = ProcessManager::default();
+    pm.running.insert(
+        pid,
+        RunningChild {
+            port: 19002,
+            model_id: "m".into(),
+            child,
+        },
+    );
+    pm.stop(pid).await;
+    for _ in 0..100 {
+        if !is_process_alive(descendant) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !is_process_alive(descendant),
+        "GPU descendant survived model unload"
+    );
+}

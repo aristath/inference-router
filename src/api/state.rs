@@ -10,6 +10,7 @@ use crate::orchestrator::AppState;
 /// Used by the dashboard to display live GPU/CPU/RAM metrics and model states.
 #[derive(Serialize)]
 struct StatusResponse {
+    gpu_admission: crate::orchestrator::gpu_gate::GateSnapshot,
     /// Host-level metrics (CPU %, RAM usage, temperature)
     system: SystemResponse,
     /// GPU information including VRAM usage and temperature
@@ -136,6 +137,7 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     let response = StatusResponse {
+        gpu_admission: state.gpu_gate.snapshot(),
         server_port: state.server_port,
         events,
         system: SystemResponse {

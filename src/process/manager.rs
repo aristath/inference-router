@@ -40,6 +40,7 @@ pub struct ModelRuntime {
 /// connection closes.
 #[derive(Debug)]
 pub struct RequestGuard {
+    pub(crate) gpu_permit: Option<crate::orchestrator::gpu_gate::InferencePermit>,
     pub port: u16,
     /// PID of the instance this request is routed to, so a caller that detects a
     /// stall (idle timeout) can ask the orchestrator to recycle that exact
@@ -55,6 +56,7 @@ impl RequestGuard {
     pub(crate) fn retain(&self) -> Self {
         self.active.fetch_add(1, Ordering::Relaxed);
         Self {
+            gpu_permit: self.gpu_permit.clone(),
             port: self.port,
             pid: self.pid,
             active: self.active.clone(),
@@ -236,6 +238,7 @@ impl ProcessManager {
             },
         );
         Ok(RequestGuard {
+            gpu_permit: None,
             port,
             pid,
             active,
@@ -258,6 +261,7 @@ impl ProcessManager {
             if inst.active.load(Ordering::Relaxed) == 0 {
                 inst.active.fetch_add(1, Ordering::Relaxed);
                 return Some(RequestGuard {
+                    gpu_permit: None,
                     port: inst.port,
                     pid: inst.pid,
                     active: inst.active.clone(),
@@ -281,6 +285,7 @@ impl ProcessManager {
             .min_by_key(|inst| inst.active.load(Ordering::Relaxed))?;
         inst.active.fetch_add(1, Ordering::Relaxed);
         Some(RequestGuard {
+            gpu_permit: None,
             port: inst.port,
             pid: inst.pid,
             active: inst.active.clone(),
@@ -435,7 +440,7 @@ impl ProcessManager {
             return;
         }
 
-        let Some(rc) = self.running.remove(&pid) else {
+        let Some(mut rc) = self.running.remove(&pid) else {
             warn!(
                 pid,
                 "stopping process not in running table; skipping signal"
@@ -444,12 +449,7 @@ impl ProcessManager {
         };
         self.remove_instance(&rc.model_id, pid);
 
-        let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGTERM);
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if is_process_alive(pid) {
-            warn!(pid, "process didn't exit after SIGTERM, sending SIGKILL");
-            let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGKILL);
-        }
+        terminate_child(&mut rc.child).await;
         info!(
             pid,
             port = rc.port,
@@ -897,9 +897,10 @@ async fn terminate_child(child: &mut tokio::process::Child) {
     if let Some(pid) = pid {
         let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGTERM);
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if is_process_alive(pid) {
-            let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGKILL);
-        }
+        // The leader may exit before its GPU descendants. Keep its child
+        // handle unreaped until the entire owned process group is signalled.
+        let _ = kill_process_group(pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     } else {
         let _ = child.kill().await;
     }
