@@ -144,7 +144,10 @@ impl MediaController {
                 format!("media {name} {id}: inference drained; unloading GPU models"),
             )
             .await;
-        let gpu_instances = state.process_manager.lock().await.gpu_instances();
+        let mut gpu_instances = state.process_manager.lock().await.gpu_instances();
+        gpu_instances.extend(self.draining.lock().unwrap().clone());
+        gpu_instances.sort();
+        gpu_instances.dedup();
         *self.draining.lock().unwrap() = gpu_instances.clone();
         let run_result = async {
             cleanup_recorded_worker(&self.marker()?).await?;
