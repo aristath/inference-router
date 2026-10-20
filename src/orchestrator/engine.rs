@@ -50,6 +50,7 @@ pub type AppState = Arc<Orchestrator>;
 /// Long-lived app controller. Built once in `lifecycle::run`, cloned into
 /// handlers, and held by the reconcile task.
 pub struct Orchestrator {
+    cpu_config: Arc<tokio::sync::RwLock<()>>,
     pub gpu_gate: Arc<super::gpu_gate::GpuGate>,
     pub media: Arc<super::media::MediaController>,
     pub data: Arc<Mutex<AppData>>,
@@ -205,6 +206,7 @@ impl Orchestrator {
         }
 
         Self {
+            cpu_config: Arc::new(tokio::sync::RwLock::new(())),
             gpu_gate: Arc::new(super::gpu_gate::GpuGate::default()),
             media: Arc::new(super::media::MediaController::default()),
             data: Arc::new(Mutex::new(AppData {
@@ -462,6 +464,68 @@ impl Orchestrator {
         resolve_alias_chain(&data.aliases, name)
     }
 
+    /// Primary alias resolution is stable; fallback applies only to new requests
+    /// denied immediate GPU admission by media or recovery. Never retry a request.
+    pub async fn inference_target(&self, name: &str, media_blocked: bool) -> (String, bool) {
+        let data = self.data.lock().await;
+        let primary = resolve_alias_chain(&data.aliases, name);
+        if primary.is_empty() {
+            return (primary, false);
+        }
+        if is_cpu_target(&data.models, &primary) {
+            return (primary, true);
+        }
+        if media_blocked {
+            let mut current = name;
+            let mut seen = HashSet::new();
+            while let Some(alias) = data.aliases.get(current) {
+                if !seen.insert(current) {
+                    break;
+                }
+                if let Some(fallback) = &alias.fallback {
+                    let id = resolve_alias_chain(&data.aliases, fallback);
+                    if is_cpu_target(&data.models, &id) {
+                        return (id, true);
+                    }
+                    // Invalidated fallback: keep the original GPU queue policy.
+                    break;
+                }
+                current = &alias.target;
+            }
+        }
+        (primary, false)
+    }
+
+    pub async fn has_cpu_models(&self) -> bool {
+        self.data
+            .lock()
+            .await
+            .models
+            .values()
+            .any(|m| m.cpu_only && m.weights_format == WeightsFormat::Gguf)
+    }
+
+    pub async fn ensure_loaded_cpu(self: Arc<Self>, id: &str) -> Result<RequestGuard, LoadError> {
+        // A model edit must not turn this gate-free load into a GPU load, even
+        // if its caller disconnects while the detached startup task continues.
+        let config = self.cpu_config.clone().read_owned().await;
+        if !is_cpu_target(&self.data.lock().await.models, id) {
+            return Err(LoadError::CpuOnlyRequired(id.into()));
+        }
+        let guard = self.clone().load_admitted(id, None, Some(config)).await?;
+        if self
+            .process_manager
+            .lock()
+            .await
+            .gpu_instances()
+            .iter()
+            .any(|(_, pid)| *pid == guard.pid)
+        {
+            return Err(LoadError::CpuOnlyRequired(id.into()));
+        }
+        Ok(guard)
+    }
+
     pub async fn add_alias(&self, alias: ModelAlias) -> Result<(), MutationError> {
         let mut data = self.data.lock().await;
         if data.aliases.contains_key(&alias.alias) {
@@ -493,6 +557,9 @@ impl Orchestrator {
             if other.target == current_name {
                 other.target = alias.alias.clone();
             }
+            if other.fallback.as_deref() == Some(current_name) {
+                other.fallback = Some(alias.alias.clone());
+            }
         }
         validate_alias_with_maps(&data.models, &aliases, &alias)?;
         data.aliases = aliases;
@@ -511,6 +578,9 @@ impl Orchestrator {
         for a in data.aliases.values_mut() {
             if a.target == name {
                 a.target.clear();
+            }
+            if a.fallback.as_deref() == Some(name) {
+                a.fallback = None;
             }
         }
         self.aliases_dirty.store(true, Ordering::Relaxed);
@@ -596,6 +666,7 @@ impl Orchestrator {
     }
 
     pub async fn update_model(&self, new: ModelConfig) -> Result<(), MutationError> {
+        let _cpu_config = self.cpu_config.write().await;
         let stop_after_update;
         let config_changed;
         let id = new.id.clone();
@@ -665,6 +736,7 @@ impl Orchestrator {
     }
 
     pub async fn remove_model(&self, id: &str) -> Result<(), MutationError> {
+        let _cpu_config = self.cpu_config.write().await;
         {
             let data = self.data.lock().await;
             if !data.models.contains_key(id) {
@@ -710,6 +782,10 @@ impl Orchestrator {
                     a.target.clear();
                     unassigned_any = true;
                 }
+                if a.fallback.as_deref() == Some(id) {
+                    a.fallback = None;
+                    unassigned_any = true;
+                }
             }
             if unassigned_any {
                 self.aliases_dirty.store(true, Ordering::Relaxed);
@@ -736,6 +812,9 @@ impl Orchestrator {
     /// caller cancellation (client disconnect) can't leave the model stuck
     /// in Loading forever.
     pub async fn ensure_loaded(self: Arc<Self>, id: &str) -> Result<RequestGuard, LoadError> {
+        if is_cpu_target(&self.data.lock().await.models, id) {
+            return self.clone().ensure_loaded_cpu(id).await;
+        }
         let permit = Some(
             self.gpu_gate
                 .inference()
@@ -750,7 +829,7 @@ impl Orchestrator {
         id: &str,
         permit: Option<super::gpu_gate::InferencePermit>,
     ) -> Result<RequestGuard, LoadError> {
-        let mut guard = self.clone().load_admitted(id, permit.clone()).await?;
+        let mut guard = self.clone().load_admitted(id, permit.clone(), None).await?;
         guard.gpu_permit = permit;
         Ok(guard)
     }
@@ -759,6 +838,7 @@ impl Orchestrator {
         self: Arc<Self>,
         id: &str,
         permit: Option<super::gpu_gate::InferencePermit>,
+        cpu_config: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> Result<RequestGuard, LoadError> {
         // Fast path: idle instance available — no serialization needed.
         if let Some(guard) = self.process_manager.lock().await.acquire_idle_instance(id) {
@@ -788,6 +868,7 @@ impl Orchestrator {
         let handle = tokio::spawn(async move {
             // A cancelled caller must not let media overlap its detached load.
             let _gpu_permit = permit;
+            let _cpu_config = cpu_config;
             let _lock = load_guard.lock().await;
 
             // Re-check after acquiring the lock — another task may have spawned already.
@@ -1807,6 +1888,8 @@ fn unix_now() -> f64 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
+    #[error("model '{0}' is not a CPU-only GGUF model")]
+    CpuOnlyRequired(String),
     #[error("GPU recovery failed: {0}")]
     MediaRecoveryFailed(String),
     #[error("model '{0}' not found")]
@@ -1953,6 +2036,12 @@ fn target_creates_cycle(
 /// - the alias does not shadow an existing model id
 /// - if a target is given, it names an existing model **or** an existing alias
 /// - the target does not create a resolution cycle
+fn is_cpu_target(models: &HashMap<String, ModelConfig>, id: &str) -> bool {
+    models
+        .get(id)
+        .is_some_and(|m| m.cpu_only && m.weights_format == WeightsFormat::Gguf)
+}
+
 fn validate_alias(data: &AppData, alias: &ModelAlias) -> Result<(), MutationError> {
     validate_alias_with_maps(&data.models, &data.aliases, alias)
 }
@@ -1984,6 +2073,14 @@ fn validate_alias_with_maps(
                 alias: alias.alias.clone(),
                 target: alias.target.clone(),
             });
+        }
+    }
+    if let Some(fallback) = &alias.fallback {
+        let resolved = resolve_alias_chain(aliases, fallback);
+        if fallback == &alias.alias || !is_cpu_target(models, &resolved) {
+            return Err(MutationError::AliasInvalid(
+                "fallback must resolve to a CPU-only GGUF model".into(),
+            ));
         }
     }
     Ok(())

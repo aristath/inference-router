@@ -1,6 +1,6 @@
 //! Real HTTP requests + owned synthetic processes; no GPU/model downloads.
 use inference_router::{
-    config::{BinaryPreset, JsonStore, ModelAlias, ModelConfig, ModelState},
+    config::{BinaryPreset, JsonStore, ModelAlias, ModelConfig, ModelState, WeightsFormat},
     orchestrator::{
         media::{MediaConfig, MediaWorker},
         AppState, Orchestrator,
@@ -52,7 +52,7 @@ class Server(http.server.BaseHTTPRequestHandler):
    self.wfile.write(b'data: [DONE]\n\n');self.wfile.flush()
   else:
    self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers()
-   self.wfile.write(json.dumps({{'choices':[{{'message':{{'role':'assistant','content':name}}}}]}}).encode())
+   self.wfile.write(json.dumps({{'model':data['model'],'choices':[{{'message':{{'role':'assistant','content':name}}}}]}}).encode())
 http.server.ThreadingHTTPServer(('127.0.0.1',args.port),Server).serve_forever()
 "#,root=dir.path().to_str().unwrap())).unwrap();
         std::fs::set_permissions(&llm, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -81,7 +81,7 @@ print(json.dumps({{'image':'saved.png'}}),flush=True)
             name: "Fake resident".into(),
             binary: llm,
             model_path: dir.path().join("fake.gguf"),
-            cpu_only: true,
+            weights_format: WeightsFormat::Safetensors,
             context: 128,
             ..ModelConfig::default()
         };
@@ -157,6 +157,32 @@ print(json.dumps({{'image':'saved.png'}}),flush=True)
             url,
             server,
         }
+    }
+    async fn fallback(&self) {
+        let mut cpu = self.state.data.lock().await.models["fake"].clone();
+        cpu.id = "cpu".into();
+        cpu.cpu_only = true;
+        cpu.weights_format = WeightsFormat::Gguf;
+        cpu.state = ModelState::Idle;
+        cpu.pid = None;
+        self.state.add_model(cpu).await.unwrap();
+        for alias in [
+            ModelAlias {
+                alias: "fast".into(),
+                target: "cpu".into(),
+                fallback: None,
+            },
+            ModelAlias {
+                alias: "default".into(),
+                target: "fake".into(),
+                fallback: Some("fast".into()),
+            },
+        ] {
+            self.state.add_alias(alias).await.unwrap();
+        }
+    }
+    fn request_model(&self, model: &str, stream: bool) -> reqwest::RequestBuilder {
+        self.inference("fallback test").json(&json!({"model":model,"stream":stream,"messages":[{"role":"user","content":"fallback test"}]}))
     }
     fn mark(&self, name: &str) {
         std::fs::write(self.dir.path().join(name), "").unwrap();
@@ -638,4 +664,204 @@ async fn inference_queues_before_waiting_for_a_large_request_body() {
     .await
     .unwrap();
     assert!(!f.events().iter().any(|event| event.starts_with("request:")));
+}
+
+#[tokio::test]
+async fn fallback_answers_on_cpu_during_media_and_returns_to_primary_after_restore() {
+    let f = Fixture::new(30).await;
+    f.fallback().await;
+    let primary: Value = f
+        .request_model("default", false)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(primary["model"], "fake");
+    let media = tokio::spawn(f.media(json!({})).send());
+    f.wait("media-started").await;
+    let fallback: Value = timeout(
+        Duration::from_secs(3),
+        f.request_model("default", false).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(fallback["model"], "cpu");
+    assert!(!media.is_finished());
+    assert_eq!(f.state.gpu_gate.snapshot().queued_inference, 0);
+    let direct: Value = f
+        .request_model("fast", false)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(direct["model"], "cpu");
+    let no_fallback = tokio::spawn(f.request_model("fake", false).send());
+    timeout(Duration::from_secs(2), async {
+        while f.state.gpu_gate.snapshot().queued_inference == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!no_fallback.is_finished());
+    f.mark("finish-media");
+    assert!(media.await.unwrap().unwrap().status().is_success());
+    assert_eq!(
+        no_fallback
+            .await
+            .unwrap()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["model"],
+        "fake"
+    );
+    assert_eq!(
+        f.request_model("default", false)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["model"],
+        "fake"
+    );
+}
+
+#[tokio::test]
+async fn cpu_stream_does_not_block_media_restoration_or_switch_models_mid_response() {
+    let f = Fixture::new(30).await;
+    f.fallback().await;
+    let media = tokio::spawn(f.media(json!({})).send());
+    f.wait("media-started").await;
+    let mut stream = f.request_model("default", true).send().await.unwrap();
+    assert!(stream.chunk().await.unwrap().is_some());
+    f.mark("finish-media");
+    assert!(timeout(Duration::from_secs(4), media)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .status()
+        .is_success());
+    assert_eq!(
+        f.request_model("default", false)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["model"],
+        "fake"
+    );
+    f.mark("finish-stream");
+    let tail = stream.text().await.unwrap();
+    assert!(tail.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn fallback_handles_model_field_after_large_messages_without_queueing_or_reordering_body() {
+    let f = Fixture::new(30).await;
+    f.fallback().await;
+    let media = tokio::spawn(f.media(json!({})).send());
+    f.wait("media-started").await;
+    let content = "x".repeat(200_000);
+    let body =
+        format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"default"}}"#);
+    let reply = timeout(
+        Duration::from_secs(3),
+        f.client()
+            .post(format!("{}/v1/chat/completions", f.url))
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let reply: Value = reply.json().await.unwrap();
+    assert_eq!(reply["model"], "cpu");
+    assert_eq!(reply["choices"][0]["message"]["content"], content);
+    assert!(!media.is_finished());
+    f.mark("finish-media");
+    assert!(media.await.unwrap().unwrap().status().is_success());
+}
+
+#[tokio::test]
+async fn fallback_remains_usable_during_restore_and_after_gpu_recovery_failure() {
+    let f = Fixture::new(30).await;
+    f.fallback().await;
+    let media = tokio::spawn(f.media(json!({})).send());
+    f.wait("media-started").await;
+    assert_eq!(
+        f.request_model("default", false)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["model"],
+        "cpu"
+    );
+    // Warm CPU instance stays available while the GPU resident's health check stalls.
+    f.mark("hold-health");
+    f.mark("finish-media");
+    timeout(Duration::from_secs(3), async {
+        while f.state.gpu_gate.snapshot().state.phase != "restoring" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        timeout(
+            Duration::from_secs(2),
+            f.request_model("default", false).send()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["model"],
+        "cpu"
+    );
+    // Manual CPU loads also use the independent admission lane.
+    drop(
+        timeout(Duration::from_secs(2), f.state.clone().ensure_loaded("cpu"))
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    std::fs::remove_file(f.dir.path().join("hold-health")).unwrap();
+    assert!(media.await.unwrap().unwrap().status().is_success());
+    f.state
+        .gpu_gate
+        .set_error(Some("GPU recovery failed".into()));
+    assert_eq!(
+        f.request_model("default", false)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["model"],
+        "cpu"
+    );
+    assert_eq!(
+        f.request_model("fake", false)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
 }

@@ -951,6 +951,7 @@ async fn reconcile_persists_settings_when_dirty() {
 
 fn alias(name: &str, target: &str) -> ModelAlias {
     ModelAlias {
+        fallback: None,
         alias: name.into(),
         target: target.into(),
     }
@@ -1272,4 +1273,85 @@ fn cpu_only_gguf_bypasses_fit_and_gpu_admission() {
     assert_eq!(stored["cpu_only"], true);
     let restored: ModelConfig = serde_json::from_value(stored).unwrap();
     assert!(restored.cpu_only);
+}
+
+#[tokio::test]
+async fn fallback_validation_inheritance_rename_delete_and_model_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let o = orch(&tmp);
+    o.add_model(model("gpu")).await.unwrap();
+    let mut cpu = model("cpu");
+    cpu.cpu_only = true;
+    o.add_model(cpu.clone()).await.unwrap();
+    o.add_alias(alias("fast", "cpu")).await.unwrap();
+    let mut default = alias("default", "gpu");
+    default.fallback = Some("gpu".into());
+    assert!(o.add_alias(default.clone()).await.is_err());
+    default.fallback = Some("missing".into());
+    assert!(o.add_alias(default.clone()).await.is_err());
+    default.fallback = Some("fast".into());
+    o.add_alias(default).await.unwrap();
+    o.reconcile().await;
+    let persisted: Vec<ModelAlias> =
+        serde_json::from_str(&std::fs::read_to_string(o.aliases_store.path()).unwrap()).unwrap();
+    assert_eq!(
+        persisted
+            .iter()
+            .find(|a| a.alias == "default")
+            .unwrap()
+            .fallback
+            .as_deref(),
+        Some("fast")
+    );
+    o.add_alias(alias("clara", "default")).await.unwrap();
+    assert_eq!(
+        o.inference_target("clara", false).await,
+        ("gpu".into(), false)
+    );
+    assert_eq!(
+        o.inference_target("clara", true).await,
+        ("cpu".into(), true)
+    );
+    o.update_alias("fast", alias("quick", "cpu")).await.unwrap();
+    assert_eq!(
+        o.list_aliases()
+            .await
+            .into_iter()
+            .find(|a| a.alias == "default")
+            .unwrap()
+            .fallback
+            .as_deref(),
+        Some("quick")
+    );
+    cpu.cpu_only = false;
+    o.update_model(cpu.clone()).await.unwrap();
+    assert_eq!(
+        o.inference_target("default", true).await,
+        ("gpu".into(), false)
+    );
+    cpu.cpu_only = true;
+    o.update_model(cpu).await.unwrap();
+    o.remove_alias("quick").await.unwrap();
+    assert_eq!(
+        o.list_aliases()
+            .await
+            .into_iter()
+            .find(|a| a.alias == "default")
+            .unwrap()
+            .fallback,
+        None
+    );
+    let mut default = alias("default", "gpu");
+    default.fallback = Some("cpu".into());
+    o.update_alias("default", default).await.unwrap();
+    o.remove_model("cpu").await.unwrap();
+    assert_eq!(
+        o.list_aliases()
+            .await
+            .into_iter()
+            .find(|a| a.alias == "default")
+            .unwrap()
+            .fallback,
+        None
+    );
 }

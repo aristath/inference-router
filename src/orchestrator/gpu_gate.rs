@@ -49,6 +49,15 @@ impl Drop for Waiting<'_> {
 }
 
 impl GpuGate {
+    /// Never jump a queued media writer. A recovery fault also closes GPU admission.
+    pub fn try_inference(&self) -> Option<InferencePermit> {
+        let permit = self.lock.clone().try_read_owned().ok()?;
+        if self.state.lock().unwrap().error.is_some() {
+            return None;
+        }
+        Some(Arc::new(permit))
+    }
+
     pub async fn inference(&self) -> Result<InferencePermit, String> {
         self.waiting_inference.fetch_add(1, Ordering::SeqCst);
         let waiting = Waiting(&self.waiting_inference);

@@ -57,6 +57,11 @@
                         <label for="alias-target">Target model</label>
                         <select id="alias-target"></select>
                     </div>
+                    <div class="form-group">
+                        <label for="alias-fallback">Fallback during media generation</label>
+                        <select id="alias-fallback"></select>
+                        <small class="field-help">Optional CPU model or alias. Requests use its context limit and capabilities; otherwise they wait for the GPU.</small>
+                    </div>
                 </div>
                 <div style="display: flex; gap: 0.75rem; margin-top: 0.75rem;">
                     <button type="button" class="btn btn-primary btn-sm" onclick="saveAlias()">Save</button>
@@ -2230,6 +2235,7 @@ function renderAliasRow(a) {
             <code class="model-chip profile">${escapeHtmlText(a.alias)}</code>
             <span style="color:#64748b;">→</span>
             ${targetHtml}
+            ${a.fallback ? `<small style="display:block; color:#94a3b8;">During media → <code>${escapeHtmlText(a.fallback)}</code></small>` : ''}
         </div>
         <button type="button" class="btn btn-secondary btn-sm">Edit</button>
         <button type="button" class="btn btn-danger btn-sm">Delete</button>
@@ -2264,18 +2270,61 @@ function formatModelFileSizeSuffix(m) {
     return size > 0 ? ` — ${(size / 1024**3).toFixed(1)} GiB` : '';
 }
 
-async function refreshAliasTargetSelect(selected) {
+async function refreshAliasTargetSelect(selected, fallbackSelected) {
     const sel = document.getElementById('alias-target');
     if (!sel) return;
     sel.innerHTML = '';
+    const fallbackSelect = document.getElementById('alias-fallback');
+    fallbackSelect.replaceChildren();
+    fallbackSelect.disabled = true;
+    sel.disabled = true;
     const unassigned = document.createElement('option');
     unassigned.value = '';
     unassigned.textContent = '— Unassigned —';
     sel.appendChild(unassigned);
     try {
         const [mr, ar] = await Promise.all([fetch('/api/models'), fetch('/api/aliases')]);
-        const models = mr.ok ? await mr.json() : [];
-        const aliases = ar.ok ? await ar.json() : [];
+        if (!mr.ok || !ar.ok) throw new Error('Could not load model choices');
+        const models = await mr.json();
+        const aliases = await ar.json();
+        const fallback = document.getElementById('alias-fallback');
+        fallback.replaceChildren();
+        const none = document.createElement('option');
+        none.value = '';
+        none.textContent = 'None — queue requests';
+        fallback.appendChild(none);
+        const cpuTarget = name => {
+            const seen = new Set();
+            let current = name;
+            while (aliases.some(a => a.alias === current)) {
+                if (seen.has(current)) return false;
+                seen.add(current);
+                current = aliases.find(a => a.alias === current).target;
+            }
+            return models.some(m => m.id === current && m.cpu_only && (m.weights_format || 'gguf') === 'gguf');
+        };
+        const fallbackOptions = [
+            ...aliases.filter(a => a.alias !== _aliasEditingOriginal && cpuTarget(a.alias))
+                .map(a => ({ value: a.alias, label: `${a.alias} → ${a.target}` })),
+            ...models.filter(m => m.cpu_only && (m.weights_format || 'gguf') === 'gguf')
+                .map(m => ({ value: m.id, label: m.name || m.id })),
+        ];
+        fallbackOptions.forEach(item => {
+            const option = document.createElement('option');
+            option.value = item.value;
+            option.textContent = item.label;
+            fallback.appendChild(option);
+        });
+        if (fallbackSelected && !fallbackOptions.some(o => o.value === fallbackSelected)) {
+            const option = document.createElement('option');
+            option.value = fallbackSelected;
+            option.textContent = `${fallbackSelected} (unavailable — choose another fallback)`;
+            fallback.appendChild(option);
+        }
+        fallback.value = fallbackSelected || '';
+        fallback.disabled = false;
+        sel.disabled = false;
+
 
         const aliasOpts = aliases
             .filter(a => a.alias !== _aliasEditingOriginal)
@@ -2316,7 +2365,7 @@ async function openAliasEditor(existing) {
     const nameEl = document.getElementById('alias-name');
     nameEl.value = existing ? existing.alias : '';
     // Names are editable — including renaming an existing alias.
-    await refreshAliasTargetSelect(existing ? existing.target : undefined);
+    await refreshAliasTargetSelect(existing?.target, existing?.fallback);
     setTimeout(() => nameEl.focus(), 20);
 }
 
@@ -2335,7 +2384,12 @@ async function saveAlias() {
         return;
     }
 
-    const body = JSON.stringify({ alias, target });
+    if (document.getElementById('alias-target').disabled || document.getElementById('alias-fallback').disabled) {
+        alert('Model choices could not be loaded yet. Reopen the editor to try again.');
+        return;
+    }
+    const fallback = document.getElementById('alias-fallback').value || null;
+    const body = JSON.stringify({ alias, target, fallback });
     const url = _aliasEditorMode === 'add'
         ? '/api/aliases'
         : `/api/aliases/${encodeURIComponent(_aliasEditingOriginal || alias)}`;

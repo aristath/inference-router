@@ -9,8 +9,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tracing::{error, warn};
 
-use crate::api::body_peek;
 use crate::api::loop_guard::{self, StreamSession};
+use crate::api::routing_body::RoutingBody;
 use crate::orchestrator::AppState;
 use crate::process::manager::RequestGuard;
 
@@ -108,37 +108,43 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
-    // Queue before buffering large prompts. Hyper applies socket backpressure
-    // while media owns the GPU instead of retaining every queued body in RAM.
-    let permit = match state.gpu_gate.inference().await {
-        Ok(permit) => permit,
-        Err(error) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": format!("GPU recovery failed: {error}")})),
-            )
-                .into_response()
-        }
-    };
+    // Keep ordinary inference admission ahead of body buffering. When CPU
+    // routes exist, requests blocked by media must first reveal their model;
+    // large queued bodies spill to private files instead of accumulating RAM.
+    let mut permit = state.gpu_gate.try_inference();
+    if permit.is_none() && !state.has_cpu_models().await {
+        permit = match state.gpu_gate.inference().await {
+            Ok(p) => Some(p),
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":error})),
+                )
+                    .into_response()
+            }
+        };
+    }
     let (parts, body) = req.into_parts();
-
-    let body_bytes = match axum::body::to_bytes(body, state.max_body_bytes).await {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(json!({
-                    "error": format!(
-                        "request body exceeds max size of {} bytes or could not be read: {e}",
-                        state.max_body_bytes,
-                    ),
-                })),
-            )
-                .into_response();
+    let directory = state
+        .store
+        .path()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("request-spool");
+    let body = match RoutingBody::read(
+        body,
+        state.max_body_bytes,
+        permit.is_none().then_some(directory.as_path()),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error":error}))).into_response()
         }
     };
 
-    let requested_model = match body_peek::extract_model(&body_bytes) {
+    let requested_model = match body.model() {
         Some(id) => id,
         None => {
             return (
@@ -151,7 +157,9 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
 
     // Resolve aliases to their target model. Non-alias names pass through
     // unchanged.
-    let model_id = state.resolve_model_id(&requested_model).await;
+    let (model_id, cpu) = state
+        .inference_target(&requested_model, permit.is_none())
+        .await;
 
     // A defined-but-unassigned alias resolves to an empty target. Real model
     // ids are never empty, so this unambiguously means "alias not pointed at a
@@ -167,11 +175,28 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
-    let guard = match state
-        .clone()
-        .ensure_loaded_admitted(&model_id, Some(permit))
-        .await
-    {
+    let loaded = if cpu {
+        drop(permit.take());
+        state.clone().ensure_loaded_cpu(&model_id).await
+    } else {
+        if permit.is_none() {
+            permit = match state.gpu_gate.inference().await {
+                Ok(p) => Some(p),
+                Err(error) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error":error})),
+                    )
+                        .into_response()
+                }
+            };
+        }
+        state
+            .clone()
+            .ensure_loaded_admitted(&model_id, permit)
+            .await
+    };
+    let guard = match loaded {
         Ok(g) => g,
         Err(e) => {
             warn!(model = model_id, error = %e, "ensure_loaded failed");
@@ -180,6 +205,16 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
                 Json(json!({"error": e.to_string(), "model": model_id})),
             )
                 .into_response();
+        }
+    };
+    let body_bytes = match body.into_bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":error.to_string()})),
+            )
+                .into_response()
         }
     };
 

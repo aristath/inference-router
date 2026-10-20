@@ -141,14 +141,14 @@ automatic replay after a router restart.
 
 The router uses fair shared/exclusive admission:
 
-1. A media request joins the admission queue. Later inference cannot jump ahead
+1. A media request joins the admission queue. Later GPU inference cannot jump ahead
    of it, so continued requests from other applications cannot starve media.
-2. Already admitted inference and model loads drain, including complete SSE
+2. Already admitted GPU inference and model loads drain, including complete SSE
    responses and their immediate performance-accounting work.
 3. GPU-backed inference processes are unloaded. Explicitly CPU-only resident
-   processes need not be evicted, but their new requests use the same queue.
+   processes need not be evicted and their requests can run alongside media.
 4. The router starts the worker in its own process group under an exclusive
-   permit. New inference remains queued, regardless of alias or client.
+   permit. GPU requests queue unless their alias has a usable CPU fallback.
 5. The worker and any remaining group members are terminated and checked before
    the configured resident model is loaded and passes its normal readiness check.
 6. Queued inference is admitted in FIFO lock order, retaining normal inference
@@ -156,8 +156,9 @@ The router uses fair shared/exclusive admission:
    response completion order can differ when inference runs concurrently.
 
 This covers ordinary `/v1/*` requests and explicit model-load requests. Inference
-queues before reading large prompt bodies, allowing HTTP socket backpressure
-instead of buffering every pending prompt in memory. Unregistered workers are
+uses socket backpressure before ordinary admission. During media, routing metadata
+is read first and large queued prompts spill to private temporary files (see
+[alias fallback](#alias-fallback-during-media)). Unregistered workers are
 rejected. Requests that disconnect while queued are cancelled. The backend idle
 timeout starts after dispatch, not while waiting for media. External clients may
 still impose their own timeouts; the router cannot deliver to a closed connection.
@@ -421,3 +422,34 @@ the dashboard or with `PUT /api/aliases/slm` to change the model without changin
 Clara. Its initial `qwen3.5-2b-mtp` target uses the B60/SYCL preset, native 262144
 context, one slot, F16 KV, `mtp_tokens: 3`, `threads: 4`, flash attention,
 `request_idle_timeout_secs: 0`, and default `enable_thinking: false`.
+
+### Alias fallback during media
+
+The alias editor has an optional **Fallback during media generation** selector.
+Choose a CPU-only GGUF model or an alias such as `fast` that resolves to one:
+
+```json
+{"alias":"default","target":"qwen3.8-27b","fallback":"fast"}
+```
+
+New requests use the primary model while GPU admission is available. During
+media draining, generation, resident restoration, or a GPU recovery fault, they
+use the fallback instead. Aliases pointing at this alias inherit its fallback
+unless they set their own. Direct CPU requests also run independently of media.
+GPU requests with no usable fallback keep the existing queue/recovery behavior.
+An edited or unassigned fallback that no longer resolves to a CPU-only model is
+never allowed to load on the reserved GPU.
+
+The entire request is forwarded unchanged except for its resolved `model` field;
+the fallback's context limit, modalities and tool support apply. Upstream errors
+are returned normally. A request is assigned once: streaming responses never
+switch models, and nothing is automatically retried or replayed. Subsequent
+requests return to the primary after GPU restoration. The upstream response's
+model identifies the model that actually answered.
+
+Routing needs the model from the request body, regardless of JSON field order.
+During media, small bodies are read in memory; bodies over 64 KiB spill to
+private unnamed files in `request-spool/` beside the router configuration.
+Queued GPU prompts stay there until admitted, and their files close on
+cancellation. The configured maximum request size still applies. This avoids
+holding every queued prompt in RAM while CPU requests continue to arrive.

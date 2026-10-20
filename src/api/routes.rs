@@ -349,6 +349,11 @@ pub async fn load_model(
             Json(serde_json::json!({"ok": true, "port": guard.port})),
         )
             .into_response(),
+        Err(LoadError::CpuOnlyRequired(id)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":format!("model '{id}' is not CPU-only")})),
+        )
+            .into_response(),
         Err(LoadError::MediaRecoveryFailed(error)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": error})),

@@ -21,6 +21,10 @@ pub struct JsonStore<T: Clone + DeserializeOwned + Serialize + Send + Sync> {
 }
 
 impl<T: Clone + DeserializeOwned + Serialize + Send + Sync> JsonStore<T> {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// Creates a new store at the given path, loading existing data if present.
     #[allow(dead_code)]
     pub fn new(path: PathBuf) -> Self {

@@ -11,6 +11,9 @@ pub struct ModelAlias {
     pub alias: String,
     /// The id of the configured model this alias resolves to.
     pub target: String,
+    /// Optional CPU model or alias used while media blocks GPU admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 #[cfg(test)]

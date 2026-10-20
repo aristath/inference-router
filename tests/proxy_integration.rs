@@ -761,6 +761,7 @@ async fn proxy_routes_alias_to_target_model() {
     let orchestrator = build_proxy_orchestrator(upstream).await;
     orchestrator
         .add_alias(ModelAlias {
+            fallback: None,
             alias: "gpt-4o".into(),
             target: "fake".into(),
         })
@@ -794,6 +795,7 @@ async fn proxy_routes_alias_chain_to_target_model() {
     // coder -> default -> fake (a real, running model).
     orchestrator
         .add_alias(ModelAlias {
+            fallback: None,
             alias: "default".into(),
             target: "fake".into(),
         })
@@ -801,6 +803,7 @@ async fn proxy_routes_alias_chain_to_target_model() {
         .unwrap();
     orchestrator
         .add_alias(ModelAlias {
+            fallback: None,
             alias: "coder".into(),
             target: "default".into(),
         })
@@ -832,6 +835,7 @@ async fn proxy_returns_503_for_unassigned_alias() {
     // A canonical alias defined but not yet pointed at a model.
     orchestrator
         .add_alias(ModelAlias {
+            fallback: None,
             alias: "planner".into(),
             target: String::new(),
         })
@@ -864,6 +868,7 @@ async fn v1_models_full_list_includes_models_and_aliases() {
     let orchestrator = build_proxy_orchestrator(upstream).await;
     orchestrator
         .add_alias(ModelAlias {
+            fallback: None,
             alias: "gpt-4o".into(),
             target: "fake".into(),
         })
@@ -896,6 +901,7 @@ async fn v1_models_aliases_only_hides_real_models() {
     let orchestrator = build_proxy_orchestrator(upstream).await;
     orchestrator
         .add_alias(ModelAlias {
+            fallback: None,
             alias: "gpt-4o".into(),
             target: "fake".into(),
         })
