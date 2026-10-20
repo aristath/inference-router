@@ -581,6 +581,7 @@ async fn cancelled_pending_child_cannot_register_as_running() {
         port,
         model_id: "m".into(),
         uses_gpu: true,
+        media_independent: false,
         child,
         kv_bytes_rx,
         cancel_rx,
@@ -801,4 +802,53 @@ async fn stop_kills_gpu_descendant_even_after_leader_exits() {
         !is_process_alive(descendant),
         "GPU descendant survived model unload"
     );
+}
+
+#[test]
+fn igpu_instances_are_tracked_for_resets_but_excluded_from_media_draining() {
+    let mut pm = ProcessManager::default();
+    for (name, pid, uses_gpu, independent) in [
+        ("cpu", 1, false, true),
+        ("igpu", 2, true, true),
+        ("main", 3, true, false),
+    ] {
+        pm.instances.insert(
+            name.into(),
+            vec![InstanceInfo {
+                pid,
+                port: 1234,
+                active: Arc::new(AtomicUsize::new(0)),
+                uses_gpu,
+                media_independent: independent,
+            }],
+        );
+    }
+    let mut all = pm.gpu_instances();
+    all.sort();
+    assert_eq!(all, vec![("igpu".into(), 2), ("main".into(), 3)]);
+    assert_eq!(pm.media_gpu_instances(), vec![("main".into(), 3)]);
+}
+
+#[test]
+fn igpu_argv_enforces_the_resolved_device_and_requires_placement() {
+    let mut m = ModelConfig::default();
+    m.igpu_only = true;
+    m.device = Some("Vulkan3".into());
+    m.n_gpu_layers = Some(99);
+    let args = build_command_args(&m, None, 9001);
+    assert_eq!(
+        last_flag_value(&args, &["--device"]).as_deref(),
+        Some("Vulkan3")
+    );
+    assert_eq!(
+        last_flag_value(&args, &["--gpu-layers"]).as_deref(),
+        Some("99")
+    );
+    assert_eq!(last_flag_value(&args, &["--fit"]).as_deref(), Some("off"));
+    assert!(instance_uses_gpu(&m, &args));
+    m.device = None;
+    assert!(matches!(
+        ProcessManager::default().spawn_child(&m, None),
+        Err(SpawnError::InvalidPlacement(_))
+    ));
 }

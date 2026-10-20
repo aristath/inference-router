@@ -604,3 +604,26 @@ fn migrate_accepts_draft_max_aliases() {
     assert!(m.migrate_extra_args());
     assert_eq!(m.draft_max, Some(12));
 }
+
+#[test]
+fn igpu_policy_roundtrips_and_rejects_conflicting_placement() {
+    let mut m = ModelConfig {
+        igpu_only: true,
+        ..ModelConfig::default()
+    };
+    assert!(m.media_independent());
+    assert!(m.validate_placement().is_ok());
+    let restored: ModelConfig = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+    assert!(restored.igpu_only);
+    m.cpu_only = true;
+    assert!(m.validate_placement().is_err());
+    m.cpu_only = false;
+    m.weights_format = WeightsFormat::Safetensors;
+    assert!(m.validate_placement().is_err());
+    m.weights_format = WeightsFormat::Gguf;
+    m.extra_args = vec!["--override-tensor=blk.*=CUDA0".into()];
+    assert!(m.validate_placement().is_err());
+    m.extra_args.clear();
+    m.mtp_tokens = Some(1);
+    assert!(m.validate_placement().is_err());
+}

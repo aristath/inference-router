@@ -50,7 +50,7 @@ pub type AppState = Arc<Orchestrator>;
 /// Long-lived app controller. Built once in `lifecycle::run`, cloned into
 /// handlers, and held by the reconcile task.
 pub struct Orchestrator {
-    cpu_config: Arc<tokio::sync::RwLock<()>>,
+    independent_config: Arc<tokio::sync::RwLock<()>>,
     pub gpu_gate: Arc<super::gpu_gate::GpuGate>,
     pub media: Arc<super::media::MediaController>,
     pub data: Arc<Mutex<AppData>>,
@@ -206,7 +206,7 @@ impl Orchestrator {
         }
 
         Self {
-            cpu_config: Arc::new(tokio::sync::RwLock::new(())),
+            independent_config: Arc::new(tokio::sync::RwLock::new(())),
             gpu_gate: Arc::new(super::gpu_gate::GpuGate::default()),
             media: Arc::new(super::media::MediaController::default()),
             data: Arc::new(Mutex::new(AppData {
@@ -472,7 +472,7 @@ impl Orchestrator {
         if primary.is_empty() {
             return (primary, false);
         }
-        if is_cpu_target(&data.models, &primary) {
+        if is_independent_target(&data.models, &primary) {
             return (primary, true);
         }
         if media_blocked {
@@ -484,7 +484,7 @@ impl Orchestrator {
                 }
                 if let Some(fallback) = &alias.fallback {
                     let id = resolve_alias_chain(&data.aliases, fallback);
-                    if is_cpu_target(&data.models, &id) {
+                    if is_independent_target(&data.models, &id) {
                         return (id, true);
                     }
                     // Invalidated fallback: keep the original GPU queue policy.
@@ -496,32 +496,35 @@ impl Orchestrator {
         (primary, false)
     }
 
-    pub async fn has_cpu_models(&self) -> bool {
+    pub async fn has_independent_models(&self) -> bool {
         self.data
             .lock()
             .await
             .models
             .values()
-            .any(|m| m.cpu_only && m.weights_format == WeightsFormat::Gguf)
+            .any(|m| m.media_independent())
     }
 
-    pub async fn ensure_loaded_cpu(self: Arc<Self>, id: &str) -> Result<RequestGuard, LoadError> {
-        // A model edit must not turn this gate-free load into a GPU load, even
+    pub async fn ensure_loaded_independent(
+        self: Arc<Self>,
+        id: &str,
+    ) -> Result<RequestGuard, LoadError> {
+        // A model edit must not turn this gate-free load into a discrete-GPU load, even
         // if its caller disconnects while the detached startup task continues.
-        let config = self.cpu_config.clone().read_owned().await;
-        if !is_cpu_target(&self.data.lock().await.models, id) {
-            return Err(LoadError::CpuOnlyRequired(id.into()));
+        let config = self.independent_config.clone().read_owned().await;
+        if !is_independent_target(&self.data.lock().await.models, id) {
+            return Err(LoadError::IndependentModelRequired(id.into()));
         }
         let guard = self.clone().load_admitted(id, None, Some(config)).await?;
         if self
             .process_manager
             .lock()
             .await
-            .gpu_instances()
+            .media_gpu_instances()
             .iter()
             .any(|(_, pid)| *pid == guard.pid)
         {
-            return Err(LoadError::CpuOnlyRequired(id.into()));
+            return Err(LoadError::IndependentModelRequired(id.into()));
         }
         Ok(guard)
     }
@@ -666,7 +669,7 @@ impl Orchestrator {
     }
 
     pub async fn update_model(&self, new: ModelConfig) -> Result<(), MutationError> {
-        let _cpu_config = self.cpu_config.write().await;
+        let _independent_config = self.independent_config.write().await;
         let stop_after_update;
         let config_changed;
         let id = new.id.clone();
@@ -699,6 +702,7 @@ impl Orchestrator {
             // Drop the estimate whenever anything that affects KV cache size or
             // weight layout changes — it'll be remeasured on next load.
             let kv_invalidated = existing.cpu_only != updated.cpu_only
+                || existing.igpu_only != updated.igpu_only
                 || existing.model_path != updated.model_path
                 || existing.context != updated.context
                 || existing.cache_type_k != updated.cache_type_k
@@ -736,7 +740,7 @@ impl Orchestrator {
     }
 
     pub async fn remove_model(&self, id: &str) -> Result<(), MutationError> {
-        let _cpu_config = self.cpu_config.write().await;
+        let _independent_config = self.independent_config.write().await;
         {
             let data = self.data.lock().await;
             if !data.models.contains_key(id) {
@@ -812,8 +816,8 @@ impl Orchestrator {
     /// caller cancellation (client disconnect) can't leave the model stuck
     /// in Loading forever.
     pub async fn ensure_loaded(self: Arc<Self>, id: &str) -> Result<RequestGuard, LoadError> {
-        if is_cpu_target(&self.data.lock().await.models, id) {
-            return self.clone().ensure_loaded_cpu(id).await;
+        if is_independent_target(&self.data.lock().await.models, id) {
+            return self.clone().ensure_loaded_independent(id).await;
         }
         let permit = Some(
             self.gpu_gate
@@ -838,7 +842,7 @@ impl Orchestrator {
         self: Arc<Self>,
         id: &str,
         permit: Option<super::gpu_gate::InferencePermit>,
-        cpu_config: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        independent_config: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> Result<RequestGuard, LoadError> {
         // Fast path: idle instance available — no serialization needed.
         if let Some(guard) = self.process_manager.lock().await.acquire_idle_instance(id) {
@@ -868,7 +872,7 @@ impl Orchestrator {
         let handle = tokio::spawn(async move {
             // A cancelled caller must not let media overlap its detached load.
             let _gpu_permit = permit;
-            let _cpu_config = cpu_config;
+            let _independent_config = independent_config;
             let _lock = load_guard.lock().await;
 
             // Re-check after acquiring the lock — another task may have spawned already.
@@ -1888,8 +1892,8 @@ fn unix_now() -> f64 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
-    #[error("model '{0}' is not a CPU-only GGUF model")]
-    CpuOnlyRequired(String),
+    #[error("model '{0}' is not a CPU-only or iGPU-only GGUF model")]
+    IndependentModelRequired(String),
     #[error("GPU recovery failed: {0}")]
     MediaRecoveryFailed(String),
     #[error("model '{0}' not found")]
@@ -2036,10 +2040,8 @@ fn target_creates_cycle(
 /// - the alias does not shadow an existing model id
 /// - if a target is given, it names an existing model **or** an existing alias
 /// - the target does not create a resolution cycle
-fn is_cpu_target(models: &HashMap<String, ModelConfig>, id: &str) -> bool {
-    models
-        .get(id)
-        .is_some_and(|m| m.cpu_only && m.weights_format == WeightsFormat::Gguf)
+fn is_independent_target(models: &HashMap<String, ModelConfig>, id: &str) -> bool {
+    models.get(id).is_some_and(|m| m.media_independent())
 }
 
 fn validate_alias(data: &AppData, alias: &ModelAlias) -> Result<(), MutationError> {
@@ -2077,9 +2079,9 @@ fn validate_alias_with_maps(
     }
     if let Some(fallback) = &alias.fallback {
         let resolved = resolve_alias_chain(aliases, fallback);
-        if fallback == &alias.alias || !is_cpu_target(models, &resolved) {
+        if fallback == &alias.alias || !is_independent_target(models, &resolved) {
             return Err(MutationError::AliasInvalid(
-                "fallback must resolve to a CPU-only GGUF model".into(),
+                "fallback must resolve to a CPU-only or iGPU-only GGUF model".into(),
             ));
         }
     }
@@ -2087,6 +2089,9 @@ fn validate_alias_with_maps(
 }
 
 fn validate_model_identity(data: &AppData, model: &ModelConfig) -> Result<(), MutationError> {
+    model
+        .validate_placement()
+        .map_err(MutationError::InvalidConfig)?;
     if model.id.trim().is_empty() {
         return Err(MutationError::InvalidConfig(ConfigError::EmptyModelId));
     }
@@ -2134,6 +2139,7 @@ fn spawn_config_changed(old: &ModelConfig, new: &ModelConfig) -> bool {
         || old.repeat_penalty != new.repeat_penalty
         || old.flash_attn != new.flash_attn
         || old.cpu_only != new.cpu_only
+        || old.igpu_only != new.igpu_only
         || old.mlock != new.mlock
         || old.no_mmap != new.no_mmap
         || old.parallel_slots != new.parallel_slots
@@ -2180,7 +2186,7 @@ fn subtract_reserved_from_gpus(mut gpus: Vec<GpuInfo>, mut reserved: u64) -> Vec
 /// (or a single backend inferred from a legacy preset). Falls back to Vulkan —
 /// the historical implicit backend — for models with no preset at all.
 fn resolve_targets(model: &ModelConfig, presets: &HashMap<String, BinaryPreset>) -> Vec<Backend> {
-    if model.cpu_only && model.weights_format == WeightsFormat::Gguf {
+    if model.media_independent() {
         return Vec::new();
     }
     model
@@ -2235,6 +2241,9 @@ fn place_model(
     reserved: u64,
     caps: (f64, f64),
 ) -> Result<PlaceOutcome, crate::vram::llama_fit::LlamaFitError> {
+    model
+        .validate_placement()
+        .map_err(|error| crate::vram::llama_fit::LlamaFitError::Parse(error.to_string()))?;
     if model.cpu_only && model.weights_format == WeightsFormat::Gguf {
         model.device = Some("none".into());
         model.n_gpu_layers = Some(0);
@@ -2243,6 +2252,26 @@ fn place_model(
         model.fit_target = None;
         model.tensor_split = None;
         model.main_gpu = None;
+        model.estimated_vram = 0;
+        return Ok(PlaceOutcome::Fits);
+    }
+    if model.igpu_only {
+        let gpu = gpus
+            .iter()
+            .find(|gpu| gpu.integrated && gpu.supports(Backend::Vulkan))
+            .ok_or_else(|| {
+                crate::vram::llama_fit::LlamaFitError::Parse(
+                    "no integrated Vulkan GPU is available".into(),
+                )
+            })?;
+        model.device = gpu.vulkan_index.map(|index| format!("Vulkan{index}"));
+        model.n_gpu_layers = Some(99);
+        model.n_cpu_moe = None;
+        model.override_tensor = None;
+        model.fit_target = None;
+        model.tensor_split = None;
+        model.main_gpu = None;
+        // An iGPU uses system memory, not the discrete GPU's VRAM budget.
         model.estimated_vram = 0;
         return Ok(PlaceOutcome::Fits);
     }

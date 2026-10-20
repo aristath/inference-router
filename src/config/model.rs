@@ -304,6 +304,9 @@ pub struct ModelConfig {
     /// Run GGUF target, draft and projector on CPU without GPU admission or fit.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cpu_only: bool,
+    /// Use only an integrated Vulkan GPU, independently of discrete-GPU media.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub igpu_only: bool,
     #[serde(skip)]
     pub n_gpu_layers: Option<u32>,
     /// Legacy/internal only. Manual MoE expert placement is not accepted from
@@ -452,6 +455,7 @@ impl Default for ModelConfig {
             repeat_penalty: default_repeat_penalty(),
             flash_attn: false,
             cpu_only: false,
+            igpu_only: false,
             n_gpu_layers: None,
             n_cpu_moe: None,
             override_tensor: None,
@@ -493,6 +497,8 @@ impl Default for ModelConfig {
 pub enum ConfigError {
     #[error("model id cannot be empty")]
     EmptyModelId,
+    #[error("invalid model placement: {0}")]
+    InvalidPlacement(String),
     #[error("model references draft '{id}', but no model with that id exists")]
     DraftNotFound { id: String },
     #[error("model cannot reference itself as a draft")]
@@ -523,6 +529,58 @@ fn saturating_sum_bytes(lengths: impl IntoIterator<Item = u64>) -> u64 {
 }
 
 impl ModelConfig {
+    pub fn media_independent(&self) -> bool {
+        self.weights_format == WeightsFormat::Gguf && (self.cpu_only || self.igpu_only)
+    }
+
+    pub fn validate_placement(&self) -> Result<(), ConfigError> {
+        if self.igpu_only {
+            if self.cpu_only || self.weights_format != WeightsFormat::Gguf {
+                return Err(ConfigError::InvalidPlacement(
+                    "iGPU-only requires GGUF and cannot also be CPU-only".into(),
+                ));
+            }
+            if self.draft_model_id.is_some() || self.mtp_tokens.unwrap_or(0) > 0 {
+                return Err(ConfigError::InvalidPlacement(
+                    "iGPU-only does not support speculative decoding".into(),
+                ));
+            }
+            let placement_flags = [
+                "--device",
+                "-dev",
+                "--gpu-layers",
+                "--n-gpu-layers",
+                "-ngl",
+                "--split-mode",
+                "-sm",
+                "--main-gpu",
+                "-mg",
+                "--tensor-split",
+                "-ts",
+                "--override-tensor",
+                "-ot",
+                "--cpu-moe",
+                "--n-cpu-moe",
+                "--spec-draft-device",
+                "-devd",
+                "--spec-draft-ngl",
+                "-ngld",
+                "--gpu-layers-draft",
+                "--n-gpu-layers-draft",
+            ];
+            if self
+                .extra_args
+                .iter()
+                .any(|arg| placement_flags.contains(&arg.split('=').next().unwrap_or("")))
+            {
+                return Err(ConfigError::InvalidPlacement(
+                    "iGPU-only placement is router-owned; remove raw GPU placement flags".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// On-disk model size in bytes for UI ordering/labels. GGUF prefers the
     /// stored metadata snapshot and falls back to reading the file headers;
     /// safetensors sums regular files in the configured model directory.

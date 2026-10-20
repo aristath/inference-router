@@ -134,6 +134,9 @@ pub async fn validate_model(
     if let Some(path) = binary {
         validate_binary_path(path, &mut errors);
     }
+    if let Err(error) = model.validate_placement() {
+        errors.push(error.to_string());
+    }
     validate_model_path(&model, &mut errors);
     validate_context(&model, &mut warnings);
     validate_cache_quantization(&model, &mut warnings);
@@ -349,9 +352,9 @@ pub async fn load_model(
             Json(serde_json::json!({"ok": true, "port": guard.port})),
         )
             .into_response(),
-        Err(LoadError::CpuOnlyRequired(id)) => (
+        Err(LoadError::IndependentModelRequired(id)) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error":format!("model '{id}' is not CPU-only")})),
+            Json(serde_json::json!({"error":format!("model '{id}' is not CPU-only or iGPU-only")})),
         )
             .into_response(),
         Err(LoadError::MediaRecoveryFailed(error)) => (

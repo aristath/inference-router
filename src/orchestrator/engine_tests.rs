@@ -1355,3 +1355,59 @@ async fn fallback_validation_inheritance_rename_delete_and_model_changes() {
         None
     );
 }
+
+#[test]
+fn igpu_placement_uses_only_integrated_vulkan_and_never_the_discrete_budget() {
+    let discrete = gpu("discrete", "0000:01:00.0", 0);
+    let mut integrated = gpu("integrated", "0000:0c:00.0", 3);
+    integrated.integrated = true;
+    integrated.total_vram = 512 * 1024 * 1024;
+    let mut m = model("igpu");
+    m.igpu_only = true;
+    m.context = 262144;
+    m.estimated_vram = 20 * 1024 * 1024 * 1024;
+    assert!(resolve_targets(&m, &HashMap::new()).is_empty());
+    let result = place_model(
+        &mut m,
+        None,
+        &[],
+        &[discrete.clone(), integrated],
+        u64::MAX,
+        (0.0, 0.0),
+    )
+    .unwrap();
+    assert!(matches!(result, PlaceOutcome::Fits));
+    assert_eq!(m.device.as_deref(), Some("Vulkan3"));
+    assert_eq!(m.n_gpu_layers, Some(99));
+    assert_eq!(m.estimated_vram, 0);
+    assert_eq!(m.context, 262144);
+    assert!(place_model(&mut m, None, &[], &[discrete], 0, (99.0, 99.0)).is_err());
+}
+
+#[tokio::test]
+async fn igpu_models_are_valid_fallbacks_and_edits_remove_independent_routing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let o = orch(&tmp);
+    o.add_model(model("main")).await.unwrap();
+    let mut igpu = model("igpu");
+    igpu.igpu_only = true;
+    o.add_model(igpu.clone()).await.unwrap();
+    o.add_alias(alias("fast", "igpu")).await.unwrap();
+    let mut default = alias("default", "main");
+    default.fallback = Some("fast".into());
+    o.add_alias(default).await.unwrap();
+    assert_eq!(
+        o.inference_target("default", true).await,
+        ("igpu".into(), true)
+    );
+    assert_eq!(
+        o.inference_target("fast", false).await,
+        ("igpu".into(), true)
+    );
+    igpu.igpu_only = false;
+    o.update_model(igpu).await.unwrap();
+    assert_eq!(
+        o.inference_target("default", true).await,
+        ("main".into(), false)
+    );
+}

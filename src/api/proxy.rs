@@ -108,11 +108,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
-    // Keep ordinary inference admission ahead of body buffering. When CPU
+    // Keep ordinary inference admission ahead of body buffering. When CPU/iGPU
     // routes exist, requests blocked by media must first reveal their model;
     // large queued bodies spill to private files instead of accumulating RAM.
     let mut permit = state.gpu_gate.try_inference();
-    if permit.is_none() && !state.has_cpu_models().await {
+    if permit.is_none() && !state.has_independent_models().await {
         permit = match state.gpu_gate.inference().await {
             Ok(p) => Some(p),
             Err(error) => {
@@ -157,7 +157,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
 
     // Resolve aliases to their target model. Non-alias names pass through
     // unchanged.
-    let (model_id, cpu) = state
+    let (model_id, independent) = state
         .inference_target(&requested_model, permit.is_none())
         .await;
 
@@ -175,9 +175,9 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
-    let loaded = if cpu {
+    let loaded = if independent {
         drop(permit.take());
-        state.clone().ensure_loaded_cpu(&model_id).await
+        state.clone().ensure_loaded_independent(&model_id).await
     } else {
         if permit.is_none() {
             permit = match state.gpu_gate.inference().await {

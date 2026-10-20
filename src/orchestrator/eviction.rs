@@ -8,7 +8,10 @@ use tracing::debug;
 /// deficit. Safetensors models (no GGUF metadata) are the realistic
 /// offenders here.
 fn is_evictable(m: &ModelConfig, idle_models: &HashSet<String>) -> bool {
-    m.state == ModelState::Running && m.estimated_vram > 0 && idle_models.contains(&m.id)
+    !m.media_independent()
+        && m.state == ModelState::Running
+        && m.estimated_vram > 0
+        && idle_models.contains(&m.id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

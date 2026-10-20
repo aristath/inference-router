@@ -25,6 +25,8 @@ pub struct InstanceInfo {
     /// recycle it). Recorded at spawn from the resolved placement, which is the
     /// only reliable source — the persisted `ModelConfig.device` is `serde(skip)`.
     pub uses_gpu: bool,
+    /// This instance is isolated from the discrete GPU used by media.
+    pub media_independent: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -125,6 +127,7 @@ pub struct PendingChild {
     pub port: u16,
     model_id: String,
     uses_gpu: bool,
+    media_independent: bool,
     child: tokio::process::Child,
     kv_bytes_rx: tokio::sync::oneshot::Receiver<u64>,
     cancel_rx: watch::Receiver<bool>,
@@ -136,6 +139,20 @@ impl ProcessManager {
         model: &ModelConfig,
         draft: Option<&ModelConfig>,
     ) -> Result<PendingChild, SpawnError> {
+        model
+            .validate_placement()
+            .map_err(|error| SpawnError::InvalidPlacement(error.to_string()))?;
+        if model.igpu_only
+            && !model.device.as_deref().is_some_and(|device| {
+                device
+                    .strip_prefix("Vulkan")
+                    .is_some_and(|index| index.parse::<usize>().is_ok())
+            })
+        {
+            return Err(SpawnError::InvalidPlacement(
+                "iGPU model has no resolved integrated Vulkan device".into(),
+            ));
+        }
         let port = find_free_port(&self.reserved_ports, self.backend_port_range)
             .ok_or(SpawnError::NoFreePort)?;
         self.reserved_ports.insert(port);
@@ -196,6 +213,7 @@ impl ProcessManager {
             port,
             model_id: model.id.clone(),
             uses_gpu,
+            media_independent: model.media_independent(),
             child,
             kv_bytes_rx: kv_rx,
             cancel_rx,
@@ -228,6 +246,7 @@ impl ProcessManager {
                 port,
                 active: active.clone(),
                 uses_gpu: pending.uses_gpu,
+                media_independent: pending.media_independent,
             });
         self.running.insert(
             pending.pid,
@@ -374,6 +393,19 @@ impl ProcessManager {
         out
     }
 
+    /// Discrete/shared GPU instances that must drain before a media handoff.
+    pub fn media_gpu_instances(&self) -> Vec<(String, i32)> {
+        self.instances
+            .iter()
+            .flat_map(|(id, instances)| {
+                instances
+                    .iter()
+                    .filter(|instance| instance.uses_gpu && !instance.media_independent)
+                    .map(|instance| (id.clone(), instance.pid))
+            })
+            .collect()
+    }
+
     /// `(model_id, pid, port)` for every idle live instance. Used by the
     /// background liveness probe; active requests rely on the proxy idle-timeout
     /// path so the probe does not interrupt legitimate long generations.
@@ -503,6 +535,7 @@ impl ProcessManager {
                 port,
                 active,
                 uses_gpu: false,
+                media_independent: false,
             });
     }
 
@@ -710,6 +743,34 @@ pub fn build_command_args(
                 "--fit",
                 "off",
                 "--no-op-offload",
+                "--spec-draft-device",
+                "none",
+                "--spec-draft-ngl",
+                "0",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        if model.mmproj_path.is_some() {
+            args.push("--no-mmproj-offload".into());
+        }
+    }
+    if model.igpu_only && model.weights_format == WeightsFormat::Gguf {
+        // Final placement flags cannot redirect this independent worker to the media GPU.
+        args.extend(
+            [
+                "--device",
+                model.device.as_deref().unwrap_or("none"),
+                "--gpu-layers",
+                "99",
+                "--fit",
+                "off",
+                "--split-mode",
+                "none",
+                "--main-gpu",
+                "0",
+                "--tensor-split",
+                "1",
                 "--spec-draft-device",
                 "none",
                 "--spec-draft-ngl",
@@ -971,6 +1032,8 @@ fn kill_process_group(pid: i32, sig: nix::sys::signal::Signal) -> nix::Result<()
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
+    #[error("invalid placement: {0}")]
+    InvalidPlacement(String),
     #[error("failed to spawn '{}': {}", .1.display(), .0)]
     SpawnFailed(std::io::Error, PathBuf),
 

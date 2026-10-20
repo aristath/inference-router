@@ -1,0 +1,8 @@
+{
+  "id": "llama-vulkan-igpu",
+  "name": "llama.cpp (integrated Vulkan GPU)",
+  "binary": "/var/home/aristath/llama.cpp-vulkan/build/bin/llama-server",
+  "targets": [
+    "vulkan"
+  ]
+}

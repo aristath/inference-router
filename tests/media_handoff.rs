@@ -158,6 +158,60 @@ print(json.dumps({{'image':'saved.png'}}),flush=True)
             server,
         }
     }
+    async fn igpu_fallback(&self) -> i32 {
+        let mut model = self.state.data.lock().await.models["fake"].clone();
+        model.id = "igpu".into();
+        model.weights_format = WeightsFormat::Gguf;
+        model.igpu_only = true;
+        model.state = ModelState::Idle;
+        model.pid = None;
+        model.device = Some("Vulkan3".into());
+        model.n_gpu_layers = Some(99);
+        self.state.add_model(model.clone()).await.unwrap();
+        let mut pending = self
+            .state
+            .process_manager
+            .lock()
+            .await
+            .spawn_child(&model, None)
+            .unwrap();
+        pending
+            .wait_for_health(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let pid = pending.pid;
+        drop(
+            self.state
+                .process_manager
+                .lock()
+                .await
+                .register(pending)
+                .unwrap_or_else(|_| panic!("register failed")),
+        );
+        {
+            let mut data = self.state.data.lock().await;
+            let model = data.models.get_mut("igpu").unwrap();
+            model.state = ModelState::Running;
+            model.pid = Some(pid);
+        }
+        self.state
+            .add_alias(ModelAlias {
+                alias: "fast".into(),
+                target: "igpu".into(),
+                fallback: None,
+            })
+            .await
+            .unwrap();
+        self.state
+            .add_alias(ModelAlias {
+                alias: "default".into(),
+                target: "fake".into(),
+                fallback: Some("fast".into()),
+            })
+            .await
+            .unwrap();
+        pid
+    }
     async fn fallback(&self) {
         let mut cpu = self.state.data.lock().await.models["fake"].clone();
         cpu.id = "cpu".into();
@@ -863,5 +917,73 @@ async fn fallback_remains_usable_during_restore_and_after_gpu_recovery_failure()
             .unwrap()
             .status(),
         503
+    );
+}
+
+#[tokio::test]
+async fn igpu_fallback_keeps_serving_on_the_same_process_through_media_and_restoration() {
+    let f = Fixture::new(30).await;
+    let pid = f.igpu_fallback().await;
+    assert!(f
+        .state
+        .process_manager
+        .lock()
+        .await
+        .gpu_instances()
+        .contains(&("igpu".into(), pid)));
+    let media = tokio::spawn(f.media(json!({})).send());
+    f.wait("media-started").await;
+    let response = timeout(
+        Duration::from_secs(3),
+        f.request_model("default", false).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.json::<Value>().await.unwrap()["model"], "igpu");
+    assert!(!media.is_finished());
+    assert_eq!(f.state.gpu_gate.snapshot().queued_inference, 0);
+    assert!(f
+        .state
+        .process_manager
+        .lock()
+        .await
+        .gpu_instances()
+        .contains(&("igpu".into(), pid)));
+    assert!(!f
+        .state
+        .process_manager
+        .lock()
+        .await
+        .media_gpu_instances()
+        .contains(&("igpu".into(), pid)));
+    f.mark("finish-media");
+    assert!(media.await.unwrap().unwrap().status().is_success());
+    assert!(f
+        .state
+        .process_manager
+        .lock()
+        .await
+        .gpu_instances()
+        .contains(&("igpu".into(), pid)));
+    assert_eq!(
+        f.request_model("default", false)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["model"],
+        "fake"
+    );
+    assert_eq!(
+        f.request_model("fast", false)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["model"],
+        "igpu"
     );
 }

@@ -76,6 +76,7 @@ State files under `~/.config/inference-router/`:
   - `binary`, `model_path`, `port`, `context`: mandatory.
   - `weights_format`: `gguf` (llama.cpp argv style) or `safetensors` (vLLM style).
   - `cpu_only: true` runs a GGUF model entirely on CPU, including draft/MTP and projector, without GPU admission or fit probing. Use a CPU-capable binary preset; normal GPU placement is unchanged when omitted.
+  - `igpu_only: true` runs a GGUF model fully on an integrated Vulkan GPU without the discrete-GPU media gate. It fails if no integrated Vulkan GPU exists; it never falls back to a discrete GPU. CPU-only and iGPU-only are mutually exclusive. Draft/MTP and raw GPU-placement overrides are not supported in iGPU-only mode.
   - llama.cpp knobs: `flash_attn`, `n_gpu_layers`, `mlock`, `no_mmap`, `parallel_slots`, `cache_type_{k,v}`, `split_mode` (`none | layer | row | tensor`), `main_gpu`, `tensor_split`.
   - Speculative decoding: `mtp_tokens` for embedded MTP heads, or `draft_model_id` plus `draft_{max,min,p_min}` for an external draft model.
   - `extra_args`: arbitrary argv array — escape hatch for flags not modelled.
@@ -423,7 +424,7 @@ Clara. Its initial `qwen3.5-2b-mtp` target uses the B60/SYCL preset, native 2621
 context, one slot, F16 KV, `mtp_tokens: 3`, `threads: 4`, flash attention,
 `request_idle_timeout_secs: 0`, and default `enable_thinking: false`.
 
-Clara's CPU fallback now uses the [CPU SLM profile](examples/clara-cpu-slm.json):
+The [CPU SLM profile](examples/clara-cpu-slm.json) uses:
 Gemma4 26B-A4B **IQ2_M weights**, a **262144-token context**, and **Q4_0 K/V
 caches**, with one CPU-only slot. The legacy model ID ending in `cpu-32k` is
 retained so existing `fast`/`slm` aliases and clients keep working; its display
@@ -445,10 +446,28 @@ request reloads it; Core and inference-router do not need restarting. Verify
 the managed process has `-c 262144 --cache-type-k q4_0 --cache-type-v q4_0`
 and that its `/slots` reports `n_ctx: 262144`.
 
+### Clara iGPU fallback
+
+Clara's active fallback uses [this iGPU profile](examples/clara-igpu-slm.json)
+and [Vulkan preset](examples/clara-igpu-preset.json). It preserves the IQ2_M
+weights, 262144-token context, Q4_0 K/V cache and legacy model ID; `fast`, `slm`
+and the default alias's fallback keep their existing targets. All model layers
+use the integrated GPU and shared system RAM, outside the RTX 3090's VRAM budget.
+The CPU profile above remains available for rollback.
+
+Install the preset with `POST /api/presets`, then apply the iGPU model profile
+with `PUT /api/models/gemma4-26b-a4b-iq2m-cpu-32k` when the model is idle.
+The Hardware tab's **Compute placement** selector exposes automatic, CPU-only
+and integrated-GPU-only modes. The alias fallback selector accepts either
+independent mode. The router selects the integrated Vulkan device from the
+current inventory, enforces its placement flags, and leaves its processes
+running during discrete-GPU media unload/restoration. GPU reset recovery still
+tracks the iGPU process.
+
 ### Alias fallback during media
 
 The alias editor has an optional **Fallback during media generation** selector.
-Choose a CPU-only GGUF model or an alias such as `fast` that resolves to one:
+Choose a CPU-only or iGPU-only GGUF model, or an alias such as `fast` that resolves to one:
 
 ```json
 {"alias":"default","target":"qwen3.8-27b","fallback":"fast"}
@@ -457,9 +476,9 @@ Choose a CPU-only GGUF model or an alias such as `fast` that resolves to one:
 New requests use the primary model while GPU admission is available. During
 media draining, generation, resident restoration, or a GPU recovery fault, they
 use the fallback instead. Aliases pointing at this alias inherit its fallback
-unless they set their own. Direct CPU requests also run independently of media.
+unless they set their own. Direct CPU/iGPU requests also run independently of media.
 GPU requests with no usable fallback keep the existing queue/recovery behavior.
-An edited or unassigned fallback that no longer resolves to a CPU-only model is
+An edited or unassigned fallback that no longer resolves to a CPU-only or iGPU-only model is
 never allowed to load on the reserved GPU.
 
 The entire request is forwarded unchanged except for its resolved `model` field;
