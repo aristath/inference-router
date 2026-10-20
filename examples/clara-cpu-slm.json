@@ -1,0 +1,29 @@
+{
+  "id": "gemma4-26b-a4b-iq2m-cpu-32k",
+  "name": "Gemma4 26B A4B IQ2_M CPU 256K (Q4 KV)",
+  "binary_preset": "llama-cpu",
+  "model_path": "/var/home/aristath/models/gemma-4-26b-a4b-iq2m/gemma-4-26B-A4B-it-UD-IQ2_M.gguf",
+  "context": 262144,
+  "cpu_only": true,
+  "cache_type_k": "q4_0",
+  "cache_type_v": "q4_0",
+  "flash_attn": true,
+  "parallel_slots": 1,
+  "split_mode": "none",
+  "threads": 6,
+  "cache_ram_mib": 0,
+  "mtp_tokens": 0,
+  "temperature": 0.0,
+  "request_idle_timeout_secs": 0,
+  "chat_template_kwargs": "{\"enable_thinking\":false}",
+  "extra_args": [
+    "--alias", "gemma4-26b-a4b-iq2m-cpu-32k",
+    "--batch-size", "512",
+    "--ubatch-size", "256",
+    "--threads-batch", "6",
+    "--no-context-shift",
+    "--no-warmup",
+    "--perf",
+    "--load-mode", "mmap"
+  ]
+}

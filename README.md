@@ -423,6 +423,28 @@ Clara. Its initial `qwen3.5-2b-mtp` target uses the B60/SYCL preset, native 2621
 context, one slot, F16 KV, `mtp_tokens: 3`, `threads: 4`, flash attention,
 `request_idle_timeout_secs: 0`, and default `enable_thinking: false`.
 
+Clara's CPU fallback now uses the [CPU SLM profile](examples/clara-cpu-slm.json):
+Gemma4 26B-A4B **IQ2_M weights**, a **262144-token context**, and **Q4_0 K/V
+caches**, with one CPU-only slot. The legacy model ID ending in `cpu-32k` is
+retained so existing `fast`/`slm` aliases and clients keep working; its display
+name describes the current 256K configuration. The context budget includes both
+the input and generated output. Q4 here applies to KV cache, not model weights.
+
+After installing the model and `llama-cpu` preset on Clara, apply the profile
+when the model has no active requests:
+
+```sh
+curl --fail-with-body -X PUT \
+  http://127.0.0.1:8080/api/models/gemma4-26b-a4b-iq2m-cpu-32k \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/clara-cpu-slm.json
+```
+
+Updating spawn settings stops the existing instance. The next `fast`/`slm`
+request reloads it; Core and inference-router do not need restarting. Verify
+the managed process has `-c 262144 --cache-type-k q4_0 --cache-type-v q4_0`
+and that its `/slots` reports `n_ctx: 262144`.
+
 ### Alias fallback during media
 
 The alias editor has an optional **Fallback during media generation** selector.
