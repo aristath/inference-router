@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+# Opt this backend into per-request templates without changing model files.
+export EXTRA_ARGS="${EXTRA_ARGS:-} --trust-request-chat-template"
+exec "$HOME/qwen38-27b-rtx3090/router_backend_kvarn.sh" "$@"

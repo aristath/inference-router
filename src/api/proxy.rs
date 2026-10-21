@@ -92,6 +92,15 @@ fn rewrite_model_field(body: &[u8], model_id: &str) -> Result<Vec<u8>, serde_jso
     if let Some(model) = doc.get_mut("model") {
         *model = serde_json::Value::String(model_id.to_owned());
     }
+    // Select only after routing: an alias may have been sent to its fallback.
+    if let Some(overrides) = doc
+        .as_object_mut()
+        .and_then(|o| o.remove("chat_template_overrides"))
+    {
+        if let Some(template) = overrides.get(model_id).and_then(|v| v.as_str()) {
+            doc["chat_template"] = serde_json::Value::String(template.to_owned());
+        }
+    }
     serde_json::to_vec(&doc)
 }
 
@@ -261,7 +270,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
 
-    let routed_body = if requested_model == model_id {
+    let routed_body = if requested_model == model_id
+        && !body_bytes
+            .windows(25)
+            .any(|w| w == b"\"chat_template_overrides\"")
+    {
         body_bytes.to_vec()
     } else {
         match rewrite_model_field(&body_bytes, &model_id) {
@@ -494,6 +507,22 @@ fn proxy_idle_timeout(
 mod idle_timeout_tests {
     use super::proxy_idle_timeout;
     use std::time::Duration;
+    #[test]
+    fn templates_follow_the_resolved_model_including_fallbacks() {
+        let body = br#"{"model":"default","messages":[],"chat_template_overrides":{"gpu":"GPU template","cpu":"CPU template"}}"#;
+        for (target, expected) in [
+            ("gpu", Some("GPU template")),
+            ("cpu", Some("CPU template")),
+            ("other", None),
+        ] {
+            let bytes = super::rewrite_model_field(body, target).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(doc["model"], target);
+            assert_eq!(doc["chat_template"].as_str(), expected);
+            assert!(doc.get("chat_template_overrides").is_none());
+            assert_eq!(doc["messages"], serde_json::json!([]));
+        }
+    }
     #[test]
     fn model_timeout_override_preserves_other_models_and_watchdogs() {
         assert_eq!(

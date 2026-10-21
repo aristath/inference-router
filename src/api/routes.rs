@@ -90,6 +90,61 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.settings().await)
 }
 
+/// Read the registered model's template without loading or editing its weights directory.
+pub async fn model_chat_template(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(model) = state.list_models().await.into_iter().find(|m| m.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"Unknown model"})),
+        )
+            .into_response();
+    };
+    let supported = model.weights_format == WeightsFormat::Safetensors;
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+        if !supported {
+            return GgufMeta::read(&model.model_path)
+                .map(|m| m.chat_template)
+                .map_err(|e| e.to_string());
+        }
+        let path = model.model_path.join("chat_template.jinja");
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let text = std::fs::read_to_string(model.model_path.join("tokenizer_config.json"))
+                    .map_err(|e| e.to_string())?;
+                let config: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                let template = &config["chat_template"];
+                Ok(template
+                    .as_str()
+                    .or_else(|| {
+                        template
+                            .as_array()?
+                            .iter()
+                            .find(|t| t["name"] == "default")?["template"]
+                            .as_str()
+                    })
+                    .map(str::to_owned))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(template)) => {
+            Json(serde_json::json!({"template":template,"supported":supported})).into_response()
+        }
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":format!("Could not read model template: {other:?}")})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn update_settings(
     State(state): State<AppState>,
     Json(settings): Json<AppSettings>,

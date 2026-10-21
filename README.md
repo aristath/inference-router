@@ -1,5 +1,15 @@
 # inference-router
 
+Per-request vLLM template overrides may be supplied as `chat_template_overrides`,
+an object keyed by concrete model ID. The proxy selects the resolved model's entry
+after alias/fallback routing, forwards it as `chat_template`, and removes the map.
+No match leaves normal backend formatting in place. GET
+`/api/models/{id}/chat-template` reads the registered model's template without
+loading or modifying it; `/tokenize` and `/detokenize` proxy token-only previews.
+vLLM must enable `--trust-request-chat-template`. The Clara host's optional
+`scripts/clara-vllm-request-templates` launcher adds this flag through `EXTRA_ARGS`
+while retaining the existing Qwen runtime launcher and model files.
+
 A VRAM-aware, OpenAI-compatible HTTP proxy for [llama.cpp](https://github.com/ggerganov/llama.cpp) (and vLLM-style safetensors backends). Runs one backend process per loaded model, routes `/v1/*` requests to the right process by the `model` field in the JSON body, and evicts models under VRAM pressure.
 
 Built for a single-user, localhost, multi-GPU AMD workstation (3x Radeon AI PRO R9700). No auth, no rate limiting, no multi-tenant isolation.

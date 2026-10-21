@@ -217,6 +217,7 @@ pub fn build_router(app_state: AppState) -> axum::Router {
         .route("/api/models/reconcile", post(reconcile_models_folder))
         .route("/api/models/validate", post(validate_model))
         .route("/api/models/{id}", put(update_model).delete(delete_model))
+        .route("/api/models/{id}/chat-template", get(model_chat_template))
         .route("/api/models/{id}/load", post(load_model))
         .route("/api/models/{id}/stop", post(stop_model))
         .route(
@@ -240,6 +241,8 @@ pub fn build_router(app_state: AppState) -> axum::Router {
         // OpenAI-compatible surface
         .route("/v1/models", get(proxy::list_v1_models))
         .route("/v1/{*rest}", any(proxy::proxy_handler))
+        .route("/tokenize", post(proxy::proxy_handler))
+        .route("/detokenize", post(proxy::proxy_handler))
         // Liveness
         .route("/healthz", get(proxy::healthz))
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))

@@ -454,6 +454,52 @@ async fn proxy_forwards_json_body_identically() {
 }
 
 #[tokio::test]
+async fn template_map_is_selected_even_without_an_alias_and_never_leaks_upstream() {
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(|body: Json<serde_json::Value>| async move { body }),
+    );
+    let upstream = start_proxy_server(app).await;
+    let proxy = start_proxy_server(build_proxy_app(upstream).await).await;
+    let result: serde_json::Value = reqwest::Client::new().post(format!("http://127.0.0.1:{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"fake","messages":[],"chat_template_overrides":{"fake":"selected", "other":"wrong"}}))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(result["chat_template"], "selected");
+    assert!(result.get("chat_template_overrides").is_none());
+}
+
+#[tokio::test]
+async fn original_template_can_be_read_without_loading_or_modifying_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("chat_template.jinja");
+    std::fs::write(&file, "original Jinja").unwrap();
+    let state = build_proxy_orchestrator(1).await;
+    state
+        .add_model(ModelConfig {
+            id: "template-model".into(),
+            name: "Template model".into(),
+            model_path: dir.path().to_owned(),
+            weights_format: WeightsFormat::Safetensors,
+            ..ModelConfig::default()
+        })
+        .await
+        .unwrap();
+    let port = start_proxy_server(inference_router::lifecycle::build_router(state.clone())).await;
+    let url = format!("http://127.0.0.1:{port}/api/models/template-model/chat-template");
+    let result: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+    assert_eq!(result["template"], "original Jinja");
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "original Jinja");
+    assert!(state
+        .list_models()
+        .await
+        .iter()
+        .find(|m| m.id == "template-model")
+        .unwrap()
+        .pid
+        .is_none());
+}
+
+#[tokio::test]
 async fn proxy_forwards_sse_bytes_identically() {
     let upstream = spawn_fake_llama().await;
     let app = build_proxy_app(upstream).await;
