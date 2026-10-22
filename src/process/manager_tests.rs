@@ -87,6 +87,8 @@ fn gguf_argv_shape() {
             "0.95",
             "--top-k",
             "40",
+            "--min-p",
+            "0",
             "--presence-penalty",
             "0",
             "--repeat-penalty",
@@ -106,9 +108,9 @@ fn gguf_argv_includes_min_p_when_positive() {
 }
 
 #[test]
-fn gguf_argv_omits_min_p_when_zero() {
+fn gguf_argv_explicitly_disables_min_p_when_zero() {
     let args = build_command_args(&gguf_model(), None, 9001);
-    assert!(!args.iter().any(|a| a == "--min-p"));
+    assert!(args.windows(2).any(|w| w == ["--min-p", "0"]));
 }
 
 #[test]

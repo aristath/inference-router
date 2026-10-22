@@ -582,10 +582,8 @@ pub fn build_command_args(
             args.push(model.top_p.to_string());
             args.push("--top-k".into());
             args.push(model.top_k.to_string());
-            if model.min_p > 0.0 {
-                args.push("--min-p".into());
-                args.push(model.min_p.to_string());
-            }
+            args.push("--min-p".into());
+            args.push(model.min_p.to_string());
             args.push("--presence-penalty".into());
             args.push(model.presence_penalty.to_string());
             args.push("--repeat-penalty".into());
