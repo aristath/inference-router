@@ -119,9 +119,11 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         ticker.tick().await;
         reconcile_orch.reconcile().await;
+        reconcile_orch.maintain_replica_pools().await;
         loop {
             ticker.tick().await;
             reconcile_orch.reconcile().await;
+            reconcile_orch.maintain_replica_pools().await;
         }
     });
 

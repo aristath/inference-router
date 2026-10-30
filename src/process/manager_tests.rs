@@ -624,6 +624,43 @@ fn acquire_any_instance_picks_idle_then_least_busy() {
 }
 
 #[test]
+fn prefix_affinity_survives_idle_turns_but_yields_to_load_and_dead_instances() {
+    let mut pm = ProcessManager::default();
+    pm.register_existing_instance("m", 123, 9001);
+    pm.register_existing_instance("m", 124, 9002);
+    let first = pm.acquire_affine_instance("m", &[7]).unwrap();
+    assert_eq!(first.port, 9001);
+    let other = pm.acquire_affine_instance("m", &[8]).unwrap();
+    assert_eq!(other.port, 9002);
+    drop((first, other));
+    assert_eq!(pm.acquire_affine_instance("m", &[8]).unwrap().port, 9002);
+    let busy = pm.acquire_affine_instance("m", &[8]).unwrap();
+    assert_eq!(pm.acquire_affine_instance("m", &[8]).unwrap().port, 9001);
+    drop(busy);
+    pm.remove_instance("m", 123);
+    assert_eq!(pm.acquire_affine_instance("m", &[8]).unwrap().port, 9002);
+}
+
+#[test]
+fn shared_goal_prefix_does_not_override_each_agents_longer_history() {
+    let mut pm = ProcessManager::default();
+    pm.register_existing_instance("m", 123, 9001);
+    pm.register_existing_instance("m", 124, 9002);
+    let first = pm.acquire_affine_instance("m", &[7, 70]).unwrap();
+    let second = pm.acquire_affine_instance("m", &[7, 80]).unwrap();
+    assert_eq!((first.port, second.port), (9001, 9002));
+    drop((first, second));
+    assert_eq!(
+        pm.acquire_affine_instance("m", &[7, 70, 700]).unwrap().port,
+        9001
+    );
+    assert_eq!(
+        pm.acquire_affine_instance("m", &[7, 80, 800]).unwrap().port,
+        9002
+    );
+}
+
+#[test]
 fn idle_instances_excludes_active_requests() {
     let mut pm = ProcessManager::default();
     pm.register_existing_instance("m", 123, 9001);
@@ -835,6 +872,7 @@ fn igpu_instances_are_tracked_for_resets_but_excluded_from_media_draining() {
                 pid,
                 port: 1234,
                 active: Arc::new(AtomicUsize::new(0)),
+                background: Arc::new(AtomicUsize::new(0)),
                 uses_gpu,
                 media_independent: independent,
             }],
@@ -868,4 +906,20 @@ fn igpu_argv_enforces_the_resolved_device_and_requires_placement() {
         ProcessManager::default().spawn_child(&m, None),
         Err(SpawnError::InvalidPlacement(_))
     ));
+}
+
+#[test]
+fn background_metrics_keep_ownership_without_displacing_prefix_affinity() {
+    let mut pm = ProcessManager::default();
+    pm.register_existing_instance("m", 123, 9001);
+    pm.register_existing_instance("m", 124, 9002);
+    let request = pm.acquire_affine_instance("m", &[7]).unwrap();
+    let metrics = request.retain();
+    drop(request);
+    assert!(
+        pm.has_active_requests(),
+        "background collection still protects ownership"
+    );
+    assert_eq!(pm.acquire_affine_instance("m", &[7]).unwrap().port, 9001);
+    drop(metrics);
 }

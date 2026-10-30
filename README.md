@@ -76,6 +76,21 @@ The port is `8080`, hardcoded in `AppConfig::default()` (see `src/lifecycle.rs`)
 
 ## Configuration
 
+For a persistent replica pool, add `"replica_pools": {"MODEL_ID": 2}` to
+`settings.json`. The existing instance cap still applies. The reconcile loop
+starts missing replicas in the background while healthy instances continue
+serving requests. Launchers must lease disjoint GPU sets and use distinct
+container names; the Qwen host launcher reads these from
+`/home/aristath/vllm-r9700/qwen38-replicas.json`.
+
+Pool requests prefer the least-busy replica, retaining conversation affinity
+when loads tie so the backend can reuse its prefix cache. The affinity key uses
+`prompt_cache_key`, session affinity headers, or bounded hashes of increasingly
+specific conversation prefixes, and never stores prompt text. A transport failure before response headers gets one attempt on a
+surviving replica. A response that has already started is not replayed on another
+replica; interrupted streams must be retried by the client. Dead processes are
+removed and their replacements warmed automatically.
+
 State files under `~/.config/inference-router/`:
 
 - **`presets.json`** — named binary paths. Lets you rebuild llama.cpp once and have every model pick up the new binary.

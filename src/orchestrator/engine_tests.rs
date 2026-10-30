@@ -39,6 +39,58 @@ fn default_instance_cap_is_vram_limited() {
     assert_eq!(DEFAULT_MAX_INSTANCES_PER_MODEL, usize::MAX);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn warm_pool_replaces_a_dead_child_while_survivor_serves_without_waiting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = tmp.path().join("backend.py");
+    fs::write(&binary, "#!/usr/bin/python3\nimport argparse,http.server\np=argparse.ArgumentParser();p.add_argument('--port',type=int);a,_=p.parse_known_args()\nclass H(http.server.BaseHTTPRequestHandler):\n def do_GET(self):\n  self.send_response(200);self.end_headers();self.wfile.write(b'{}')\n def log_message(self,*a):pass\nhttp.server.HTTPServer(('127.0.0.1',a.port),H).serve_forever()\n").unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let o = orch(&tmp);
+    let mut m = model("warm");
+    m.binary = binary;
+    m.cpu_only = true;
+    m.weights_format = WeightsFormat::Safetensors;
+    o.add_model(m).await.unwrap();
+    o.settings
+        .lock()
+        .await
+        .replica_pools
+        .insert("warm".into(), 2);
+    for desired in [1, 2] {
+        o.maintain_replica_pools().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while o.process_manager.lock().await.instance_count("warm") < desired {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let before = o.process_manager.lock().await.pids_for_model("warm");
+    o.recycle_instance(before[0], "test failure").await;
+    let survivor = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        o.clone().ensure_loaded("warm"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(survivor.pid, before[1]);
+    drop(survivor);
+    o.maintain_replica_pools().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while o.process_manager.lock().await.instance_count("warm") < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let after = o.process_manager.lock().await.pids_for_model("warm");
+    assert!(after.contains(&before[1]));
+    assert!(!after.contains(&before[0]));
+}
+
 fn gpu(id: &str, pci: &str, vulkan_index: usize) -> GpuInfo {
     let mut tags = std::collections::BTreeSet::new();
     tags.insert(Backend::Vulkan);

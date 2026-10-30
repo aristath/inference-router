@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
+    /// Model ids whose healthy replica pools are maintained in the background.
+    pub replica_pools: std::collections::HashMap<String, usize>,
     /// Folder scanned by the dashboard model-discovery action.
     pub models_folder: String,
     /// Loop guard configuration for both streaming and tool loops
@@ -27,6 +29,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            replica_pools: std::collections::HashMap::new(),
             models_folder: default_models_folder(),
             loop_guards: LoopGuardSettings::default(),
             model_exposure: ModelExposure::default(),
@@ -40,6 +43,7 @@ impl Default for AppSettings {
 impl AppSettings {
     pub fn from_env() -> Self {
         Self {
+            replica_pools: std::collections::HashMap::new(),
             models_folder: std::env::var("INFERENCE_ROUTER_MODELS_FOLDER")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
@@ -54,6 +58,11 @@ impl AppSettings {
     }
 
     pub fn sanitized(mut self) -> Self {
+        self.replica_pools
+            .retain(|id, count| !id.is_empty() && *count > 0);
+        for count in self.replica_pools.values_mut() {
+            *count = (*count).min(8);
+        }
         if self.models_folder.trim().is_empty() {
             self.models_folder = default_models_folder();
         }

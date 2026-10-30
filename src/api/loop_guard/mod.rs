@@ -187,9 +187,34 @@ impl StreamSession {
         }
     }
 
-    pub(super) async fn into_response(mut self, guard: RequestGuard) -> Response {
+    pub(super) async fn into_response(mut self, mut guard: RequestGuard) -> Response {
+        let mut initial = self.send_upstream().await;
+        if initial
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.is_connect() || e.is_timeout())
+            && self
+                .state
+                .settings()
+                .await
+                .replica_pools
+                .contains_key(&self.model_id)
+        {
+            let Some(next) = self.state.failover_request(&self.model_id, guard).await else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({"error":"no healthy replica is available", "retry":true})),
+                )
+                    .into_response();
+            };
+            guard = next;
+            let mut url = reqwest::Url::parse(&self.upstream_url).expect("router upstream URL");
+            url.set_port(Some(guard.port)).expect("local upstream port");
+            self.upstream_url = url.to_string();
+            initial = self.send_upstream().await;
+        }
         self.pid = guard.pid;
-        let first = match self.send_upstream().await {
+        let first = match initial {
             Ok(response) => response,
             Err(e) if e.is_timeout() => {
                 warn!(

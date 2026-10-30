@@ -961,7 +961,12 @@ impl Orchestrator {
         id: &str,
         after_initial_load: bool,
     ) -> Result<Option<RequestGuard>, LoadError> {
-        match self.try_spawn_additional_instance(id).await {
+        // A configured warm pool recovers in the background. Serving requests
+        // must never wait for its replacement process to finish starting.
+        if self.settings.lock().await.replica_pools.contains_key(id) {
+            return Ok(self.process_manager.lock().await.acquire_any_instance(id));
+        }
+        match self.try_spawn_additional_instance(id, false).await {
             Ok(Some(guard)) => return Ok(Some(guard)),
             Ok(None) => {}
             Err(e) if is_configuration_load_error(&e) => {
@@ -1261,17 +1266,27 @@ impl Orchestrator {
     async fn try_spawn_additional_instance(
         &self,
         id: &str,
+        warm: bool,
     ) -> Result<Option<RequestGuard>, LoadError> {
         let (mut pending, pid, port, vram_reservation) = {
             let _admit = self.admission.lock().await;
 
             // Re-check: did an idle instance appear while we waited?
-            if let Some(guard) = self.process_manager.lock().await.acquire_idle_instance(id) {
-                return Ok(Some(guard));
+            if !warm {
+                if let Some(guard) = self.process_manager.lock().await.acquire_idle_instance(id) {
+                    return Ok(Some(guard));
+                }
             }
-            if self.process_manager.lock().await.total_instance_count(id)
-                >= self.max_instances_per_model
-            {
+            let cap = self
+                .settings
+                .lock()
+                .await
+                .replica_pools
+                .get(id)
+                .copied()
+                .unwrap_or(self.max_instances_per_model)
+                .min(self.max_instances_per_model);
+            if self.process_manager.lock().await.total_instance_count(id) >= cap {
                 return Ok(None);
             }
 
@@ -1747,6 +1762,66 @@ impl Orchestrator {
     }
 
     // ----- reconcile -----
+
+    /// Keep explicitly configured replicas warm without delaying inference on
+    /// survivors. Admission, pending-process accounting, and GPU media permits
+    /// remain owned by the existing orchestrator.
+    pub async fn maintain_replica_pools(self: &Arc<Self>) {
+        let pools = self.settings.lock().await.replica_pools.clone();
+        for (id, desired) in pools {
+            if !self.data.lock().await.models.contains_key(&id) {
+                continue;
+            }
+            let pm = self.process_manager.lock().await;
+            let total = pm.total_instance_count(&id);
+            let live = pm.instance_count(&id);
+            if total >= desired.min(self.max_instances_per_model) || total > live {
+                continue;
+            }
+            drop(pm);
+            let Some(permit) = self.gpu_gate.try_inference() else {
+                continue;
+            };
+            let lock = self
+                .load_guards
+                .lock()
+                .await
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone();
+            let Ok(lock) = lock.try_lock_owned() else {
+                continue;
+            };
+            let state = self.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _lock = lock;
+                if let Err(error) = state.try_spawn_additional_instance(&id, true).await {
+                    warn!(model = id, %error, "warm replica startup failed; survivors remain available");
+                }
+            });
+        }
+    }
+
+    /// Pick a surviving instance before recycling the failed process. Only
+    /// requests with no client response yet may use this one-shot failover.
+    pub async fn failover_request(
+        self: &Arc<Self>,
+        id: &str,
+        guard: RequestGuard,
+    ) -> Option<RequestGuard> {
+        let permit = guard.gpu_permit.clone();
+        let pid = guard.pid;
+        drop(guard);
+        self.recycle_instance(pid, "upstream transport failed before response headers")
+            .await;
+        // Externally registered ports have no owned child to stop, but must
+        // still disappear from routing when their transport is unavailable.
+        self.process_manager.lock().await.forget(pid);
+        let mut next = self.process_manager.lock().await.acquire_any_instance(id)?;
+        next.gpu_permit = permit;
+        Some(next)
+    }
 
     /// Refresh VRAM from sysfs, detect dead processes, persist if dirty.
     /// Called on a 5s timer by `lifecycle::run`.

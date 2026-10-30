@@ -454,6 +454,40 @@ async fn proxy_forwards_json_body_identically() {
 }
 
 #[tokio::test]
+async fn replica_failover_before_headers_preserves_json_and_sse() {
+    for streaming in [false, true] {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let healthy = spawn_fake_llama().await;
+        let state = build_proxy_orchestrator(dead_port).await;
+        state
+            .process_manager
+            .lock()
+            .await
+            .register_existing_instance("fake", 99999999, healthy);
+        let mut settings = state.settings().await;
+        settings.replica_pools.insert("fake".into(), 2);
+        state.update_settings(settings).await;
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(proxy::proxy_handler))
+            .with_state(state.clone());
+        let port = start_proxy_server(app).await;
+        let response = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&serde_json::json!({"model":"fake", "stream":streaming, "messages":[{"role":"user","content":"same session"}]}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.bytes().await.unwrap();
+        if streaming {
+            assert_eq!(body.as_ref(), SSE_BODY);
+        } else {
+            assert_eq!(body.as_ref(), JSON_RESPONSE.as_bytes());
+        }
+        assert_eq!(state.process_manager.lock().await.instance_count("fake"), 1);
+    }
+}
+
+#[tokio::test]
 async fn template_map_is_selected_even_without_an_alias_and_never_leaks_upstream() {
     let app = axum::Router::new().route(
         "/v1/chat/completions",

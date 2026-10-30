@@ -21,6 +21,7 @@ pub struct InstanceInfo {
     pub port: u16,
     /// Number of in-flight requests currently routed to this instance.
     pub active: Arc<AtomicUsize>,
+    background: Arc<AtomicUsize>,
     /// True when this instance was placed on a GPU (so a GPU engine-reset should
     /// recycle it). Recorded at spawn from the resolved placement, which is the
     /// only reliable source — the persisted `ModelConfig.device` is `serde(skip)`.
@@ -49,6 +50,8 @@ pub struct RequestGuard {
     /// process.
     pub pid: i32,
     active: Arc<AtomicUsize>,
+    background: Arc<AtomicUsize>,
+    is_background: bool,
     request_done: Arc<Notify>,
 }
 
@@ -57,11 +60,14 @@ impl RequestGuard {
     /// must finish immediately after the client-facing request completes.
     pub(crate) fn retain(&self) -> Self {
         self.active.fetch_add(1, Ordering::Relaxed);
+        self.background.fetch_add(1, Ordering::Relaxed);
         Self {
             gpu_permit: self.gpu_permit.clone(),
             port: self.port,
             pid: self.pid,
             active: self.active.clone(),
+            background: self.background.clone(),
+            is_background: true,
             request_done: self.request_done.clone(),
         }
     }
@@ -70,6 +76,9 @@ impl RequestGuard {
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::Relaxed);
+        if self.is_background {
+            self.background.fetch_sub(1, Ordering::Relaxed);
+        }
         self.request_done.notify_waiters();
     }
 }
@@ -88,6 +97,7 @@ pub struct ProcessManager {
     pending: HashMap<i32, PendingInfo>,
     request_done: Arc<Notify>,
     backend_port_range: Option<(u16, u16)>,
+    prefix_instances: HashMap<(String, u64), i32>,
 }
 
 impl Drop for ProcessManager {
@@ -111,6 +121,7 @@ impl Default for ProcessManager {
             pending: HashMap::new(),
             request_done: Arc::new(Notify::new()),
             backend_port_range: parse_port_range_env("INFERENCE_ROUTER_BACKEND_PORT_RANGE"),
+            prefix_instances: HashMap::new(),
         }
     }
 }
@@ -234,6 +245,7 @@ impl ProcessManager {
         }
 
         let active = Arc::new(AtomicUsize::new(1));
+        let background = Arc::new(AtomicUsize::new(0));
         let port = pending.port;
         let pid = pending.pid;
         self.release_pending(&pending.model_id, pending.port);
@@ -245,6 +257,7 @@ impl ProcessManager {
                 pid,
                 port,
                 active: active.clone(),
+                background: background.clone(),
                 uses_gpu: pending.uses_gpu,
                 media_independent: pending.media_independent,
             });
@@ -261,6 +274,8 @@ impl ProcessManager {
             port,
             pid,
             active,
+            background,
+            is_background: false,
             request_done: self.request_done.clone(),
         })
     }
@@ -277,13 +292,15 @@ impl ProcessManager {
     /// a guard. Returns `None` if no instances exist or all are busy.
     pub fn acquire_idle_instance(&self, model_id: &str) -> Option<RequestGuard> {
         for inst in self.instances.get(model_id)?.iter() {
-            if inst.active.load(Ordering::Relaxed) == 0 {
+            if inst.active.load(Ordering::Relaxed) == inst.background.load(Ordering::Relaxed) {
                 inst.active.fetch_add(1, Ordering::Relaxed);
                 return Some(RequestGuard {
                     gpu_permit: None,
                     port: inst.port,
                     pid: inst.pid,
                     active: inst.active.clone(),
+                    background: inst.background.clone(),
+                    is_background: false,
                     request_done: self.request_done.clone(),
                 });
             }
@@ -297,19 +314,63 @@ impl ProcessManager {
         if let Some(g) = self.acquire_idle_instance(model_id) {
             return Some(g);
         }
-        let inst = self
-            .instances
-            .get(model_id)?
-            .iter()
-            .min_by_key(|inst| inst.active.load(Ordering::Relaxed))?;
+        let inst = self.instances.get(model_id)?.iter().min_by_key(|inst| {
+            inst.active
+                .load(Ordering::Relaxed)
+                .saturating_sub(inst.background.load(Ordering::Relaxed))
+        })?;
         inst.active.fetch_add(1, Ordering::Relaxed);
         Some(RequestGuard {
             gpu_permit: None,
             port: inst.port,
             pid: inst.pid,
             active: inst.active.clone(),
+            background: inst.background.clone(),
+            is_background: false,
             request_done: self.request_done.clone(),
         })
+    }
+
+    /// Reuse a conversation's cache when loads tie; an idle or less-busy
+    /// replica wins over affinity, and dead replicas cannot be selected.
+    pub fn acquire_affine_instance(
+        &mut self,
+        model_id: &str,
+        prefixes: &[u64],
+    ) -> Option<RequestGuard> {
+        let live = self.instances.get(model_id)?;
+        let preferred = prefixes.iter().rev().find_map(|prefix| {
+            self.prefix_instances
+                .get(&(model_id.to_owned(), *prefix))
+                .copied()
+                .filter(|pid| live.iter().any(|inst| inst.pid == *pid))
+        });
+        let inst = self.instances.get(model_id)?.iter().min_by_key(|inst| {
+            (
+                inst.active
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(inst.background.load(Ordering::Relaxed)),
+                Some(inst.pid) != preferred,
+            )
+        })?;
+        inst.active.fetch_add(1, Ordering::Relaxed);
+        let guard = RequestGuard {
+            gpu_permit: None,
+            port: inst.port,
+            pid: inst.pid,
+            active: inst.active.clone(),
+            background: inst.background.clone(),
+            is_background: false,
+            request_done: self.request_done.clone(),
+        };
+        if self.prefix_instances.len() >= 4096 {
+            self.prefix_instances.clear();
+        }
+        for prefix in prefixes {
+            self.prefix_instances
+                .insert((model_id.to_owned(), *prefix), guard.pid);
+        }
+        Some(guard)
     }
 
     /// Number of live instances for a model.
@@ -527,6 +588,7 @@ impl ProcessManager {
     #[allow(dead_code)]
     pub fn register_existing_instance(&mut self, model_id: &str, pid: i32, port: u16) {
         let active = Arc::new(AtomicUsize::new(0));
+        let background = Arc::new(AtomicUsize::new(0));
         self.instances
             .entry(model_id.into())
             .or_default()
@@ -534,6 +596,7 @@ impl ProcessManager {
                 pid,
                 port,
                 active,
+                background,
                 uses_gpu: false,
                 media_independent: false,
             });

@@ -257,7 +257,7 @@ async fn proxy_admitted(
             .ensure_loaded_admitted(&model_id, admission.gpu.clone())
             .await
     };
-    let guard = match loaded {
+    let mut guard = match loaded {
         Ok(g) => g,
         Err(e) => {
             warn!(model = model_id, error = %e, "ensure_loaded failed");
@@ -279,8 +279,20 @@ async fn proxy_admitted(
         }
     };
 
+    if state.settings().await.replica_pools.contains_key(&model_id) {
+        if let Some(key) = super::replica_routing::prefix_keys(&body_bytes, &parts.headers) {
+            let permit = guard.gpu_permit.clone();
+            let mut pm = state.process_manager.lock().await;
+            drop(guard);
+            let Some(next) = pm.acquire_affine_instance(&model_id, &key) else {
+                return unresponsive_response(&model_id);
+            };
+            guard = next;
+            guard.gpu_permit = permit;
+        }
+    }
+
     let port = guard.port;
-    let pid = guard.pid;
     let vllm_perf_generation = state.vllm_perf_generation(&model_id).await;
 
     state.mark_used(&model_id).await;
@@ -290,7 +302,7 @@ async fn proxy_admitted(
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    let upstream_url = format!("http://127.0.0.1:{}{}", port, path_and_query);
+    let mut upstream_url = format!("http://127.0.0.1:{}{}", port, path_and_query);
 
     let settings = state.settings().await;
 
@@ -360,41 +372,60 @@ async fn proxy_admitted(
         return session.into_response(guard).await;
     }
 
-    let mut builder = client
-        .request(upstream_method, &upstream_url)
-        .body(outbound_body);
+    let mut attempted_failover = false;
+    let upstream = loop {
+        let mut builder = client
+            .request(upstream_method.clone(), &upstream_url)
+            .body(outbound_body.clone());
 
-    for (name, value) in parts.headers.iter() {
-        let lower = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str()) || lower == "host" || lower == "content-length" {
-            continue;
+        for (name, value) in parts.headers.iter() {
+            let lower = name.as_str().to_ascii_lowercase();
+            if HOP_BY_HOP.contains(&lower.as_str()) || lower == "host" || lower == "content-length"
+            {
+                continue;
+            }
+            builder = builder.header(name.as_str(), value);
         }
-        builder = builder.header(name.as_str(), value);
-    }
 
-    let upstream = match builder.send().await {
-        Ok(r) => r,
-        Err(e) if e.is_timeout() => {
-            warn!(
-                upstream = upstream_url,
-                "no response before idle timeout; recycling wedged instance"
-            );
-            let pid = guard.pid;
-            drop(guard);
-            state
-                .recycle_instance(pid, "idle timeout before response headers")
-                .await;
-            return unresponsive_response(&model_id);
-        }
-        Err(e) => {
-            error!(upstream = upstream_url, error = %e, "upstream request failed");
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("upstream error: {e}")})),
-            )
-                .into_response();
+        match builder.send().await {
+            Ok(r) => break r,
+            Err(e)
+                if !attempted_failover
+                    && (e.is_connect() || e.is_timeout())
+                    && state.settings().await.replica_pools.contains_key(&model_id) =>
+            {
+                let Some(next) = state.failover_request(&model_id, guard).await else {
+                    return unresponsive_response(&model_id);
+                };
+                guard = next;
+                upstream_url = format!("http://127.0.0.1:{}{}", guard.port, path_and_query);
+                attempted_failover = true;
+                continue;
+            }
+            Err(e) if e.is_timeout() => {
+                warn!(
+                    upstream = upstream_url,
+                    "no response before idle timeout; recycling wedged instance"
+                );
+                let pid = guard.pid;
+                drop(guard);
+                state
+                    .recycle_instance(pid, "idle timeout before response headers")
+                    .await;
+                return unresponsive_response(&model_id);
+            }
+            Err(e) => {
+                error!(upstream = upstream_url, error = %e, "upstream request failed");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("upstream error: {e}")})),
+                )
+                    .into_response();
+            }
         }
     };
+    let port = guard.port;
+    let pid = guard.pid;
 
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
