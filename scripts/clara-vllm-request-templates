@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-# Opt this backend into per-request templates without changing model files.
-export EXTRA_ARGS="${EXTRA_ARGS:-} --trust-request-chat-template"
+# Keep per-request templates and explicitly enable reusable hybrid-model prefixes.
+# Align mode caches the recurrent GDN state at reusable block boundaries.
+export EXTRA_ARGS="${EXTRA_ARGS:-} --trust-request-chat-template --enable-prefix-caching --mamba-cache-mode align"
 exec "$HOME/qwen38-27b-rtx3090/router_backend_kvarn.sh" "$@"
