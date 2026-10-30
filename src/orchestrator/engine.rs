@@ -52,6 +52,7 @@ pub type AppState = Arc<Orchestrator>;
 pub struct Orchestrator {
     independent_config: Arc<tokio::sync::RwLock<()>>,
     pub gpu_gate: Arc<super::gpu_gate::GpuGate>,
+    pub request_queue: super::request_queue::RequestQueue,
     pub media: Arc<super::media::MediaController>,
     pub data: Arc<Mutex<AppData>>,
     pub process_manager: Arc<Mutex<ProcessManager>>,
@@ -216,6 +217,7 @@ impl Orchestrator {
                 aliases,
             })),
             process_manager: Arc::new(Mutex::new(ProcessManager::default())),
+            request_queue: Default::default(),
             vram_tracker,
             system_tracker: Arc::new(SystemTracker::default()),
             admission: Arc::new(Mutex::new(())),
@@ -494,15 +496,6 @@ impl Orchestrator {
             }
         }
         (primary, false)
-    }
-
-    pub async fn has_independent_models(&self) -> bool {
-        self.data
-            .lock()
-            .await
-            .models
-            .values()
-            .any(|m| m.media_independent())
     }
 
     pub async fn ensure_loaded_independent(

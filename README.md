@@ -504,3 +504,21 @@ private unnamed files in `request-spool/` beside the router configuration.
 Queued GPU prompts stay there until admitted, and their files close on
 cancellation. The configured maximum request size still applies. This avoids
 holding every queued prompt in RAM while CPU requests continue to arrive.
+
+### Inference request priority
+
+`POST /v1/*` accepts the optional `x-inference-priority` header: `interactive`,
+`normal`, or `background`. Missing or unrecognized values use `normal`. The
+router consumes this header; it is not forwarded into prompts or backend input.
+
+Admission is shared by the resolved model ID, including aliases and fallbacks.
+Queued interactive requests precede normal requests, which precede background
+requests; requests of the same priority remain FIFO. Running requests finish
+normally, including their complete streaming response. Client retries are new
+requests and rejoin the queue. Cancellation drops the waiting admission ticket.
+Independent models keep separate queues. Capacity uses the model's configured
+`parallel_slots` (one if unset), multiplied by its current running instance count (at least one).
+Queued requests do not pin backend instances or GPU readers; media handoffs keep
+exclusive access, and chats can overtake background requests waiting for media.
+Large queued bodies use the existing private request spool rather than retaining
+all prompts in memory. The queue itself stores only priority and request IDs.

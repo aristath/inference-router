@@ -106,6 +106,8 @@ struct ModelResponse {
     pending_instances: usize,
     /// Number of active requests
     active_requests: usize,
+    /// Requests awaiting model/GPU admission, without prompt contents.
+    queued_requests: usize,
 }
 
 /// Returns a complete system status snapshot.
@@ -179,6 +181,7 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
                     ModelState::Running => ("running", None),
                     ModelState::Error(msg) => ("error", Some(msg.clone())),
                 };
+                let queued_requests = state.request_queue.queued(&m.id);
                 ModelResponse {
                     id: m.id,
                     name: m.name,
@@ -199,6 +202,7 @@ pub async fn get_app_state(State(state): State<AppState>) -> impl IntoResponse {
                     instances: runtime.instances,
                     pending_instances: runtime.pending,
                     active_requests: runtime.active,
+                    queued_requests,
                 }
             })
             .collect(),

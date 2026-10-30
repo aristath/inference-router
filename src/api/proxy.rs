@@ -11,6 +11,7 @@ use tracing::{error, warn};
 
 use crate::api::loop_guard::{self, StreamSession};
 use crate::api::routing_body::RoutingBody;
+use crate::orchestrator::request_queue::{Priority, RequestPermit, PRIORITY_HEADER};
 use crate::orchestrator::AppState;
 use crate::process::manager::RequestGuard;
 
@@ -117,35 +118,21 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
-    // Keep ordinary inference admission ahead of body buffering. When CPU/iGPU
-    // routes exist, requests blocked by media must first reveal their model;
-    // large queued bodies spill to private files instead of accumulating RAM.
-    let mut permit = state.gpu_gate.try_inference();
-    if permit.is_none() && !state.has_independent_models().await {
-        permit = match state.gpu_gate.inference().await {
-            Ok(p) => Some(p),
-            Err(error) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"error":error})),
-                )
-                    .into_response()
-            }
-        };
-    }
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
+    let priority = Priority::from_header(
+        parts
+            .headers
+            .remove(PRIORITY_HEADER)
+            .as_ref()
+            .and_then(|v| v.to_str().ok()),
+    );
     let directory = state
         .store
         .path()
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("request-spool");
-    let body = match RoutingBody::read(
-        body,
-        state.max_body_bytes,
-        permit.is_none().then_some(directory.as_path()),
-    )
-    .await
+    let body = match RoutingBody::read(body, state.max_body_bytes, Some(directory.as_path())).await
     {
         Ok(body) => body,
         Err(error) => {
@@ -166,8 +153,9 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
 
     // Resolve aliases to their target model. Non-alias names pass through
     // unchanged.
+    let media_blocked = state.gpu_gate.try_inference().is_none();
     let (model_id, independent) = state
-        .inference_target(&requested_model, permit.is_none())
+        .inference_target(&requested_model, media_blocked)
         .await;
 
     // A defined-but-unassigned alias resolves to an empty target. Real model
@@ -184,25 +172,89 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
+    let slots = state
+        .data
+        .lock()
+        .await
+        .models
+        .get(&model_id)
+        .and_then(|model| model.parallel_slots)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let replicas = state
+        .process_manager
+        .lock()
+        .await
+        .instance_count(&model_id)
+        .max(1);
+    let admission = match state
+        .request_queue
+        .acquire(
+            &model_id,
+            priority,
+            slots.saturating_mul(replicas),
+            (!independent).then(|| state.gpu_gate.clone()),
+        )
+        .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":error})),
+            )
+                .into_response()
+        }
+    };
+    let response = proxy_admitted(
+        state,
+        parts,
+        body,
+        requested_model,
+        model_id,
+        independent,
+        &admission,
+    )
+    .await;
+    response.map(|body| {
+        Body::from_stream(AdmittedStream {
+            inner: body.into_data_stream(),
+            permit: Some(admission),
+        })
+    })
+}
+
+/// The queue's permit follows the complete response body, including disconnects.
+struct AdmittedStream<S> {
+    inner: S,
+    permit: Option<RequestPermit>,
+}
+impl<S: Stream + Unpin> Stream for AdmittedStream<S> {
+    type Item = S::Item;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let next = Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(next, Poll::Ready(None)) {
+            self.permit.take();
+        }
+        next
+    }
+}
+
+async fn proxy_admitted(
+    state: AppState,
+    parts: axum::http::request::Parts,
+    body: RoutingBody,
+    requested_model: String,
+    model_id: String,
+    independent: bool,
+    admission: &RequestPermit,
+) -> Response {
     let loaded = if independent {
-        drop(permit.take());
         state.clone().ensure_loaded_independent(&model_id).await
     } else {
-        if permit.is_none() {
-            permit = match state.gpu_gate.inference().await {
-                Ok(p) => Some(p),
-                Err(error) => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"error":error})),
-                    )
-                        .into_response()
-                }
-            };
-        }
         state
             .clone()
-            .ensure_loaded_admitted(&model_id, permit)
+            .ensure_loaded_admitted(&model_id, admission.gpu.clone())
             .await
     };
     let guard = match loaded {
