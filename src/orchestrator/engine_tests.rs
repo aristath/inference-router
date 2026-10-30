@@ -1275,6 +1275,21 @@ fn cpu_only_gguf_bypasses_fit_and_gpu_admission() {
     assert!(restored.cpu_only);
 }
 
+#[test]
+fn cpu_only_safetensors_bypasses_gpu_admission() {
+    let mut m = model("vllm-cpu");
+    m.weights_format = WeightsFormat::Safetensors;
+    m.cpu_only = true;
+    m.estimated_vram = 24 * 1024 * 1024 * 1024;
+    assert!(m.media_independent());
+    assert!(resolve_targets(&m, &HashMap::new()).is_empty());
+    let result = place_model(&mut m, None, &[], &[], u64::MAX, (0.0, 0.0)).unwrap();
+    assert!(matches!(result, PlaceOutcome::Fits));
+    assert_eq!(m.estimated_vram, 0);
+    assert!(m.device.is_none());
+    assert!(m.n_gpu_layers.is_none());
+}
+
 #[tokio::test]
 async fn fallback_validation_inheritance_rename_delete_and_model_changes() {
     let tmp = tempfile::tempdir().unwrap();

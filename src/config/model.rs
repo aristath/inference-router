@@ -301,7 +301,8 @@ pub struct ModelConfig {
     // llama-fit-params chooses layer/split/expert placement at load time.
     #[serde(default, skip_serializing_if = "is_false")]
     pub flash_attn: bool,
-    /// Run GGUF target, draft and projector on CPU without GPU admission or fit.
+    /// Run on a CPU-capable backend without GPU admission or fit.
+    /// For GGUF this also disables draft and projector offload.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cpu_only: bool,
     /// Use only an integrated Vulkan GPU, independently of discrete-GPU media.
@@ -530,7 +531,7 @@ fn saturating_sum_bytes(lengths: impl IntoIterator<Item = u64>) -> u64 {
 
 impl ModelConfig {
     pub fn media_independent(&self) -> bool {
-        self.weights_format == WeightsFormat::Gguf && (self.cpu_only || self.igpu_only)
+        self.cpu_only || (self.weights_format == WeightsFormat::Gguf && self.igpu_only)
     }
 
     pub fn validate_placement(&self) -> Result<(), ConfigError> {

@@ -289,17 +289,17 @@
 
                     <!-- ── Hardware ── -->
                     <div class="tab-panel" id="tab-hardware">
-                        <small class="field-help" style="display:block; margin-bottom:0.75rem;">Backend flags for <code>llama-server</code>. Applied only when Weights format is GGUF.</small>
-                        <div id="llama-section">
                             <div class="form-group">
                                 <label for="compute_mode">Compute placement</label>
                                 <select id="compute_mode" name="compute_mode">
                                     <option value="auto">Automatic GPU placement</option>
                                     <option value="cpu">CPU only</option>
-                                    <option value="igpu">Integrated GPU only (Vulkan)</option>
+                                    <option value="igpu" id="compute-igpu-option">Integrated GPU only (Vulkan, GGUF)</option>
                                 </select>
-                                <small class="field-help">CPU-only and iGPU-only models can answer while the discrete GPU generates media. iGPU-only requires a Vulkan binary and keeps all model layers on the integrated GPU.</small>
+                                <small class="field-help">CPU-only requires a CPU-capable binary preset, including a CPU build of vLLM for safetensors. CPU-only and iGPU-only models can answer while the discrete GPU generates media.</small>
                             </div>
+                        <div id="llama-section">
+                        <small class="field-help" style="display:block; margin-bottom:0.75rem;">Backend flags for <code>llama-server</code>. Applied only when Weights format is GGUF.</small>
                             <div class="form-row">
                                 <div class="form-group">
                                     <label style="display:flex; align-items:center; gap:0.5rem;">
@@ -1476,6 +1476,7 @@ function populateModelForm(m, mode) {
     // Format-dependent llama section visibility.
     document.getElementById('llama-section').style.display =
         (m.weights_format || 'gguf') === 'gguf' ? '' : 'none';
+    document.getElementById('compute-igpu-option').disabled = (m.weights_format || 'gguf') !== 'gguf';
 }
 
 function setPair(name, value) {
@@ -1625,6 +1626,10 @@ document.addEventListener('click', (e) => {
     function apply() {
         const fmt = document.querySelector('input[name="weights_format"]:checked').value;
         section.style.display = fmt === 'gguf' ? '' : 'none';
+        document.getElementById('compute-igpu-option').disabled = fmt !== 'gguf';
+        if (fmt !== 'gguf' && document.getElementById('compute_mode').value === 'igpu') {
+            document.getElementById('compute_mode').value = 'auto';
+        }
     }
     radios.forEach(r => r.addEventListener('change', apply));
     apply();
@@ -2313,12 +2318,12 @@ async function refreshAliasTargetSelect(selected, fallbackSelected) {
                 seen.add(current);
                 current = aliases.find(a => a.alias === current).target;
             }
-            return models.some(m => m.id === current && (m.cpu_only || m.igpu_only) && (m.weights_format || 'gguf') === 'gguf');
+            return models.some(m => m.id === current && (m.cpu_only || (m.igpu_only && (m.weights_format || 'gguf') === 'gguf')));
         };
         const fallbackOptions = [
             ...aliases.filter(a => a.alias !== _aliasEditingOriginal && independentTarget(a.alias))
                 .map(a => ({ value: a.alias, label: `${a.alias} → ${a.target}` })),
-            ...models.filter(m => (m.cpu_only || m.igpu_only) && (m.weights_format || 'gguf') === 'gguf')
+            ...models.filter(m => m.cpu_only || (m.igpu_only && (m.weights_format || 'gguf') === 'gguf'))
                 .map(m => ({ value: m.id, label: m.name || m.id })),
         ];
         fallbackOptions.forEach(item => {
@@ -2544,7 +2549,7 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         min_p: parseFloat(field('min_p').value),
         presence_penalty: parseFloat(field('presence_penalty').value),
         repeat_penalty: parseFloat(field('repeat_penalty').value),
-        cpu_only: field('weights_format').value === 'gguf' && field('compute_mode').value === 'cpu',
+        cpu_only: field('compute_mode').value === 'cpu',
         igpu_only: field('weights_format').value === 'gguf' && field('compute_mode').value === 'igpu',
         flash_attn: field('flash_attn').checked,
         n_gpu_layers: toOptInt(field('n_gpu_layers').value),

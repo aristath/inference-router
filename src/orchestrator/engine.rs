@@ -2237,9 +2237,11 @@ fn place_model(
     model
         .validate_placement()
         .map_err(|error| crate::vram::llama_fit::LlamaFitError::Parse(error.to_string()))?;
-    if model.cpu_only && model.weights_format == WeightsFormat::Gguf {
-        model.device = Some("none".into());
-        model.n_gpu_layers = Some(0);
+    if model.cpu_only {
+        if model.weights_format == WeightsFormat::Gguf {
+            model.device = Some("none".into());
+            model.n_gpu_layers = Some(0);
+        }
         model.n_cpu_moe = None;
         model.override_tensor = None;
         model.fit_target = None;

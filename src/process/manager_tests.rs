@@ -689,6 +689,21 @@ fn cpu_only_argv_disables_target_and_draft_offload() {
     assert!(!instance_uses_gpu(&m, &args));
 }
 
+#[test]
+fn cpu_only_safetensors_uses_vllm_args_without_gpu_ownership() {
+    let mut m = ModelConfig {
+        weights_format: WeightsFormat::Safetensors,
+        cpu_only: true,
+        ..ModelConfig::default()
+    };
+    let args = build_command_args(&m, None, 9001);
+    assert!(args.contains(&"--model".to_string()));
+    assert!(!args.contains(&"--gpu-layers".to_string()));
+    assert!(!instance_uses_gpu(&m, &args));
+    m.cpu_only = false;
+    assert!(instance_uses_gpu(&m, &args));
+}
+
 #[tokio::test]
 async fn dropping_manager_kills_running_and_pending_worker_descendants() {
     use std::os::unix::fs::PermissionsExt;

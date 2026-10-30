@@ -85,7 +85,7 @@ State files under `~/.config/inference-router/`:
   - `profile` (optional): workspace label such as `coding`, `long-context`, or `vision` for dashboard filtering.
   - `binary`, `model_path`, `port`, `context`: mandatory.
   - `weights_format`: `gguf` (llama.cpp argv style) or `safetensors` (vLLM style).
-  - `cpu_only: true` runs a GGUF model entirely on CPU, including draft/MTP and projector, without GPU admission or fit probing. Use a CPU-capable binary preset; normal GPU placement is unchanged when omitted.
+  - `cpu_only: true` runs a model entirely on CPU without GPU admission or fit probing. Use a CPU-capable binary preset (such as a CPU build of vLLM for safetensors). For GGUF this also disables draft/MTP and projector offload; normal GPU placement is unchanged when omitted.
   - `igpu_only: true` runs a GGUF model fully on an integrated Vulkan GPU without the discrete-GPU media gate. It fails if no integrated Vulkan GPU exists; it never falls back to a discrete GPU. CPU-only and iGPU-only are mutually exclusive. Draft/MTP and raw GPU-placement overrides are not supported in iGPU-only mode.
   - llama.cpp knobs: `flash_attn`, `n_gpu_layers`, `mlock`, `no_mmap`, `parallel_slots`, `cache_type_{k,v}`, `split_mode` (`none | layer | row | tensor`), `main_gpu`, `tensor_split`.
   - Speculative decoding: `mtp_tokens` for embedded MTP heads, or `draft_model_id` plus `draft_{max,min,p_min}` for an external draft model.

@@ -790,7 +790,7 @@ fn gguf_has_fitted_placement(model: &ModelConfig) -> bool {
 
 fn instance_uses_gpu(model: &ModelConfig, args: &[String]) -> bool {
     match model.weights_format {
-        WeightsFormat::Safetensors => true,
+        WeightsFormat::Safetensors => !model.cpu_only,
         WeightsFormat::Gguf => gguf_args_use_gpu(args),
     }
 }
