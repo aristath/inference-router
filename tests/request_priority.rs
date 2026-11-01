@@ -171,3 +171,106 @@ async fn queued_aliases_share_priority_and_running_stream_finishes_before_next_r
     router.abort();
     backend.abort();
 }
+
+#[tokio::test]
+async fn strata_reserves_a_live_slot_against_a_second_background_stream() {
+    let upstream = Upstream::default();
+    let (upstream_port, backend) = server(
+        axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/v1/chat/completions", post(generate))
+            .with_state(upstream.clone()),
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(Orchestrator::new(
+        Arc::new(JsonStore::new(directory.path().join("models.json"))),
+        Arc::new(JsonStore::new(directory.path().join("presets.json"))),
+        Arc::new(JsonStore::new(directory.path().join("aliases.json"))),
+        0,
+    ));
+    state
+        .add_model(ModelConfig {
+            id: "fake".into(),
+            name: "fake".into(),
+            binary: "/bin/true".into(),
+            model_path: "/dev/null".into(),
+            parallel_slots: Some(2),
+            strata: Some(inference_router::config::StrataConfig {
+                config: "/runtime/native.json".into(),
+                vram_mib: 1,
+                gpu: 0,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    {
+        let mut data = state.data.lock().await;
+        let model = data.models.get_mut("fake").unwrap();
+        model.state = ModelState::Running;
+        model.pid = Some(1);
+        data.aliases.insert(
+            "default".into(),
+            ModelAlias {
+                alias: "default".into(),
+                target: "fake".into(),
+                fallback: None,
+            },
+        );
+    }
+    state
+        .process_manager
+        .lock()
+        .await
+        .register_existing_port("fake", upstream_port);
+    let (port, router) = server(
+        axum::Router::new()
+            .route("/v1/{*rest}", any(proxy::proxy_handler))
+            .with_state(state.clone()),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let send = |label: &'static str, priority: Option<&'static str>| {
+        let mut request = client.post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&serde_json::json!({"model":"default", "messages":[{"role":"user", "content":label}], "stream": label == "first"}));
+        if let Some(priority) = priority {
+            request = request.header("x-inference-priority", priority);
+        }
+        tokio::spawn(async move { request.send().await.unwrap().text().await.unwrap() })
+    };
+    let first = send("first", Some("background"));
+    timeout(Duration::from_secs(3), async {
+        while upstream.order.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let background = send("background", Some("background"));
+    depth(&state, 1).await;
+    let chat = send("chat", Some("interactive"));
+    let reply = timeout(Duration::from_secs(3), chat)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reply.contains("chat"));
+    assert!(
+        !first.is_finished(),
+        "foreground must finish while background is still streaming"
+    );
+    assert!(!background.is_finished());
+    assert_eq!(*upstream.order.lock().unwrap(), vec!["first", "chat"]);
+    upstream.finish.notify_one();
+    timeout(Duration::from_secs(3), async {
+        tokio::try_join!(first, background).unwrap();
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        *upstream.order.lock().unwrap(),
+        vec!["first", "chat", "background"]
+    );
+    router.abort();
+    backend.abort();
+}

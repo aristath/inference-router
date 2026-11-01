@@ -172,31 +172,39 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
-    let slots = state
+    let (slots, strata) = state
         .data
         .lock()
         .await
         .models
         .get(&model_id)
-        .and_then(|model| model.parallel_slots)
-        .unwrap_or(1)
-        .max(1) as usize;
+        .map(|model| {
+            (
+                model.parallel_slots.unwrap_or(1).max(1) as usize,
+                model.strata.is_some(),
+            )
+        })
+        .unwrap_or((1, false));
     let replicas = state
         .process_manager
         .lock()
         .await
         .instance_count(&model_id)
         .max(1);
-    let admission = match state
-        .request_queue
-        .acquire(
-            &model_id,
-            priority,
-            slots.saturating_mul(replicas),
-            (!independent).then(|| state.gpu_gate.clone()),
-        )
-        .await
-    {
+    let capacity = slots.saturating_mul(replicas);
+    let gate = (!independent).then(|| state.gpu_gate.clone());
+    let admitted = if strata && slots > 1 {
+        state
+            .request_queue
+            .acquire_with_background_reserve(&model_id, priority, capacity, replicas, gate)
+            .await
+    } else {
+        state
+            .request_queue
+            .acquire(&model_id, priority, capacity, gate)
+            .await
+    };
+    let admission = match admitted {
         Ok(permit) => permit,
         Err(error) => {
             return (

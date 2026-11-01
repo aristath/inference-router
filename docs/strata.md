@@ -25,6 +25,13 @@ budget, evicts idle models as usual, and never runs llama.cpp fitting against
 Strata. It waits for `/health` to report loaded before routing requests. Existing
 models without `strata` retain their current launch and fitting behavior.
 
+Set the model's `parallel_slots` to the native JSON's `parallel` value. With
+multiple Strata slots, one per replica is reserved against requests carrying
+`x-inference-priority: background`, so long background generations cannot fill
+every slot before a chat arrives. Interactive/normal work can use the full
+capacity. Running requests continue; further background requests wait. The
+existing request-boundary priority behavior is unchanged for other backends.
+
 The native JSON contains Strata's `exe`, `args`, `cwd`, `tokenizer`, `env`, and
 optional `vision` configuration. Use absolute paths. `cwd` contains the Strata
 checkout, `serve/server.py`, and `.venv/bin/python` (or set `python` explicitly).

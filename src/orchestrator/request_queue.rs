@@ -39,6 +39,7 @@ struct ModelQueue {
 struct QueueState {
     next_id: u64,
     active: usize,
+    active_background: usize,
     waiting: Vec<(Priority, u64)>,
 }
 
@@ -62,13 +63,19 @@ impl Drop for Ticket {
 pub struct RequestPermit {
     queue: Arc<ModelQueue>,
     pub gpu: Option<InferencePermit>,
+    background: bool,
 }
 
 impl Drop for RequestPermit {
     fn drop(&mut self) {
         // Release the GPU reader before waking requests behind a media writer.
         self.gpu.take();
-        self.queue.state.lock().unwrap().active -= 1;
+        let mut state = self.queue.state.lock().unwrap();
+        state.active -= 1;
+        if self.background {
+            state.active_background -= 1;
+        }
+        drop(state);
         self.queue.changed.notify_waiters();
     }
 }
@@ -92,6 +99,22 @@ impl RequestQueue {
         capacity: usize,
         gpu: Option<Arc<GpuGate>>,
     ) -> Result<RequestPermit, String> {
+        self.acquire_with_background_reserve(model, priority, capacity, 0, gpu)
+            .await
+    }
+
+    /// Keep capacity available for foreground work instead of filling every
+    /// backend slot with potentially long background generations.
+    pub async fn acquire_with_background_reserve(
+        &self,
+        model: &str,
+        priority: Priority,
+        capacity: usize,
+        reserved: usize,
+        gpu: Option<Arc<GpuGate>>,
+    ) -> Result<RequestPermit, String> {
+        let capacity = capacity.max(1);
+        let background_capacity = capacity - reserved.min(capacity - 1);
         let queue = {
             let mut models = self.models.lock().unwrap();
             models.retain(|_, queue| queue.strong_count() > 0);
@@ -121,7 +144,9 @@ impl RequestQueue {
             changed.as_mut().enable();
             let eligible = {
                 let state = queue.state.lock().unwrap();
-                state.active < capacity.max(1)
+                state.active < capacity
+                    && (priority != Priority::Background
+                        || state.active_background < background_capacity)
                     && state.waiting.iter().min() == Some(&(priority, ticket.id))
             };
             if !eligible {
@@ -141,11 +166,16 @@ impl RequestQueue {
             };
             let admitted = {
                 let mut state = queue.state.lock().unwrap();
-                if state.active < capacity.max(1)
+                if state.active < capacity
+                    && (priority != Priority::Background
+                        || state.active_background < background_capacity)
                     && state.waiting.iter().min() == Some(&(priority, ticket.id))
                 {
                     state.waiting.retain(|(_, id)| *id != ticket.id);
                     state.active += 1;
+                    if priority == Priority::Background {
+                        state.active_background += 1;
+                    }
                     true
                 } else {
                     false
@@ -156,6 +186,7 @@ impl RequestQueue {
                 return Ok(RequestPermit {
                     queue: queue.clone(),
                     gpu: permit,
+                    background: priority == Priority::Background,
                 });
             }
             drop(permit);
@@ -359,5 +390,45 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_slot_keeps_chat_moving_while_background_generation_continues() {
+        let queue = Arc::new(RequestQueue::default());
+        let background = queue
+            .acquire_with_background_reserve("m", Priority::Background, 2, 1, None)
+            .await
+            .unwrap();
+        let q = queue.clone();
+        let second = tokio::spawn(async move {
+            q.acquire_with_background_reserve("m", Priority::Background, 2, 1, None)
+                .await
+                .unwrap()
+        });
+        waiting(&queue, "m", 1).await;
+        assert!(!second.is_finished());
+        let chat = timeout(
+            Duration::from_secs(1),
+            queue.acquire_with_background_reserve("m", Priority::Interactive, 2, 1, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(chat);
+        assert!(
+            !second.is_finished(),
+            "the active background request keeps its permit; another must wait"
+        );
+        drop(background);
+        let next = timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(next);
+        // A one-slot backend still admits background work rather than starving it.
+        let _single = queue
+            .acquire_with_background_reserve("single", Priority::Background, 1, 1, None)
+            .await
+            .unwrap();
     }
 }
