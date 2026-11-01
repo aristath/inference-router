@@ -23,6 +23,7 @@ use tokio::{
 struct Upstream {
     order: Arc<Mutex<Vec<String>>>,
     finish: Arc<Notify>,
+    finish_chat: Arc<Notify>,
 }
 async fn generate(
     State(upstream): State<Upstream>,
@@ -32,9 +33,14 @@ async fn generate(
     assert!(!headers.contains_key("x-inference-priority"));
     let label = body["messages"][0]["content"].as_str().unwrap().to_owned();
     upstream.order.lock().unwrap().push(label.clone());
-    if label == "first" {
+    if label == "first" || label == "chat-stream" {
+        let done = if label == "first" {
+            upstream.finish.clone()
+        } else {
+            upstream.finish_chat.clone()
+        };
         let bytes = stream::unfold(0, move |step| {
-            let finish = upstream.finish.clone();
+            let finish = done.clone();
             async move {
                 match step {
                     0 => Some((
@@ -233,7 +239,7 @@ async fn strata_reserves_a_live_slot_against_a_second_background_stream() {
     let client = reqwest::Client::new();
     let send = |label: &'static str, priority: Option<&'static str>| {
         let mut request = client.post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
-            .json(&serde_json::json!({"model":"default", "messages":[{"role":"user", "content":label}], "stream": label == "first"}));
+            .json(&serde_json::json!({"model":"default", "messages":[{"role":"user", "content":label}], "stream": label == "first" || label == "chat-stream"}));
         if let Some(priority) = priority {
             request = request.header("x-inference-priority", priority);
         }
@@ -247,29 +253,46 @@ async fn strata_reserves_a_live_slot_against_a_second_background_stream() {
     })
     .await
     .unwrap();
-    let background = send("background", Some("background"));
+    let mut background = send("background", Some("background"));
     depth(&state, 1).await;
-    let chat = send("chat", Some("interactive"));
+    let chat = send("chat-stream", Some("interactive"));
+    timeout(Duration::from_secs(3), async {
+        while upstream.order.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!first.is_finished());
+    assert!(!background.is_finished());
+    assert_eq!(
+        *upstream.order.lock().unwrap(),
+        vec!["first", "chat-stream"]
+    );
+    upstream.finish.notify_one();
+    timeout(Duration::from_secs(3), first)
+        .await
+        .unwrap()
+        .unwrap();
+    depth(&state, 1).await;
+    assert!(!background.is_finished());
+    assert_eq!(
+        *upstream.order.lock().unwrap(),
+        vec!["first", "chat-stream"]
+    );
+    upstream.finish_chat.notify_one();
     let reply = timeout(Duration::from_secs(3), chat)
         .await
         .unwrap()
         .unwrap();
-    assert!(reply.contains("chat"));
-    assert!(
-        !first.is_finished(),
-        "foreground must finish while background is still streaming"
-    );
-    assert!(!background.is_finished());
-    assert_eq!(*upstream.order.lock().unwrap(), vec!["first", "chat"]);
-    upstream.finish.notify_one();
-    timeout(Duration::from_secs(3), async {
-        tokio::try_join!(first, background).unwrap();
-    })
-    .await
-    .unwrap();
+    assert!(reply.contains("start"));
+    timeout(Duration::from_secs(3), background)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         *upstream.order.lock().unwrap(),
-        vec!["first", "chat", "background"]
+        vec!["first", "chat-stream", "background"]
     );
     router.abort();
     backend.abort();

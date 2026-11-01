@@ -29,8 +29,11 @@ Set the model's `parallel_slots` to the native JSON's `parallel` value. With
 multiple Strata slots, one per replica is reserved against requests carrying
 `x-inference-priority: background`, so long background generations cannot fill
 every slot before a chat arrives. Interactive/normal work can use the full
-capacity. Running requests continue; further background requests wait. The
-existing request-boundary priority behavior is unchanged for other backends.
+capacity. Running requests continue; further background requests wait. New
+background requests also wait while any foreground request remains active, so
+successive large background prefills cannot keep interrupting its generation.
+Foreground work arriving during a running background stream still overlaps it.
+The existing request-boundary priority behavior is unchanged for other backends.
 
 The native JSON contains Strata's `exe`, `args`, `cwd`, `tokenizer`, `env`, and
 optional `vision` configuration. Use absolute paths. `cwd` contains the Strata

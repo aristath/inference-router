@@ -146,7 +146,8 @@ impl RequestQueue {
                 let state = queue.state.lock().unwrap();
                 state.active < capacity
                     && (priority != Priority::Background
-                        || state.active_background < background_capacity)
+                        || (state.active_background < background_capacity
+                            && (reserved == 0 || state.active == state.active_background)))
                     && state.waiting.iter().min() == Some(&(priority, ticket.id))
             };
             if !eligible {
@@ -168,7 +169,8 @@ impl RequestQueue {
                 let mut state = queue.state.lock().unwrap();
                 if state.active < capacity
                     && (priority != Priority::Background
-                        || state.active_background < background_capacity)
+                        || (state.active_background < background_capacity
+                            && (reserved == 0 || state.active == state.active_background)))
                     && state.waiting.iter().min() == Some(&(priority, ticket.id))
                 {
                     state.waiting.retain(|(_, id)| *id != ticket.id);
@@ -400,7 +402,7 @@ mod tests {
             .await
             .unwrap();
         let q = queue.clone();
-        let second = tokio::spawn(async move {
+        let mut second = tokio::spawn(async move {
             q.acquire_with_background_reserve("m", Priority::Background, 2, 1, None)
                 .await
                 .unwrap()
@@ -414,12 +416,18 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        drop(chat);
         assert!(
             !second.is_finished(),
             "the active background request keeps its permit; another must wait"
         );
         drop(background);
+        assert!(
+            timeout(Duration::from_millis(30), &mut second)
+                .await
+                .is_err(),
+            "a new background prefill must wait while foreground generation continues"
+        );
+        drop(chat);
         let next = timeout(Duration::from_secs(1), second)
             .await
             .unwrap()
