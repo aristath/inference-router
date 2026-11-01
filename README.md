@@ -1,5 +1,8 @@
 # inference-router
 
+Native [Strata backends](docs/strata.md) can use expert/PLE offloading without
+llama.cpp fitting or launch flags, while retaining router admission and lifecycle.
+
 Per-request vLLM template overrides may be supplied as `chat_template_overrides`,
 an object keyed by concrete model ID. The proxy selects the resolved model's entry
 after alias/fallback routing, forwards it as `chat_template`, and removes the map.

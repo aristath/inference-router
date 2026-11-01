@@ -2192,7 +2192,8 @@ fn validate_draft_reference(
 }
 
 fn spawn_config_changed(old: &ModelConfig, new: &ModelConfig) -> bool {
-    old.weights_format != new.weights_format
+    old.strata != new.strata
+        || old.weights_format != new.weights_format
         || old.binary_preset != new.binary_preset
         || old.binary != new.binary
         || old.model_path != new.model_path
@@ -2312,6 +2313,21 @@ fn place_model(
     model
         .validate_placement()
         .map_err(|error| crate::vram::llama_fit::LlamaFitError::Parse(error.to_string()))?;
+    if let Some(strata) = &model.strata {
+        // Strata's native config owns placement. Never run llama.cpp fitting
+        // against it or sum unrelated GPUs to admit a single-device runtime.
+        let free = subtract_reserved_from_gpus(gpus.to_vec(), reserved)
+            .into_iter()
+            .find(|gpu| gpu.cuda_index == Some(strata.gpu) && gpu.supports(Backend::Cuda))
+            .map(|gpu| gpu.allocatable_vram(caps.0, caps.1))
+            .unwrap_or(0);
+        model.estimated_vram = strata.vram_mib * 1024 * 1024;
+        return Ok(if free >= model.estimated_vram {
+            PlaceOutcome::Fits
+        } else {
+            PlaceOutcome::DoesNotFit { free }
+        });
+    }
     if model.cpu_only {
         if model.weights_format == WeightsFormat::Gguf {
             model.device = Some("none".into());

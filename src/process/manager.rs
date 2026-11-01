@@ -630,6 +630,30 @@ pub fn build_command_args(
     draft: Option<&ModelConfig>,
     port: u16,
 ) -> Vec<String> {
+    if let Some(strata) = &model.strata {
+        return vec![
+            "--config".into(),
+            strata.config.to_string_lossy().into_owned(),
+            "--port".into(),
+            port.to_string(),
+            "--model-name".into(),
+            model.id.clone(),
+            "--native".into(),
+            model.model_path.to_string_lossy().into_owned(),
+            "--context".into(),
+            model.context.to_string(),
+            "--gpu".into(),
+            strata.gpu.to_string(),
+            "--sampling".into(),
+            serde_json::json!({
+                "temperature": model.temperature, "top_p": model.top_p,
+                "top_k": model.top_k, "min_p": model.min_p,
+                "presence_penalty": model.presence_penalty,
+                "repetition_penalty": model.repeat_penalty,
+            })
+            .to_string(),
+        ];
+    }
     let mut args = Vec::new();
     match model.weights_format {
         WeightsFormat::Gguf => {
@@ -976,6 +1000,13 @@ async fn wait_for_health_or_exit(
         let health = async {
             match client.get(&url).send().await {
                 Ok(response) if response.status().is_success() => {
+                    // Strata can serve HTTP while its native engine is still loading.
+                    // Empty/text health bodies from other backends remain valid.
+                    if let Ok(body) = response.json::<serde_json::Value>().await {
+                        if body.get("loaded").and_then(serde_json::Value::as_bool) == Some(false) {
+                            return false;
+                        }
+                    }
                     debug!(port, "health check passed");
                     return true;
                 }

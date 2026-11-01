@@ -855,6 +855,7 @@ const MODEL_DEFAULTS = {
 // ===== 2-step modal state =====
 let _currentGgufMeta = null;
 let _editingModelGgufMeta = null;
+let _editingModelStrata = null;
 let _ggufApplyInfo = null;     // set by GGUF preview IIFE once mounted
 let _ggufResetInfo = null;
 let _step1BrowserCwd = null;
@@ -1347,6 +1348,7 @@ async function editModel(id) {
         const m = models.find(x => x.id === id);
         if (!m) { alert(`Model ${id} not found.`); return; }
         _editingModelGgufMeta = m.gguf_meta || null;
+        _editingModelStrata = m.strata || null;
         await refreshPresetSelect();
         await refreshDraftSelect();
         // If the draft no longer exists, append a placeholder option so the
@@ -2539,6 +2541,7 @@ document.getElementById('model-form').addEventListener('submit', async (e) => {
         name: field('name').value.trim(),
         profile: toOptStr(field('profile').value),
         weights_format: field('weights_format').value,
+        strata: mode === 'edit' ? _editingModelStrata : null,
         binary_preset: presetChoice === '__custom__' ? null : presetChoice,
         binary: presetChoice === '__custom__' ? field('binary').value.trim() : '',
         model_path: field('model_path').value.trim(),

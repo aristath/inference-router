@@ -5,6 +5,43 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+#[test]
+fn strata_reserves_measured_vram_on_its_configured_cuda_device_without_fit() {
+    let mut m = model("strata");
+    m.binary = "/must-not-run-a-llama-probe".into();
+    m.strata = Some(crate::config::StrataConfig {
+        config: "/runtime/strata.json".into(),
+        vram_mib: 20000,
+        gpu: 1,
+    });
+    let mut a = gpu("cuda0", "0000:01:00.0", 0);
+    a.cuda_index = Some(0);
+    a.tags.insert(Backend::Cuda);
+    let mut b = gpu("cuda1", "0000:02:00.0", 1);
+    b.cuda_index = Some(1);
+    b.tags.insert(Backend::Cuda);
+    b.used_vram = 20 * 1024 * 1024 * 1024;
+    assert!(matches!(
+        place_model(
+            &mut m,
+            None,
+            &[Backend::Cuda],
+            &[a.clone(), b.clone()],
+            0,
+            (100.0, 100.0)
+        )
+        .unwrap(),
+        PlaceOutcome::DoesNotFit { .. }
+    ));
+    b.used_vram = 0;
+    assert!(matches!(
+        place_model(&mut m, None, &[Backend::Cuda], &[a, b], 0, (100.0, 100.0)).unwrap(),
+        PlaceOutcome::Fits
+    ));
+    assert_eq!(m.estimated_vram, 20000 * 1024 * 1024);
+    assert!(m.fit_target.is_none());
+}
+
 fn orch(tmp: &TempDir) -> Arc<Orchestrator> {
     let store = Arc::new(JsonStore::<Vec<ModelConfig>>::new(
         tmp.path().join("models.json"),

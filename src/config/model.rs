@@ -237,6 +237,17 @@ impl CacheType {
     }
 }
 
+/// Native Strata configuration and measured CUDA admission budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StrataConfig {
+    /// Native Strata server JSON; the engine owns expert and KV placement.
+    pub config: PathBuf,
+    /// Measured total backend GPU footprint, including vision and scratch.
+    pub vram_mib: u64,
+    #[serde(default)]
+    pub gpu: usize,
+}
+
 /// Self-contained per-model configuration. No external framework entity.
 ///
 /// `Default` produces a blank GGUF model with llama.cpp's sampling defaults
@@ -251,6 +262,8 @@ pub struct ModelConfig {
 
     #[serde(default, skip_serializing_if = "is_default_weights_format")]
     pub weights_format: WeightsFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strata: Option<StrataConfig>,
     /// If set, looked up in the presets table at spawn time to get the actual
     /// binary path. If `None`, `binary` below is used verbatim. Lets you
     /// change a binary once (e.g. rebuild llama.cpp) and have every model
@@ -441,6 +454,7 @@ impl Default for ModelConfig {
             name: String::new(),
             profile: None,
             weights_format: WeightsFormat::default(),
+            strata: None,
             binary_preset: None,
             binary: PathBuf::new(),
             model_path: PathBuf::new(),
@@ -535,6 +549,20 @@ impl ModelConfig {
     }
 
     pub fn validate_placement(&self) -> Result<(), ConfigError> {
+        if let Some(strata) = &self.strata {
+            if self.weights_format != WeightsFormat::Gguf
+                || self.cpu_only
+                || self.igpu_only
+                || self.draft_model_id.is_some()
+                || strata.vram_mib == 0
+                || strata.vram_mib > u64::MAX / (1024 * 1024)
+                || strata.config.as_os_str().is_empty()
+            {
+                return Err(ConfigError::InvalidPlacement(
+                    "Strata requires GGUF, a native config and nonzero measured VRAM; placement and drafting belong in that config".into(),
+                ));
+            }
+        }
         if self.igpu_only {
             if self.cpu_only || self.weights_format != WeightsFormat::Gguf {
                 return Err(ConfigError::InvalidPlacement(

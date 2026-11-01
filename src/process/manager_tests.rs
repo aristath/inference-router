@@ -1,4 +1,72 @@
 use super::*;
+
+#[test]
+fn strata_launches_native_config_without_llama_fit_or_placement_flags() {
+    let mut model = gguf_model();
+    model.strata = Some(crate::config::StrataConfig {
+        config: "/runtime/strata.json".into(),
+        vram_mib: 23000,
+        gpu: 1,
+    });
+    model.device = Some("CUDA1".into());
+    model.fit_target = Some("1024".into());
+    model.extra_args = vec!["--llama-only".into()];
+    let args = build_command_args(&model, None, 9123);
+    assert_eq!(last_flag_value(&args, &["--port"]).as_deref(), Some("9123"));
+    assert_eq!(last_flag_value(&args, &["--gpu"]).as_deref(), Some("1"));
+    assert_eq!(
+        last_flag_value(&args, &["--config"]).as_deref(),
+        Some("/runtime/strata.json")
+    );
+    assert!(!args
+        .iter()
+        .any(|arg| ["-m", "--fit", "--device", "--llama-only"].contains(&arg.as_str())));
+}
+
+#[tokio::test]
+async fn health_waits_until_a_strata_engine_is_loaded() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        for loaded in [false, false, true] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 2048];
+            let received = socket.read(&mut buffer).await.unwrap();
+            assert!(received > 0);
+            let body = format!("{{\"status\":\"ok\",\"loaded\":{loaded}}}");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("10")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    // Keep the sender live; closing it means cancellation in the real manager.
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    let mut cancel = receiver;
+    wait_for_health_or_exit(&mut child, port, Duration::from_secs(5), &mut cancel)
+        .await
+        .unwrap();
+    assert!(
+        server.is_finished(),
+        "an HTTP 200 with loaded=false must not admit work"
+    );
+    server.await.unwrap();
+    child.kill().await.unwrap();
+    drop(sender);
+}
 use crate::config::{CacheType, ReasoningFormat};
 use tokio::sync::{oneshot, watch};
 

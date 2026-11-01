@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Launch a native Strata config under the router's existing process group."""
+import argparse
+import json
+import os
+from pathlib import Path
+
+
+def prepare(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--port", required=True, type=int)
+    parser.add_argument("--model-name", required=True)
+    parser.add_argument("--native", required=True, type=Path)
+    parser.add_argument("--context", required=True, type=int)
+    parser.add_argument("--gpu", required=True, type=int)
+    parser.add_argument("--sampling", required=True, type=json.loads)
+    args = parser.parse_args(argv)
+    config = json.loads(args.config.read_text())
+    engine_args = config.get("args", [])
+
+    def engine_value(flag):
+        try:
+            return engine_args[engine_args.index(flag) + 1]
+        except (ValueError, IndexError):
+            raise ValueError(f"native config must specify {flag}") from None
+
+    if Path(engine_value("--native")).resolve() != args.native.resolve():
+        raise ValueError("router model_path and Strata --native disagree")
+    if int(engine_value("--max-context")) != args.context:
+        raise ValueError("router context and Strata --max-context disagree")
+    root = Path(config["cwd"]).resolve()
+    python = Path(config.get("python", root / ".venv/bin/python"))
+    server = root / "serve/server.py"
+    if not python.is_file() or not server.is_file():
+        raise ValueError("Strata config cwd must contain serve/server.py and its .venv/bin/python")
+    config.update(model_name=args.model_name, host="127.0.0.1", port=args.port,
+                  lazy_load=False, fit_max_tokens=False)
+    config["sampling"] = {**config.get("sampling", {}), **args.sampling}
+    # The Python server needs these too (e.g. reasoning-history normalization),
+    # not only the C++ subprocess that reads the config's env block.
+    env = {**os.environ, **{k: str(v) for k, v in config.get("env", {}).items()}}
+    return config, env, python, server, args.gpu
+
+
+def main():
+    config, env, python, server, gpu = prepare()
+    # No per-port files or deployment backups accumulate. The descriptor survives
+    # exec and is reclaimed with this process. All config paths should be absolute.
+    fd = os.memfd_create("inference-router-strata", flags=0)
+    os.write(fd, json.dumps(config).encode())
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.set_inheritable(fd, True)
+    os.chdir(config["cwd"])
+    os.execve(python, [str(python), str(server), "--engine", "strata",
+                      "--config", f"/proc/self/fd/{fd}", "--host", "127.0.0.1",
+                      "--port", str(config["port"]), "--gpu", str(gpu)], env)
+
+
+if __name__ == "__main__":
+    main()
