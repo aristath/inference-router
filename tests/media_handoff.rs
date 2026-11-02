@@ -25,6 +25,10 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new(timeout_secs: u64) -> Self {
+        Self::with_initial_strata(timeout_secs, false).await
+    }
+
+    async fn with_initial_strata(timeout_secs: u64, strata: bool) -> Self {
         std::env::set_var(
             "INFERENCE_ROUTER_WORKER_EXECUTABLE",
             env!("CARGO_BIN_EXE_inference-router"),
@@ -100,7 +104,16 @@ print(json.dumps({{'image':'saved.png'}}),flush=True)
         // the real spawn path so the handoff must stop it and restore a new PID.
         let mut initial = model;
         initial.cpu_only = false;
-        initial.n_gpu_layers = Some(1);
+        if strata {
+            initial.weights_format = WeightsFormat::Gguf;
+            initial.strata = Some(inference_router::config::StrataConfig {
+                config: dir.path().join("strata.json"),
+                vram_mib: 1,
+                gpu: 0,
+            });
+        } else {
+            initial.n_gpu_layers = Some(1);
+        }
         let mut pending = state
             .process_manager
             .lock()
@@ -273,6 +286,34 @@ print(json.dumps({{'image':'saved.png'}}),flush=True)
             .post(format!("{}/api/gpu/run/image", self.url))
             .json(&input)
     }
+}
+
+#[tokio::test]
+async fn native_strata_is_unloaded_before_media_and_resident_inference_is_restored() {
+    let f = Fixture::with_initial_strata(30, true).await;
+    let initial_pid = f.state.data.lock().await.models["fake"].pid.unwrap();
+    let media = tokio::spawn(f.media(json!({})).send());
+    f.wait("media-started").await;
+    assert!(
+        f.state.data.lock().await.models["fake"].pid.is_none(),
+        "the native Strata process must unload before the media worker starts"
+    );
+    f.mark("finish-media");
+    let response = media.await.unwrap().unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let restored_pid = f.state.data.lock().await.models["fake"].pid.unwrap();
+    assert_ne!(restored_pid, initial_pid);
+    assert!(f
+        .inference("after-media")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
 }
 
 #[tokio::test]

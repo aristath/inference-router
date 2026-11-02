@@ -21,6 +21,7 @@ fn strata_launches_native_config_without_llama_fit_or_placement_flags() {
     assert!(!args
         .iter()
         .any(|arg| ["-m", "--fit", "--device", "--llama-only"].contains(&arg.as_str())));
+    assert!(instance_uses_gpu(&model, &args));
 }
 
 #[tokio::test]

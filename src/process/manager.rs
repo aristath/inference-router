@@ -876,6 +876,10 @@ fn gguf_has_fitted_placement(model: &ModelConfig) -> bool {
 }
 
 fn instance_uses_gpu(model: &ModelConfig, args: &[String]) -> bool {
+    // Strata owns CUDA placement in its native config, without llama.cpp GPU flags.
+    if model.strata.is_some() {
+        return true;
+    }
     match model.weights_format {
         WeightsFormat::Safetensors => !model.cpu_only,
         WeightsFormat::Gguf => gguf_args_use_gpu(args),
