@@ -375,9 +375,17 @@ fn split_mode_serializes_lowercase() {
 
 #[test]
 fn cache_type_serializes_lowercase() {
-    assert_eq!(serde_json::to_string(&CacheType::F16).unwrap(), "\"f16\"");
-    assert_eq!(serde_json::to_string(&CacheType::Q8_0).unwrap(), "\"q8_0\"");
-    assert_eq!(serde_json::to_string(&CacheType::Q4_0).unwrap(), "\"q4_0\"");
+    for (cache_type, name) in CacheType::ALL.into_iter().zip([
+        "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "iq4_nl", "q4_0",
+    ]) {
+        let json = serde_json::to_string(&cache_type).unwrap();
+        assert_eq!(json, format!("\"{name}\""));
+        assert_eq!(
+            serde_json::from_str::<CacheType>(&json).unwrap(),
+            cache_type
+        );
+        assert_eq!(cache_type.as_arg(), name);
+    }
 }
 
 #[test]

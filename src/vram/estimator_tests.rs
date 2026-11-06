@@ -64,11 +64,7 @@ impl KvPerElement {
 }
 
 fn cache_type_bytes(cache_type: CacheType) -> (u64, u64) {
-    match cache_type {
-        CacheType::F16 => (2, 1),
-        CacheType::Q8_0 => (1, 1),
-        CacheType::Q4_0 => (1, 2),
-    }
+    cache_type.storage()
 }
 
 impl VramEstimate {
@@ -525,25 +521,25 @@ fn partial_offload_scales_vram_by_gpu_layer_fraction() {
 }
 
 #[test]
-fn q8_kv_quantization_halves_kv_cache_vs_fp16() {
+fn q8_kv_quantization_includes_block_scales() {
     let info = uniform_info(32, 32, 128, 0);
     let fp16 = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
     let q8 = info.kv_cache_bytes(
         4096,
         KvPerElement::from_types(CacheType::Q8_0, CacheType::Q8_0),
     );
-    assert_eq!(q8 * 2, fp16);
+    assert_eq!(q8 * 32, fp16 * 17);
 }
 
 #[test]
-fn q4_kv_quantization_quarters_kv_cache_vs_fp16() {
+fn q4_kv_quantization_includes_block_scales() {
     let info = uniform_info(32, 32, 128, 0);
     let fp16 = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
     let q4 = info.kv_cache_bytes(
         4096,
         KvPerElement::from_types(CacheType::Q4_0, CacheType::Q4_0),
     );
-    assert_eq!(q4 * 4, fp16);
+    assert_eq!(q4 * 32, fp16 * 9);
 }
 
 #[test]
@@ -553,10 +549,10 @@ fn mixed_kv_quantization_sums_k_and_v_independently() {
         4096,
         KvPerElement::from_types(CacheType::Q4_0, CacheType::F16),
     );
-    // K at 0.5 bytes/elem + V at 2.0 bytes/elem = 2.5 bytes/elem
-    // vs. 4.0 for f16 both → 5/8 ratio.
+    // K at 18/32 bytes/elem + V at 2 bytes/elem = 82/32 bytes/elem
+    // vs. 4 for f16 both, including the Q4 block scales.
     let fp16 = info.kv_cache_bytes(4096, KvPerElement::FP16_BOTH);
-    assert_eq!(mixed * 8, fp16 * 5);
+    assert_eq!(mixed * 64, fp16 * 41);
 }
 
 fn info_head_dim(n_embd: u32, n_head: u32, n_head_kv: u32, key_length: u32) -> GgufInfo {

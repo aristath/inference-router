@@ -8,8 +8,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::config::{
-    AppSettings, Backend, BinaryPreset, CacheType, ModelAlias, ModelConfig, ModelState,
-    WeightsFormat,
+    AppSettings, Backend, BinaryPreset, ModelAlias, ModelConfig, ModelState, WeightsFormat,
 };
 use crate::orchestrator::{AppState, LoadError, MutationError, StopError};
 use crate::vram::estimator::GgufMeta;
@@ -350,8 +349,8 @@ fn validate_context(model: &ModelConfig, warnings: &mut Vec<String>) {
 }
 
 fn validate_cache_quantization(model: &ModelConfig, warnings: &mut Vec<String>) {
-    let quantized = matches!(model.cache_type_k, Some(CacheType::Q8_0 | CacheType::Q4_0))
-        || matches!(model.cache_type_v, Some(CacheType::Q8_0 | CacheType::Q4_0));
+    let quantized = model.cache_type_k.is_some_and(|t| t.is_quantized())
+        || model.cache_type_v.is_some_and(|t| t.is_quantized());
     if quantized && !model.flash_attn {
         warnings.push("KV cache quantization usually requires flash attention".into());
     }

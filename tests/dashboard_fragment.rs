@@ -270,3 +270,97 @@ async fn index_page_loads_libraries_and_live_regions() {
     // regexp flag, where `-` must be escaped in this character class.
     assert!(body.contains(r#"pattern="[a-z0-9._\-]+""#));
 }
+
+#[tokio::test]
+async fn cache_selects_list_every_type_in_quality_order_with_storage_sizes() {
+    let port = serve(orchestrator_with_two_models().await).await;
+    let (status, body) = get(port, "/").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let expected = [
+        ("", "2"),
+        ("f32", "4"),
+        ("f16", "2"),
+        ("bf16", "2"),
+        ("q8_0", "1.0625"),
+        ("q5_1", "0.75"),
+        ("q5_0", "0.6875"),
+        ("q4_1", "0.625"),
+        ("iq4_nl", "0.5625"),
+        ("q4_0", "0.5625"),
+    ];
+    for id in ["cache_type_k", "cache_type_v"] {
+        let select = body
+            .split(&format!("<select id=\"{id}\""))
+            .nth(1)
+            .unwrap()
+            .split("</select>")
+            .next()
+            .unwrap();
+        assert_eq!(select.matches("<option ").count(), expected.len());
+        let mut previous = 0;
+        for (value, bytes) in expected {
+            let position = select
+                .find(&format!("value=\"{value}\" data-bytes=\"{bytes}\""))
+                .unwrap_or_else(|| panic!("missing {value} in {id}"));
+            assert!(position > previous, "{value} is out of order in {id}");
+            previous = position;
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_api_retains_all_cache_types_and_warns_only_for_quantized_caches() {
+    let port = serve(orchestrator_with_two_models().await).await;
+    let client = reqwest::Client::new();
+    for name in [
+        "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "iq4_nl", "q4_0",
+    ] {
+        let model = serde_json::json!({
+            "id": "alpha", "name": "Alpha", "binary": "/bin/true",
+            "model_path": "/dev/null", "cache_type_k": name, "cache_type_v": name,
+            "flash_attn": false
+        });
+        let response = client
+            .put(format!("http://127.0.0.1:{port}/api/models/alpha"))
+            .json(&model)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{name}");
+        let models: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}/api/models"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let saved = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "alpha")
+            .unwrap();
+        assert_eq!(saved["cache_type_k"], name);
+        assert_eq!(saved["cache_type_v"], name);
+        let validation: serde_json::Value = client
+            .post(format!("http://127.0.0.1:{port}/api/models/validate"))
+            .json(&model)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let warns_about_flash = validation["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("flash attention"));
+        assert_eq!(
+            warns_about_flash,
+            !matches!(name, "f32" | "f16" | "bf16"),
+            "{name}"
+        );
+    }
+}

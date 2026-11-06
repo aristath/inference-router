@@ -248,6 +248,30 @@ fn gguf_argv_emits_structured_llama_flags() {
 }
 
 #[test]
+fn gguf_argv_preserves_every_cache_type_for_target_and_draft() {
+    for cache_type in CacheType::ALL {
+        let mut model = gguf_model();
+        model.cache_type_k = Some(cache_type);
+        model.cache_type_v = Some(cache_type);
+        let args = build_command_args(&model, None, 9001);
+        assert_eq!(
+            find_flag(&args, "--cache-type-k"),
+            Some(cache_type.as_arg())
+        );
+        assert_eq!(
+            find_flag(&args, "--cache-type-v"),
+            Some(cache_type.as_arg())
+        );
+
+        let mut target = gguf_model();
+        target.draft_model_id = Some(model.id.clone());
+        let args = build_command_args(&target, Some(&model), 9001);
+        assert_eq!(find_flag(&args, "-ctkd"), Some(cache_type.as_arg()));
+        assert_eq!(find_flag(&args, "-ctvd"), Some(cache_type.as_arg()));
+    }
+}
+
+#[test]
 fn gguf_argv_emits_flash_attn_off_when_disabled() {
     let args = build_command_args(&gguf_model(), None, 9001);
     assert_eq!(

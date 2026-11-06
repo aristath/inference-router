@@ -399,21 +399,16 @@
                                 <div class="form-group">
                                     <label for="cache_type_k">K cache quantization</label>
                                     <select id="cache_type_k" name="cache_type_k">
-                                        <option value="">default (f16)</option>
-                                        <option value="f16">f16</option>
-                                        <option value="q8_0">q8_0 (½ VRAM)</option>
-                                        <option value="q4_0">q4_0 (¼ VRAM)</option>
+                                        {% include "_cache_type_options.html" %}
                                     </select>
+                                    <small class="field-help">Higher expected quality first; exact quality varies by model.</small>
                                 </div>
                                 <div class="form-group">
                                     <label for="cache_type_v">V cache quantization</label>
                                     <select id="cache_type_v" name="cache_type_v">
-                                        <option value="">default (f16)</option>
-                                        <option value="f16">f16</option>
-                                        <option value="q8_0">q8_0 (½ VRAM)</option>
-                                        <option value="q4_0">q4_0 (¼ VRAM)</option>
+                                        {% include "_cache_type_options.html" %}
                                     </select>
-                                    <small class="field-help">Requires flash attention if not f16.</small>
+                                    <small class="field-help">Quantized caches usually require flash attention. Supported types and K/V combinations depend on the backend.</small>
                                 </div>
                             </div>
                             <div class="form-row">
@@ -1688,10 +1683,8 @@ document.addEventListener('click', (e) => {
     }
 
     function cacheBytes(sel) {
-        const v = (document.getElementById(sel) || {}).value || '';
-        if (v === 'q8_0') return 1.0;
-        if (v === 'q4_0') return 0.5;
-        return 2.0;
+        const option = document.getElementById(sel)?.selectedOptions[0];
+        return Number(option?.dataset.bytes ?? 2);
     }
 
     function recompute(ctx) {

@@ -506,6 +506,12 @@ pub struct DashboardTemplate {
     pub server_port: u16,
 }
 
+impl DashboardTemplate {
+    pub fn cache_types(&self) -> &'static [crate::config::CacheType] {
+        &crate::config::CacheType::ALL
+    }
+}
+
 /// The two live regions only, each wrapped for an idiomorph out-of-band swap.
 /// Returned by `GET /fragment/dashboard` on every poll; htmx morphs each region
 /// into place so unchanged rows/cards are never re-created (no flash).

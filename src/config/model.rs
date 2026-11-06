@@ -220,20 +220,69 @@ impl ReasoningFormat {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheType {
+    F32,
     #[default]
     F16,
+    Bf16,
     Q8_0,
+    Q5_1,
+    Q5_0,
+    Q4_1,
+    #[serde(rename = "iq4_nl")]
+    Iq4Nl,
     Q4_0,
 }
 
 impl CacheType {
+    /// Higher expected fidelity first; ordering within a precision tier is
+    /// model-dependent rather than a guarantee about answer quality.
+    pub const ALL: [Self; 9] = [
+        Self::F32,
+        Self::F16,
+        Self::Bf16,
+        Self::Q8_0,
+        Self::Q5_1,
+        Self::Q5_0,
+        Self::Q4_1,
+        Self::Iq4Nl,
+        Self::Q4_0,
+    ];
+
     /// The literal string llama.cpp expects on the command line.
     pub fn as_arg(&self) -> &'static str {
         match self {
+            Self::F32 => "f32",
             Self::F16 => "f16",
+            Self::Bf16 => "bf16",
             Self::Q8_0 => "q8_0",
+            Self::Q5_1 => "q5_1",
+            Self::Q5_0 => "q5_0",
+            Self::Q4_1 => "q4_1",
+            Self::Iq4Nl => "iq4_nl",
             Self::Q4_0 => "q4_0",
         }
+    }
+
+    pub fn is_quantized(&self) -> bool {
+        !matches!(self, Self::F32 | Self::F16 | Self::Bf16)
+    }
+
+    /// GGML block bytes and element count, including scales and offsets.
+    pub fn storage(&self) -> (u64, u64) {
+        match self {
+            Self::F32 => (4, 1),
+            Self::F16 | Self::Bf16 => (2, 1),
+            Self::Q8_0 => (34, 32),
+            Self::Q5_1 => (24, 32),
+            Self::Q5_0 => (22, 32),
+            Self::Q4_1 => (20, 32),
+            Self::Iq4Nl | Self::Q4_0 => (18, 32),
+        }
+    }
+
+    pub fn bytes_per_element(&self) -> f64 {
+        let (bytes, elements) = self.storage();
+        bytes as f64 / elements as f64
     }
 }
 

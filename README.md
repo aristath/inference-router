@@ -106,6 +106,7 @@ State files under `~/.config/inference-router/`:
   - `cpu_only: true` runs a model entirely on CPU without GPU admission or fit probing. Use a CPU-capable binary preset (such as a CPU build of vLLM for safetensors). For GGUF this also disables draft/MTP and projector offload; normal GPU placement is unchanged when omitted.
   - `igpu_only: true` runs a GGUF model fully on an integrated Vulkan GPU without the discrete-GPU media gate. It fails if no integrated Vulkan GPU exists; it never falls back to a discrete GPU. CPU-only and iGPU-only are mutually exclusive. Draft/MTP and raw GPU-placement overrides are not supported in iGPU-only mode.
   - llama.cpp knobs: `flash_attn`, `n_gpu_layers`, `mlock`, `no_mmap`, `parallel_slots`, `cache_type_{k,v}`, `split_mode` (`none | layer | row | tensor`), `main_gpu`, `tensor_split`.
+    KV cache types are listed in higher-to-lower expected quality order: `f32`, `f16`, `bf16`, `q8_0`, `q5_1`, `q5_0`, `q4_1`, `iq4_nl`, `q4_0`. Quality within a precision tier varies by model. Backend and attention-kernel support determine which K/V combinations can run; leaving a cache type blank retains llama.cpp's F16 default.
   - Speculative decoding: `mtp_tokens` for embedded MTP heads, or `draft_model_id` plus `draft_{max,min,p_min}` for an external draft model.
   - `extra_args`: arbitrary argv array — escape hatch for flags not modelled.
   - Sampling: `temperature`, `top_p`, `top_k`, `min_p`.

@@ -1,0 +1,4 @@
+<option value="" data-bytes="2">default (f16)</option>
+{% for cache_type in self.cache_types() %}
+<option value="{{ cache_type.as_arg() }}" data-bytes="{{ cache_type.bytes_per_element() }}">{{ cache_type.as_arg() }}</option>
+{% endfor %}
