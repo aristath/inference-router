@@ -105,6 +105,94 @@ fn rewrite_model_field(body: &[u8], model_id: &str) -> Result<Vec<u8>, serde_jso
     serde_json::to_vec(&doc)
 }
 
+/// Count the prepared chat prompt on an existing backend. Unlike the inference
+/// proxy this never loads, evicts, recycles, or waits for a model to start.
+pub async fn count_tokens(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let unavailable = |code: &str, message: &str| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": message, "code": code})),
+        )
+            .into_response()
+    };
+    let Some(requested) = body.get("model").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"A model is required"})),
+        )
+            .into_response();
+    };
+    let gpu_permit = state.gpu_gate.try_inference();
+    let (model_id, independent) = state
+        .inference_target(requested, gpu_permit.is_none())
+        .await;
+    let (format, strata, window) = match state.data.lock().await.models.get(&model_id) {
+        Some(model) => (model.weights_format, model.strata.is_some(), model.context),
+        None => return unavailable("model_unavailable", "The selected model is unavailable"),
+    };
+    if !independent && gpu_permit.is_none() {
+        return unavailable(
+            "model_busy",
+            "Token counting is unavailable while the GPU is reserved for media",
+        );
+    }
+    let gpu_permit = if independent { None } else { gpu_permit };
+    if strata {
+        return unavailable(
+            "unsupported",
+            "This backend does not expose chat token counting",
+        );
+    }
+    // Pin and select under one manager lock. A separate status check followed
+    // by the ordinary proxy could race an unload and inadvertently load a model.
+    let Some(guard) = state
+        .process_manager
+        .lock()
+        .await
+        .acquire_any_instance(&model_id)
+    else {
+        return unavailable(
+            "model_not_loaded",
+            "Load the selected model to count its context tokens",
+        );
+    };
+    let rewritten = rewrite_model_field(&serde_json::to_vec(&body).unwrap(), &model_id).unwrap();
+    let mut body: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+    let path = match format {
+        crate::config::WeightsFormat::Gguf => "/v1/chat/completions/input_tokens",
+        crate::config::WeightsFormat::Safetensors => {
+            body["add_generation_prompt"] = json!(true);
+            "/tokenize"
+        }
+    };
+    let reply = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}{path}", guard.port))
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&body)
+        .send()
+        .await;
+    let result = match reply {
+        Ok(reply) if reply.status().is_success() => reply.json::<serde_json::Value>().await.ok(),
+        _ => None,
+    };
+    // Keep both the instance pin and GPU reservation through the full response.
+    drop(guard);
+    drop(gpu_permit);
+    let Some(tokens) = result.as_ref().and_then(|result| {
+        match format {
+            crate::config::WeightsFormat::Gguf => result.get("input_tokens"),
+            crate::config::WeightsFormat::Safetensors => result.get("count"),
+        }
+        .and_then(|v| v.as_u64())
+    }) else {
+        return unavailable("count_unavailable", "The loaded backend could not count this chat prompt; retry after checking its token-counting support");
+    };
+    Json(json!({"tokens": tokens, "model": model_id, "contextWindow": window})).into_response()
+}
+
 /// Byte-level passthrough handler for `/v1/*`. Peeks `model` from the JSON
 /// body, calls `ensure_loaded`, then proxies request/response. Alias requests
 /// are forwarded with the resolved model id because upstream OpenAI-compatible

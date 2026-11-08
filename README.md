@@ -33,6 +33,7 @@ Default bind: `0.0.0.0:8080`.
 | --- | --- | --- |
 | `/` | GET | Dashboard (HTML) |
 | `/api/status` | GET | Live system + GPU + model snapshot (dashboard polls this) |
+| `/api/token-count` | POST | Count a prepared chat request on an already loaded model; never loads or switches models |
 | `/api/models` | GET, POST | List / create model definitions |
 | `/api/models/validate` | POST | Validate a model definition without saving it |
 | `/api/models/{id}` | PUT, DELETE | Update / delete |
@@ -47,6 +48,15 @@ Default bind: `0.0.0.0:8080`.
 | `/healthz` | GET | Liveness |
 
 ## Running
+
+`POST /api/token-count` accepts the same model/messages/tools/template controls as
+a chat request and returns `{ "tokens": 123, "model": "resolved-model-id" }`.
+It pins an existing instance for the complete request, using llama.cpp's
+`/v1/chat/completions/input_tokens` or vLLM's `/tokenize` (including its chat
+template and multimodal preprocessing). It does not generate a response. Cold
+models, reserved GPUs, unsupported backends (including Strata), or missing
+token-counting support return HTTP 503 with an explanatory error. Ordinary
+`/tokenize` retains its on-demand loading behavior.
 
 ### systemd (user unit)
 

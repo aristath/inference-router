@@ -210,6 +210,7 @@ pub fn build_router(app_state: AppState) -> axum::Router {
         .route("/assets/{file}", get(crate::ui::assets::serve_asset))
         // REST API
         .route("/api/status", get(get_app_state))
+        .route("/api/token-count", post(proxy::count_tokens))
         .route("/api/gpu", get(crate::api::media::status))
         .route("/api/gpu/run/{worker}", post(crate::api::media::run))
         .route("/api/gpu/recover", post(crate::api::media::recover))

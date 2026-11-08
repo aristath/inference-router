@@ -304,8 +304,146 @@ fn router_for(orchestrator: Arc<Orchestrator>) -> axum::Router {
     let state: AppState = orchestrator;
     axum::Router::new()
         .route("/v1/models", get(proxy::list_v1_models))
+        .route("/api/token-count", post(proxy::count_tokens))
         .route("/v1/{*rest}", any(proxy::proxy_handler))
         .with_state(state)
+}
+
+#[tokio::test]
+async fn token_count_uses_loaded_instance_and_template_without_generation() {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let backend = axum::Router::new()
+        .route(
+            "/tokenize",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body["add_generation_prompt"], true);
+                assert_eq!(body["chat_template"], "Selected template");
+                Json(serde_json::json!({"count": 0, "tokens": []}))
+            }),
+        )
+        .route(
+            "/v1/chat/completions/input_tokens",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().await.push(body);
+                    Json(serde_json::json!({"input_tokens": 4321}))
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let state = build_proxy_orchestrator(upstream).await;
+    state
+        .add_alias(ModelAlias {
+            alias: "chat".into(),
+            target: "fake".into(),
+            fallback: None,
+        })
+        .await
+        .unwrap();
+    let port = start_proxy_server(router_for(state.clone())).await;
+    let client = reqwest::Client::new();
+    let input = serde_json::json!({
+        "model": "chat", "messages": [{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,fixture"}}]}],
+        "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+        "chat_template_overrides":{"fake":"Selected template"}, "chat_template_kwargs":{"enable_thinking":false}
+    });
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api/token-count"))
+        .json(&input)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let count: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(count["tokens"], 4321);
+    assert_eq!(count["model"], "fake");
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["messages"], input["messages"]);
+    assert_eq!(seen[0]["tools"], input["tools"]);
+    assert_eq!(
+        seen[0]["chat_template_kwargs"],
+        input["chat_template_kwargs"]
+    );
+    assert_eq!(seen[0]["model"], "fake");
+    assert_eq!(seen[0]["chat_template"], "Selected template");
+    assert!(seen[0].get("chat_template_overrides").is_none());
+    assert_eq!(state.process_manager.lock().await.instance_count("fake"), 1);
+    assert!(!state
+        .process_manager
+        .lock()
+        .await
+        .model_has_active_requests("fake"));
+    drop(seen);
+    state
+        .data
+        .lock()
+        .await
+        .models
+        .get_mut("fake")
+        .unwrap()
+        .weights_format = WeightsFormat::Safetensors;
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api/token-count"))
+        .json(&input)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["tokens"],
+        0
+    );
+    let _media = state.gpu_gate.media().await;
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api/token-count"))
+        .json(&input)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["code"],
+        "model_busy"
+    );
+}
+
+#[tokio::test]
+async fn token_count_never_loads_a_cold_model_or_returns_zero_on_failure() {
+    let state = build_proxy_orchestrator(1).await;
+    state
+        .add_model(ModelConfig {
+            id: "cold".into(),
+            name: "cold".into(),
+            binary: "/must-not-launch".into(),
+            model_path: "/must-not-read".into(),
+            ..ModelConfig::default()
+        })
+        .await
+        .unwrap();
+    let port = start_proxy_server(inference_router::lifecycle::build_router(state.clone())).await;
+    let client = reqwest::Client::new();
+    for (model, code) in [("cold", "model_not_loaded"), ("fake", "count_unavailable")] {
+        let reply = client
+            .post(format!("http://127.0.0.1:{port}/api/token-count"))
+            .json(&serde_json::json!({"model":model,"messages":[]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status().as_u16(), 503);
+        let reply: serde_json::Value = reply.json().await.unwrap();
+        assert_eq!(reply["code"], code);
+        assert!(reply.get("tokens").is_none());
+    }
+    assert_eq!(state.process_manager.lock().await.instance_count("cold"), 0);
+    assert_eq!(
+        state.data.lock().await.models["cold"].state,
+        ModelState::Idle
+    );
 }
 
 /// Builds the orchestrator with a single "loaded" model pointed at `upstream_port`.
