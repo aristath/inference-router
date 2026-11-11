@@ -82,6 +82,26 @@ impl RoutingBody {
         }
     }
 
+    pub async fn affinity_keys(&self, headers: &axum::http::HeaderMap) -> Option<Vec<u64>> {
+        match self {
+            Self::Memory(bytes) => super::replica_routing::prefix_keys(bytes, headers),
+            Self::Disk(file, _) => {
+                let mut file = file.try_clone().ok()?;
+                let headers = headers.clone();
+                tokio::task::spawn_blocking(move || {
+                    file.rewind().ok()?;
+                    let doc =
+                        serde_json::from_reader::<_, serde_json::Value>(BufReader::new(&mut file));
+                    file.rewind().ok()?;
+                    super::replica_routing::document_prefix_keys(&doc.ok()?, &headers)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+        }
+    }
+
     pub async fn into_bytes(self) -> Result<Bytes, std::io::Error> {
         match self {
             Self::Memory(bytes) => Ok(bytes),

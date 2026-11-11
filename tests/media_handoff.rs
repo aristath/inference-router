@@ -209,6 +209,8 @@ print(json.dumps({{'image':'saved.png'}}),flush=True)
         }
         self.state
             .add_alias(ModelAlias {
+                slot: None,
+                slots: vec![],
                 alias: "fast".into(),
                 target: "igpu".into(),
                 fallback: None,
@@ -217,6 +219,8 @@ print(json.dumps({{'image':'saved.png'}}),flush=True)
             .unwrap();
         self.state
             .add_alias(ModelAlias {
+                slot: None,
+                slots: vec![],
                 alias: "default".into(),
                 target: "fake".into(),
                 fallback: Some("fast".into()),
@@ -235,11 +239,15 @@ print(json.dumps({{'image':'saved.png'}}),flush=True)
         self.state.add_model(cpu).await.unwrap();
         for alias in [
             ModelAlias {
+                slot: None,
+                slots: vec![],
                 alias: "fast".into(),
                 target: "cpu".into(),
                 fallback: None,
             },
             ModelAlias {
+                slot: None,
+                slots: vec![],
                 alias: "default".into(),
                 target: "fake".into(),
                 fallback: Some("fast".into()),

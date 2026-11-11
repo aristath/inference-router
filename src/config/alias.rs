@@ -11,6 +11,12 @@ pub struct ModelAlias {
     pub alias: String,
     /// The id of the configured model this alias resolves to.
     pub target: String,
+    /// Optional zero-based llama.cpp slot. The first slot in an alias chain wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    /// Allowed llama.cpp slots, selected by affinity and availability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<u32>,
     /// Optional CPU-only or iGPU-only model or alias used while media blocks GPU admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,

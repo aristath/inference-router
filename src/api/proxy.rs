@@ -88,10 +88,17 @@ fn unresponsive_response(model_id: &str) -> Response {
         .into_response()
 }
 
-fn rewrite_model_field(body: &[u8], model_id: &str) -> Result<Vec<u8>, serde_json::Error> {
+fn rewrite_model_field(
+    body: &[u8],
+    model_id: &str,
+    slot: Option<u32>,
+) -> Result<Vec<u8>, serde_json::Error> {
     let mut doc: serde_json::Value = serde_json::from_slice(body)?;
     if let Some(model) = doc.get_mut("model") {
         *model = serde_json::Value::String(model_id.to_owned());
+    }
+    if let Some(slot) = slot {
+        doc["id_slot"] = json!(slot);
     }
     // Select only after routing: an alias may have been sent to its fallback.
     if let Some(overrides) = doc
@@ -106,7 +113,7 @@ fn rewrite_model_field(body: &[u8], model_id: &str) -> Result<Vec<u8>, serde_jso
 }
 
 /// Count the prepared chat prompt on an existing backend. Unlike the inference
-/// proxy this never loads, evicts, recycles, or waits for a model to start.
+/// proxy this is read-only unless budgeting explicitly supplies load_model=true.
 pub async fn count_tokens(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -146,21 +153,45 @@ pub async fn count_tokens(
             "This backend does not expose chat token counting",
         );
     }
-    // Pin and select under one manager lock. A separate status check followed
-    // by the ordinary proxy could race an unload and inadvertently load a model.
-    let Some(guard) = state
+    // Inspection remains read-only. Budgeting can explicitly request the same
+    // model startup that its imminent completion would otherwise require.
+    let existing = state
         .process_manager
         .lock()
         .await
-        .acquire_any_instance(&model_id)
-    else {
-        return unavailable(
-            "model_not_loaded",
-            "Load the selected model to count its context tokens",
-        );
+        .acquire_any_instance(&model_id);
+    let guard = match existing {
+        Some(guard) => guard,
+        None if body.get("load_model").and_then(|v| v.as_bool()) == Some(true) => {
+            let loaded = if independent {
+                state.clone().ensure_loaded_independent(&model_id).await
+            } else {
+                state
+                    .clone()
+                    .ensure_loaded_admitted(&model_id, gpu_permit.clone())
+                    .await
+            };
+            match loaded {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return unavailable(
+                        "load_failed",
+                        &format!("Could not prepare the model tokenizer: {error}"),
+                    )
+                }
+            }
+        }
+        None => {
+            return unavailable(
+                "model_not_loaded",
+                "Load the selected model to count its context tokens",
+            )
+        }
     };
-    let rewritten = rewrite_model_field(&serde_json::to_vec(&body).unwrap(), &model_id).unwrap();
+    let rewritten =
+        rewrite_model_field(&serde_json::to_vec(&body).unwrap(), &model_id, None).unwrap();
     let mut body: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+    body.as_object_mut().unwrap().remove("load_model");
     let path = match format {
         crate::config::WeightsFormat::Gguf => "/v1/chat/completions/input_tokens",
         crate::config::WeightsFormat::Safetensors => {
@@ -260,6 +291,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             .into_response();
     }
 
+    let allowed_slots = if parts.uri.path().ends_with("/completions") {
+        state.inference_slots(&requested_model, &model_id).await
+    } else {
+        Vec::new()
+    };
     let (slots, strata) = state
         .data
         .lock()
@@ -273,12 +309,39 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
             )
         })
         .unwrap_or((1, false));
+    if !allowed_slots.is_empty() {
+        let supported = state
+            .data
+            .lock()
+            .await
+            .models
+            .get(&model_id)
+            .is_some_and(|m| m.weights_format == crate::config::WeightsFormat::Gguf && !strata);
+        if !supported || allowed_slots.iter().any(|slot| *slot as usize >= slots) {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+                "error": format!("alias '{requested_model}' selects slots {allowed_slots:?}, but model '{model_id}' needs a llama.cpp backend with matching slots; update its slot configuration"),
+                "model": model_id,
+            }))).into_response();
+        }
+    }
     let replicas = state
         .process_manager
         .lock()
         .await
         .instance_count(&model_id)
         .max(1);
+    let slot_lease = if allowed_slots.is_empty() {
+        None
+    } else {
+        let keys = body.affinity_keys(&parts.headers).await.unwrap_or_default();
+        Some(
+            state
+                .slot_pool
+                .acquire(&model_id, &allowed_slots, &keys)
+                .await,
+        )
+    };
+    let slot = slot_lease.as_ref().map(|lease| lease.slot);
     let capacity = slots.saturating_mul(replicas);
     let gate = (!independent).then(|| state.gpu_gate.clone());
     let admitted = if strata && slots > 1 {
@@ -309,6 +372,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         requested_model,
         model_id,
         independent,
+        slot,
         &admission,
     )
     .await;
@@ -316,6 +380,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
         Body::from_stream(AdmittedStream {
             inner: body.into_data_stream(),
             permit: Some(admission),
+            slot_lease,
         })
     })
 }
@@ -324,6 +389,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
 struct AdmittedStream<S> {
     inner: S,
     permit: Option<RequestPermit>,
+    slot_lease: Option<crate::orchestrator::slot_pool::SlotLease>,
 }
 impl<S: Stream + Unpin> Stream for AdmittedStream<S> {
     type Item = S::Item;
@@ -331,6 +397,7 @@ impl<S: Stream + Unpin> Stream for AdmittedStream<S> {
         let next = Pin::new(&mut self.inner).poll_next(cx);
         if matches!(next, Poll::Ready(None)) {
             self.permit.take();
+            self.slot_lease.take();
         }
         next
     }
@@ -343,6 +410,7 @@ async fn proxy_admitted(
     requested_model: String,
     model_id: String,
     independent: bool,
+    slot: Option<u32>,
     admission: &RequestPermit,
 ) -> Response {
     let loaded = if independent {
@@ -430,14 +498,15 @@ async fn proxy_admitted(
     let upstream_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::POST);
 
-    let routed_body = if requested_model == model_id
+    let routed_body = if slot.is_none()
+        && requested_model == model_id
         && !body_bytes
             .windows(25)
             .any(|w| w == b"\"chat_template_overrides\"")
     {
         body_bytes.to_vec()
     } else {
-        match rewrite_model_field(&body_bytes, &model_id) {
+        match rewrite_model_field(&body_bytes, &model_id, slot) {
             Ok(body) => body,
             Err(e) => {
                 return (
@@ -694,7 +763,7 @@ mod idle_timeout_tests {
             ("cpu", Some("CPU template")),
             ("other", None),
         ] {
-            let bytes = super::rewrite_model_field(body, target).unwrap();
+            let bytes = super::rewrite_model_field(body, target, None).unwrap();
             let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(doc["model"], target);
             assert_eq!(doc["chat_template"].as_str(), expected);

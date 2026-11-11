@@ -52,6 +52,7 @@ pub type AppState = Arc<Orchestrator>;
 pub struct Orchestrator {
     independent_config: Arc<tokio::sync::RwLock<()>>,
     pub gpu_gate: Arc<super::gpu_gate::GpuGate>,
+    pub slot_pool: Arc<super::slot_pool::SlotPool>,
     pub request_queue: super::request_queue::RequestQueue,
     pub media: Arc<super::media::MediaController>,
     pub data: Arc<Mutex<AppData>>,
@@ -218,6 +219,7 @@ impl Orchestrator {
             })),
             process_manager: Arc::new(Mutex::new(ProcessManager::default())),
             request_queue: Default::default(),
+            slot_pool: Default::default(),
             vram_tracker,
             system_tracker: Arc::new(SystemTracker::default()),
             admission: Arc::new(Mutex::new(())),
@@ -496,6 +498,30 @@ impl Orchestrator {
             }
         }
         (primary, false)
+    }
+
+    /// Slot policy follows the selected route. A media fallback never inherits
+    /// a slot from the GPU model it replaces.
+    pub async fn inference_slots(&self, name: &str, target: &str) -> Vec<u32> {
+        let data = self.data.lock().await;
+        if resolve_alias_chain(&data.aliases, name) == target {
+            return resolve_alias_slots(&data.aliases, name);
+        }
+        let mut current = name;
+        let mut seen = HashSet::new();
+        while let Some(alias) = data.aliases.get(current) {
+            if !seen.insert(current) {
+                break;
+            }
+            if let Some(fallback) = &alias.fallback {
+                if resolve_alias_chain(&data.aliases, fallback) == target {
+                    return resolve_alias_slots(&data.aliases, fallback);
+                }
+                break;
+            }
+            current = &alias.target;
+        }
+        Vec::new()
     }
 
     pub async fn ensure_loaded_independent(
@@ -2052,8 +2078,25 @@ fn is_valid_alias_name(s: &str) -> bool {
 
 /// Follow the alias chain from `name` to a concrete model id.
 ///
-/// Stops and returns an empty string when it reaches an unassigned alias or
-/// detects a cycle; returns `name` unchanged when it isn't an alias.
+/// The first explicit slot policy in the alias chain wins.
+fn resolve_alias_slots(aliases: &HashMap<String, ModelAlias>, name: &str) -> Vec<u32> {
+    let mut current = name;
+    let mut seen = HashSet::new();
+    while let Some(alias) = aliases.get(current) {
+        if !seen.insert(current) {
+            return Vec::new();
+        }
+        if !alias.slots.is_empty() {
+            return alias.slots.clone();
+        }
+        if let Some(slot) = alias.slot {
+            return vec![slot];
+        }
+        current = &alias.target;
+    }
+    Vec::new()
+}
+
 fn resolve_alias_chain(aliases: &HashMap<String, ModelAlias>, name: &str) -> String {
     let mut current = name.to_string();
     let mut seen = HashSet::new();

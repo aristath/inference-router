@@ -22,3 +22,5 @@ pub mod request_queue;
 pub use engine::{AppState, LoadError, MutationError, Orchestrator, StopError};
 
 pub mod media;
+
+pub mod slot_pool;

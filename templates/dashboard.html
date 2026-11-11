@@ -58,6 +58,11 @@
                         <select id="alias-target"></select>
                     </div>
                     <div class="form-group">
+                        <label for="alias-slot">llama.cpp slots</label>
+                        <input type="text" id="alias-slot" placeholder="Automatic / inherit, or 0,1">
+                        <small class="field-help">Comma-separated slot numbers, starting at 0. Blank inherits or selects automatically. Example: chats 0,1; compaction 2.</small>
+                    </div>
+                    <div class="form-group">
                         <label for="alias-fallback">Fallback during media generation</label>
                         <select id="alias-fallback"></select>
                         <small class="field-help">Optional CPU-only or iGPU-only model or alias. Requests use its context limit and capabilities; otherwise they wait for the GPU.</small>
@@ -2247,6 +2252,8 @@ function renderAliasRow(a) {
             <code class="model-chip profile">${escapeHtmlText(a.alias)}</code>
             <span style="color:#64748b;">→</span>
             ${targetHtml}
+            ${a.slots?.length ? `<small style="color:#94a3b8;"> · slots ${a.slots.map(Number).join(', ')}</small>` : ''}
+            ${a.slot != null ? `<small style="color:#94a3b8;"> · slot ${Number(a.slot)}</small>` : ''}
             ${a.fallback ? `<small style="display:block; color:#94a3b8;">During media → <code>${escapeHtmlText(a.fallback)}</code></small>` : ''}
         </div>
         <button type="button" class="btn btn-secondary btn-sm">Edit</button>
@@ -2376,6 +2383,7 @@ async function openAliasEditor(existing) {
     document.getElementById('alias-editor').style.display = '';
     const nameEl = document.getElementById('alias-name');
     nameEl.value = existing ? existing.alias : '';
+    document.getElementById('alias-slot').value = existing?.slots?.length ? existing.slots.join(',') : (existing?.slot ?? '');
     // Names are editable — including renaming an existing alias.
     await refreshAliasTargetSelect(existing?.target, existing?.fallback);
     setTimeout(() => nameEl.focus(), 20);
@@ -2401,7 +2409,13 @@ async function saveAlias() {
         return;
     }
     const fallback = document.getElementById('alias-fallback').value || null;
-    const body = JSON.stringify({ alias, target, fallback });
+    const slotValue = document.getElementById('alias-slot').value.trim();
+    const slots = slotValue === '' ? [] : [...new Set(slotValue.split(',').map(v => Number(v.trim())))];
+    if (slots.some(slot => !Number.isSafeInteger(slot) || slot < 0 || slot > 4294967295) || (slotValue && slotValue.split(',').some(v => !v.trim()))) {
+        alert('Use comma-separated nonnegative slot numbers, or leave blank to inherit.');
+        return;
+    }
+    const body = JSON.stringify({ alias, target, fallback, slot: slots.length === 1 ? slots[0] : null, slots: slots.length > 1 ? slots : [] });
     const url = _aliasEditorMode === 'add'
         ? '/api/aliases'
         : `/api/aliases/${encodeURIComponent(_aliasEditingOriginal || alias)}`;

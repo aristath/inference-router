@@ -3,6 +3,13 @@ use std::hash::{Hash, Hasher};
 
 pub fn prefix_keys(body: &[u8], headers: &axum::http::HeaderMap) -> Option<Vec<u64>> {
     let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    document_prefix_keys(&doc, headers)
+}
+
+pub fn document_prefix_keys(
+    doc: &serde_json::Value,
+    headers: &axum::http::HeaderMap,
+) -> Option<Vec<u64>> {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     let session = doc
         .get("prompt_cache_key")

@@ -117,6 +117,8 @@ async fn queued_aliases_share_priority_and_running_stream_finishes_before_next_r
         data.aliases.insert(
             "default".into(),
             ModelAlias {
+                slot: None,
+                slots: vec![],
                 alias: "default".into(),
                 target: "fake".into(),
                 fallback: None,
@@ -219,6 +221,8 @@ async fn strata_reserves_a_live_slot_against_a_second_background_stream() {
         data.aliases.insert(
             "default".into(),
             ModelAlias {
+                slot: None,
+                slots: vec![],
                 alias: "default".into(),
                 target: "fake".into(),
                 fallback: None,

@@ -25,6 +25,37 @@ Built for a single-user, localhost, multi-GPU AMD workstation (3x Radeon AI PRO 
 - **Browser dashboard.** Single-page UI at `/` for CRUD on models + binary presets, manual load/stop, live GPU / CPU / RAM stats, and persisted decode/prefill throughput for llama.cpp and vLLM models. Askama HTML templates, vanilla JS, 500 ms poll.
 - **Persistence.** Model and preset definitions live in `~/.config/inference-router/{models.json,presets.json}`; throughput history lives in `model_perf.json`. Writes are dirty-flag gated and flushed by the reconcile loop (5 s cadence).
 
+## Separate llama.cpp caches by alias
+
+Aliases accept an optional zero-based `slot`, editable in the dashboard and
+through `/api/aliases`. For example:
+
+```json
+[
+  {"alias": "default", "target": "qwen", "slot": 0},
+  {"alias": "compaction", "target": "default", "slot": 1}
+]
+```
+
+The first explicit slot in an alias chain wins. Omitting it inherits the target
+alias's slot; a chain with no slot retains normal backend selection. A configured
+slot overrides a caller's `id_slot` on completion requests. llama.cpp queues
+requests when that specific slot is busy. An unavailable slot or incompatible
+backend returns a retryable service-unavailable response rather than choosing a
+slot automatically. Media fallbacks use their own alias's slot policy.
+
+Pin both foreground and compaction aliases: automatic selection can reuse either
+cache. When moving compaction to a different model, select that model in Clara's
+compaction settings, or repoint this alias and clear its slot for automatic
+selection (or set 0 for a single-slot llama.cpp model).
+
+Increasing `parallel_slots` alone splits a fixed context allocation. To preserve
+foreground capacity with a shared pool, configure llama.cpp `--kv-unified` and
+`--kv-unified-per-slot` as well as an adequate total `context`. Both slots share
+that pool and GPU compute; slot routing does not reserve independent context
+quotas or guarantee that two maximum-size requests fit simultaneously. Direct
+concrete-model requests and the backend web client retain their own slot policy.
+
 ## HTTP surface
 
 Default bind: `0.0.0.0:8080`.
@@ -33,7 +64,7 @@ Default bind: `0.0.0.0:8080`.
 | --- | --- | --- |
 | `/` | GET | Dashboard (HTML) |
 | `/api/status` | GET | Live system + GPU + model snapshot (dashboard polls this) |
-| `/api/token-count` | POST | Count a prepared chat request on an already loaded model; never loads or switches models |
+| `/api/token-count` | POST | Count a prepared chat request; read-only unless load_model is explicitly true |
 | `/api/models` | GET, POST | List / create model definitions |
 | `/api/models/validate` | POST | Validate a model definition without saving it |
 | `/api/models/{id}` | PUT, DELETE | Update / delete |
@@ -54,9 +85,11 @@ a chat request and returns `{ "tokens": 123, "model": "resolved-model-id" }`.
 It pins an existing instance for the complete request, using llama.cpp's
 `/v1/chat/completions/input_tokens` or vLLM's `/tokenize` (including its chat
 template and multimodal preprocessing). It does not generate a response. Cold
-models, reserved GPUs, unsupported backends (including Strata), or missing
+models without the optional load_model flag, reserved GPUs, unsupported backends (including Strata), or missing
 token-counting support return HTTP 503 with an explanatory error. Ordinary
-`/tokenize` retains its on-demand loading behavior.
+`/tokenize` retains its on-demand loading behavior. Budgeting can set
+load_model: true to prepare the selected backend before counting; this control
+is removed before forwarding the request and never generates a completion.
 
 ### systemd (user unit)
 
@@ -551,3 +584,20 @@ Queued requests do not pin backend instances or GPU readers; media handoffs keep
 exclusive access, and chats can overtake background requests waiting for media.
 Large queued bodies use the existing private request spool rather than retaining
 all prompts in memory. The queue itself stores only priority and request IDs.
+
+### Chat slot pools
+
+An alias may set `"slots": [0, 1]` to restrict chat work to those llama.cpp slots.
+A separate `compaction` alias can target the same model with `"slot": 2`.
+The first explicit slot policy in the alias chain wins, including a singleton
+policy overriding an inherited pool. Media fallback uses the fallback's policy.
+Pool requests prefer a free slot with matching conversation prefixes and wait
+when their entire pool is busy. A lease lasts until the response stream ends or
+is cancelled; waiting chats do not consume compaction's admission capacity.
+The dashboard's slots field accepts one number or a comma-separated pool.
+
+For the shared GPU, size `--ctx-size` for the combined simultaneous workload;
+`--kv-unified-per-slot` caps an individual request, not a reserved allocation.
+RAM prompt caching (`cache_ram_mib`) can be combined with
+`--no-cache-idle-slots` to retain warm GPU slots while caching replaced prompts.
+Context checkpoints consume additional RAM outside that prompt-cache budget.

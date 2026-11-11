@@ -1040,6 +1040,8 @@ async fn reconcile_persists_settings_when_dirty() {
 
 fn alias(name: &str, target: &str) -> ModelAlias {
     ModelAlias {
+        slot: None,
+        slots: vec![],
         fallback: None,
         alias: name.into(),
         target: target.into(),
@@ -1513,5 +1515,38 @@ async fn igpu_models_are_valid_fallbacks_and_edits_remove_independent_routing() 
     assert_eq!(
         o.inference_target("default", true).await,
         ("main".into(), false)
+    );
+}
+
+#[tokio::test]
+async fn alias_slots_inherit_override_and_follow_the_selected_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let o = orch(&tmp);
+    o.add_model(model("gpu")).await.unwrap();
+    let mut cpu = model("cpu");
+    cpu.cpu_only = true;
+    o.add_model(cpu).await.unwrap();
+    let mut primary = alias("default", "gpu");
+    primary.slots = vec![0, 1];
+    primary.fallback = Some("cpu".into());
+    o.add_alias(primary).await.unwrap();
+    o.add_alias(alias("chat", "default")).await.unwrap();
+    let mut compact = alias("compaction", "default");
+    compact.slot = Some(1);
+    o.add_alias(compact.clone()).await.unwrap();
+    assert_eq!(o.inference_slots("chat", "gpu").await, vec![0, 1]);
+    assert_eq!(o.inference_slots("compaction", "gpu").await, vec![1]);
+    assert_eq!(
+        o.inference_slots("compaction", "cpu").await,
+        Vec::<u32>::new()
+    );
+    assert_eq!(o.inference_slots("gpu", "gpu").await, Vec::<u32>::new());
+    compact.target = "cpu".into();
+    compact.slot = None;
+    o.update_alias("compaction", compact).await.unwrap();
+    assert_eq!(o.resolve_model_id("compaction").await, "cpu");
+    assert_eq!(
+        o.inference_slots("compaction", "cpu").await,
+        Vec::<u32>::new()
     );
 }

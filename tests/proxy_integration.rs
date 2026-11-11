@@ -338,6 +338,8 @@ async fn token_count_uses_loaded_instance_and_template_without_generation() {
     let state = build_proxy_orchestrator(upstream).await;
     state
         .add_alias(ModelAlias {
+            slot: None,
+            slots: vec![],
             alias: "chat".into(),
             target: "fake".into(),
             fallback: None,
@@ -347,7 +349,7 @@ async fn token_count_uses_loaded_instance_and_template_without_generation() {
     let port = start_proxy_server(router_for(state.clone())).await;
     let client = reqwest::Client::new();
     let input = serde_json::json!({
-        "model": "chat", "messages": [{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,fixture"}}]}],
+        "model": "chat", "load_model": true, "messages": [{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,fixture"}}]}],
         "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
         "chat_template_overrides":{"fake":"Selected template"}, "chat_template_kwargs":{"enable_thinking":false}
     });
@@ -372,6 +374,7 @@ async fn token_count_uses_loaded_instance_and_template_without_generation() {
     assert_eq!(seen[0]["model"], "fake");
     assert_eq!(seen[0]["chat_template"], "Selected template");
     assert!(seen[0].get("chat_template_overrides").is_none());
+    assert!(seen[0].get("load_model").is_none());
     assert_eq!(state.process_manager.lock().await.instance_count("fake"), 1);
     assert!(!state
         .process_manager
@@ -444,6 +447,18 @@ async fn token_count_never_loads_a_cold_model_or_returns_zero_on_failure() {
         state.data.lock().await.models["cold"].state,
         ModelState::Idle
     );
+    // Budgeting explicitly requests startup. The deliberately missing binary
+    // must produce a loading failure, never a fabricated count or read-only miss.
+    let reply = client
+        .post(format!("http://127.0.0.1:{port}/api/token-count"))
+        .json(&serde_json::json!({"model":"cold","load_model":true,"messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status().as_u16(), 503);
+    let reply: serde_json::Value = reply.json().await.unwrap();
+    assert_eq!(reply["code"], "load_failed");
+    assert!(reply.get("tokens").is_none());
 }
 
 /// Builds the orchestrator with a single "loaded" model pointed at `upstream_port`.
@@ -979,6 +994,8 @@ async fn proxy_routes_alias_to_target_model() {
     let orchestrator = build_proxy_orchestrator(upstream).await;
     orchestrator
         .add_alias(ModelAlias {
+            slot: None,
+            slots: vec![],
             fallback: None,
             alias: "gpt-4o".into(),
             target: "fake".into(),
@@ -1013,6 +1030,8 @@ async fn proxy_routes_alias_chain_to_target_model() {
     // coder -> default -> fake (a real, running model).
     orchestrator
         .add_alias(ModelAlias {
+            slot: None,
+            slots: vec![],
             fallback: None,
             alias: "default".into(),
             target: "fake".into(),
@@ -1021,6 +1040,8 @@ async fn proxy_routes_alias_chain_to_target_model() {
         .unwrap();
     orchestrator
         .add_alias(ModelAlias {
+            slot: None,
+            slots: vec![],
             fallback: None,
             alias: "coder".into(),
             target: "default".into(),
@@ -1053,6 +1074,8 @@ async fn proxy_returns_503_for_unassigned_alias() {
     // A canonical alias defined but not yet pointed at a model.
     orchestrator
         .add_alias(ModelAlias {
+            slot: None,
+            slots: vec![],
             fallback: None,
             alias: "planner".into(),
             target: String::new(),
@@ -1086,6 +1109,8 @@ async fn v1_models_full_list_includes_models_and_aliases() {
     let orchestrator = build_proxy_orchestrator(upstream).await;
     orchestrator
         .add_alias(ModelAlias {
+            slot: None,
+            slots: vec![],
             fallback: None,
             alias: "gpt-4o".into(),
             target: "fake".into(),
@@ -1119,6 +1144,8 @@ async fn v1_models_aliases_only_hides_real_models() {
     let orchestrator = build_proxy_orchestrator(upstream).await;
     orchestrator
         .add_alias(ModelAlias {
+            slot: None,
+            slots: vec![],
             fallback: None,
             alias: "gpt-4o".into(),
             target: "fake".into(),
@@ -1146,4 +1173,134 @@ async fn v1_models_aliases_only_hides_real_models() {
         .map(|m| m["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, vec!["gpt-4o"], "aliases-only must list only aliases");
+}
+
+#[tokio::test]
+async fn alias_slot_is_pinned_and_invalid_edits_do_not_use_automatic_selection() {
+    let (upstream, seen) = spawn_capturing_fake_llama().await;
+    let state = build_proxy_orchestrator(upstream).await;
+    state
+        .data
+        .lock()
+        .await
+        .models
+        .get_mut("fake")
+        .unwrap()
+        .parallel_slots = Some(2);
+    state
+        .add_alias(ModelAlias {
+            alias: "default".into(),
+            target: "fake".into(),
+            slot: Some(0),
+            slots: vec![],
+            fallback: None,
+        })
+        .await
+        .unwrap();
+    state
+        .add_alias(ModelAlias {
+            alias: "compaction".into(),
+            target: "default".into(),
+            slot: Some(1),
+            slots: vec![],
+            fallback: None,
+        })
+        .await
+        .unwrap();
+    state
+        .add_alias(ModelAlias {
+            alias: "chat".into(),
+            target: "default".into(),
+            slot: None,
+            slots: vec![],
+            fallback: None,
+        })
+        .await
+        .unwrap();
+    let port = start_proxy_server(router_for(state.clone())).await;
+    let client = reqwest::Client::new();
+    for (alias, slot) in [("default", 0), ("chat", 0), ("compaction", 1)] {
+        let response = client.post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&serde_json::json!({"model":alias,"id_slot":99,"messages":[{"role":"user","content":"hello"}]}))
+            .send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        response.text().await.unwrap();
+        let body = seen.lock().await.clone().unwrap();
+        assert_eq!(body["id_slot"], slot);
+        assert_eq!(body["model"], "fake");
+    }
+    *seen.lock().await = None;
+    // A model edit that removes slot 1 must not silently wipe slot 0's cache.
+    state
+        .data
+        .lock()
+        .await
+        .models
+        .get_mut("fake")
+        .unwrap()
+        .parallel_slots = Some(1);
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"compaction","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+    assert!(seen.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn chat_slot_pool_routes_affinely_without_using_compaction_slot() {
+    let (upstream, seen) = spawn_capturing_fake_llama().await;
+    let state = build_proxy_orchestrator(upstream).await;
+    state
+        .data
+        .lock()
+        .await
+        .models
+        .get_mut("fake")
+        .unwrap()
+        .parallel_slots = Some(3);
+    state
+        .add_alias(ModelAlias {
+            alias: "default".into(),
+            target: "fake".into(),
+            slot: None,
+            slots: vec![0, 1],
+            fallback: None,
+        })
+        .await
+        .unwrap();
+    state
+        .add_alias(ModelAlias {
+            alias: "compaction".into(),
+            target: "default".into(),
+            slot: Some(2),
+            slots: vec![],
+            fallback: None,
+        })
+        .await
+        .unwrap();
+    let port = start_proxy_server(router_for(state)).await;
+    let client = reqwest::Client::new();
+    let mut chat_slot = None;
+    for alias in ["default", "compaction", "default"] {
+        let response = client.post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&serde_json::json!({"model":alias,"id_slot":2,"prompt_cache_key":"chat-one","messages":[{"role":"user","content":"hello"}]}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        response.text().await.unwrap();
+        let slot = seen.lock().await.as_ref().unwrap()["id_slot"]
+            .as_u64()
+            .unwrap();
+        if alias == "compaction" {
+            assert_eq!(slot, 2);
+        } else {
+            assert!(slot < 2);
+            if let Some(previous) = chat_slot {
+                assert_eq!(slot, previous);
+            }
+            chat_slot = Some(slot);
+        }
+    }
 }
