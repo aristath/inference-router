@@ -797,14 +797,15 @@ pub fn build_command_args(
                     args.push("--spec-draft-p-min".into());
                     args.push(p.to_string());
                 }
-                if let Some(n) = model.ctx_checkpoints {
-                    args.push("--ctx-checkpoints".into());
-                    args.push(n.to_string());
-                }
-                if let Some(n) = model.checkpoint_min_step {
-                    args.push("--checkpoint-min-step".into());
-                    args.push(n.to_string());
-                }
+            }
+
+            if let Some(n) = model.ctx_checkpoints {
+                args.push("--ctx-checkpoints".into());
+                args.push(n.to_string());
+            }
+            if let Some(n) = model.checkpoint_min_step {
+                args.push("--checkpoint-min-step".into());
+                args.push(n.to_string());
             }
         }
         WeightsFormat::Safetensors => {

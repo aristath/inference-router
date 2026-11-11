@@ -524,7 +524,7 @@ fn spec_decode_argv_omitted_when_no_draft_resolved() {
     let joined = args.join(" ");
     assert!(!joined.contains("-md"), "{joined}");
     assert!(!joined.contains("--spec-draft-n-max"), "{joined}");
-    assert!(!joined.contains("--ctx-checkpoints"), "{joined}");
+    assert_eq!(find_flag(&args, "--ctx-checkpoints"), Some("4"));
 }
 
 #[test]
@@ -1015,4 +1015,17 @@ fn background_metrics_keep_ownership_without_displacing_prefix_affinity() {
     );
     assert_eq!(pm.acquire_affine_instance("m", &[7]).unwrap().port, 9001);
     drop(metrics);
+}
+
+#[test]
+fn context_checkpoints_apply_to_mtp_and_ordinary_generation() {
+    for mtp in [None, Some(2)] {
+        let mut model = gguf_model();
+        model.mtp_tokens = mtp;
+        model.ctx_checkpoints = Some(8);
+        model.checkpoint_min_step = Some(1024);
+        let args = build_command_args(&model, None, 9001);
+        assert_eq!(find_flag(&args, "--ctx-checkpoints"), Some("8"));
+        assert_eq!(find_flag(&args, "--checkpoint-min-step"), Some("1024"));
+    }
 }
